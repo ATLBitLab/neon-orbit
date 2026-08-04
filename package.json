@@ -1,0 +1,21 @@
+{
+  "name": "neon-orbit",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A low-poly neon space fighter dogfight in orbit around a lush green world.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.180.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}
