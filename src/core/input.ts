@@ -208,6 +208,8 @@ const TRACKED = new Set([
   'ArrowDown',
   'ArrowLeft',
   'ArrowRight',
+  // Tab cycles targets, so it must not move focus off the canvas mid-fight.
+  'Tab',
 ])
 
 function clamp(v: number, lo: number, hi: number): number {

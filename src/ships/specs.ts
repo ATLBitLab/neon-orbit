@@ -129,7 +129,7 @@ export const SHIPS: Record<ShipId, ShipSpec> = {
     barrelSpread: 7.5,
     radius: 14,
     bounty: 200,
-    quirk: { kind: 'regen', delay: 4, rate: 9 },
+    quirk: { kind: 'regen', delay: 6.5, rate: 9 },
     strengths: ['Triple the Wasp hull', 'Twin siege cannons — two volleys end a Wasp'],
     weaknesses: ['Slowest airframe, wallows through turns', 'Long reload punishes every miss'],
     bars: { speed: 0.34, agility: 0.26, armor: 1.0, firepower: 0.92 },

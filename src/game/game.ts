@@ -21,7 +21,7 @@ import { EnemyPilot } from './ai'
 import { createBolts, type Bolts } from './bolts'
 import { createChaseCamera, type ChaseCamera } from './chase'
 import { createFx, type Fx } from './fx'
-import type { Hud, HudContact } from './hud'
+import type { Hud, HudContact, HudTarget } from './hud'
 import { Ship, type Controls, type ShipContext } from './ship'
 
 /** Hulls of each non-chosen type that make up the squadron. */
@@ -50,6 +50,9 @@ const _spawnPos = new THREE.Vector3()
 const _forward = new THREE.Vector3()
 const _toEnemy = new THREE.Vector3()
 const _reticle = new THREE.Vector3()
+const _inverseQuat = new THREE.Quaternion()
+const _lead = new THREE.Vector3()
+const _leadNdc = new THREE.Vector3()
 
 export type RunEnd = (result: RunResult) => void
 
@@ -66,6 +69,8 @@ export interface Game {
    * into their record.
    */
   abandon(): void
+  /** Switch to the next hostile. Bound to Tab / T. */
+  cycleTarget(): void
   /**
    * Read-only view of the run, for debugging in the console. Exposed on
    * `window.__neon` in dev builds only.
@@ -83,6 +88,13 @@ export interface RunSnapshot {
   enemiesAirborne: number
   enemiesQueued: number
   elapsed: number
+  /**
+   * Body-frame bearing to the locked target's **lead point** — where to point
+   * the nose for the shot to connect — in radians, plus range. Plain numbers
+   * rather than live object references, so AI behaviour is inspectable from the
+   * console and a scripted pilot can fly the game.
+   */
+  target: { yaw: number; pitch: number; range: number; hull: number } | null
 }
 
 export interface GameDeps {
@@ -121,6 +133,8 @@ export function createGame(deps: GameDeps): Game {
   let playerHits = 0
   let best = 0
   let alarmTimer = 0
+  /** The hostile the player is holding. Damage only becomes kills with a lock. */
+  let lockedTarget: Ship | null = null
   /** Set on the frame the run resolves, so the loop stops before reporting. */
   let ending = false
 
@@ -250,21 +264,70 @@ export function createGame(deps: GameDeps): Game {
     return c
   }
 
-  /** True when an enemy is roughly under the crosshair and in range. */
-  function hasLock(): boolean {
-    if (!player) return false
+  /* ------------------------------------------------------------------------ */
+  /* Targeting                                                                */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Without a lock you cannot concentrate fire. Enemies break off constantly and
+   * a Drone repairs itself, so chip damage spread across three hulls simply
+   * heals — a scripted pilot chasing whatever was nearest managed 30% accuracy
+   * and zero kills. Holding one target is what turns hits into kills.
+   */
+  function acquireTarget(): void {
+    if (!player) return
+    if (lockedTarget && (!lockedTarget.alive || !pilots.some((p) => p.ship === lockedTarget))) {
+      lockedTarget = null
+    }
+    if (lockedTarget) return
+
+    // Prefer whatever is closest to the nose, falling back to closest by range.
     player.forward(_forward)
+    let best: Ship | null = null
+    let bestScore = -Infinity
     for (const pilot of pilots) {
       const enemy = pilot.ship
-      if (!enemy.alive || !enemy.targetable) continue
+      if (!enemy.alive) continue
       _toEnemy.subVectors(enemy.position, player.position)
       const dist = _toEnemy.length()
-      if (dist > 1400 || dist < 1e-3) continue
-      _toEnemy.multiplyScalar(1 / dist)
-      // A generous cone: this drives a reticle colour, not an aim assist.
-      if (_forward.dot(_toEnemy) > Math.cos(0.09 + 60 / dist)) return true
+      if (dist < 1e-3) continue
+      const alignment = _forward.dot(_toEnemy) / dist
+      const score = alignment * 2 - dist / 4000
+      if (score > bestScore) {
+        bestScore = score
+        best = enemy
+      }
     }
-    return false
+    lockedTarget = best
+  }
+
+  /**
+   * Where to aim so a bolt meets the target. One Newton step on
+   * `|target + v·t − self| = boltSpeed·t` is plenty at these ranges.
+   */
+  function solveLead(target: Ship, out: THREE.Vector3): void {
+    if (!player) return
+    const boltSpeed = player.spec.boltSpeed + Math.max(0, player.speed) * 0.35
+    let t = target.position.distanceTo(player.position) / boltSpeed
+    for (let i = 0; i < 2; i++) {
+      out.copy(target.position).addScaledVector(target.velocity, t)
+      t = out.distanceTo(player.position) / boltSpeed
+    }
+    out.copy(target.position).addScaledVector(target.velocity, t)
+  }
+
+  /** True when the nose is close enough to the lead point for the shot to land. */
+  function onTarget(): boolean {
+    if (!player || !lockedTarget || !lockedTarget.targetable) return false
+    solveLead(lockedTarget, _lead)
+    _toEnemy.subVectors(_lead, player.position)
+    const dist = _toEnemy.length()
+    if (dist > 1600 || dist < 1e-3) return false
+    player.forward(_forward)
+    // The angle the hull subtends, plus a little slack for the reticle to feel
+    // responsive rather than binary.
+    const gate = Math.atan2(lockedTarget.radius * 2.2, dist)
+    return _forward.dot(_toEnemy.multiplyScalar(1 / dist)) > Math.cos(gate)
   }
 
   /* ------------------------------------------------------------------------ */
@@ -277,6 +340,7 @@ export function createGame(deps: GameDeps): Game {
       pilot.ship.dispose()
     }
     pilots = []
+    lockedTarget = null
     if (player) {
       scene.remove(player.visual.group)
       player.dispose()
@@ -383,12 +447,29 @@ export function createGame(deps: GameDeps): Game {
       })
     }
 
+    acquireTarget()
+
     const remaining = queue.length + contactBuffer.length
     const critical = player.hullFraction <= CRITICAL_HULL
 
     // Project the gun line so the crosshair marks where shots actually go.
     player.forward(_forward)
     _reticle.copy(player.position).addScaledVector(_forward, RETICLE_RANGE).project(camera)
+
+    function targetReadout(): HudTarget | null {
+      if (!player || !lockedTarget || !lockedTarget.alive) return null
+      solveLead(lockedTarget, _lead)
+      _leadNdc.copy(_lead).project(camera)
+      return {
+        name: lockedTarget.spec.name.toUpperCase(),
+        accent: lockedTarget.spec.accent,
+        hullFraction: lockedTarget.hullFraction,
+        range: lockedTarget.position.distanceTo(player.position),
+        leadNdcX: _leadNdc.x,
+        leadNdcY: _leadNdc.y,
+        leadVisible: _leadNdc.z < 1 && Math.abs(_leadNdc.x) < 1 && Math.abs(_leadNdc.y) < 1,
+      }
+    }
 
     hud.update({
       hullFraction: player.hullFraction,
@@ -401,11 +482,12 @@ export function createGame(deps: GameDeps): Game {
       enemiesRemaining: remaining,
       speed: player.velocity.length(),
       throttle: playerControls.throttle,
-      locked: hasLock(),
+      locked: onTarget(),
       critical,
-      reticleX: (_reticle.x * 0.5 + 0.5) * window.innerWidth,
-      reticleY: (-_reticle.y * 0.5 + 0.5) * window.innerHeight,
+      reticleNdcX: _reticle.x,
+      reticleNdcY: _reticle.y,
       boundaryOvershoot: player.boundaryOvershoot,
+      target: targetReadout(),
     })
     hud.updateContacts(contactBuffer, camera)
     hud.tick(dt)
@@ -476,6 +558,7 @@ export function createGame(deps: GameDeps): Game {
       multiplier = 1
       playerHits = 0
       alarmTimer = 0
+      lockedTarget = null
       ending = false
       best = deps.bestScoreFor(shipId)
       playerControls.throttle = 0.6
@@ -509,6 +592,21 @@ export function createGame(deps: GameDeps): Game {
 
     snapshot() {
       if (!player) return null
+
+      let bearing: RunSnapshot['target'] = null
+      if (lockedTarget && lockedTarget.alive) {
+        solveLead(lockedTarget, _lead)
+        _toEnemy.subVectors(_lead, player.position)
+        _inverseQuat.copy(player.quaternion).invert()
+        _toEnemy.applyQuaternion(_inverseQuat)
+        bearing = {
+          yaw: Math.atan2(_toEnemy.x, -_toEnemy.z),
+          pitch: Math.atan2(_toEnemy.y, Math.hypot(_toEnemy.x, _toEnemy.z)),
+          range: lockedTarget.position.distanceTo(player.position),
+          hull: lockedTarget.hullFraction,
+        }
+      }
+
       return {
         score,
         kills,
@@ -518,7 +616,18 @@ export function createGame(deps: GameDeps): Game {
         enemiesAirborne: pilots.length,
         enemiesQueued: queue.length,
         elapsed,
+        target: bearing,
       }
+    },
+
+    cycleTarget() {
+      const live = pilots.map((p) => p.ship).filter((s) => s.alive)
+      if (live.length === 0) {
+        lockedTarget = null
+        return
+      }
+      const index = lockedTarget ? live.indexOf(lockedTarget) : -1
+      lockedTarget = live[(index + 1) % live.length]
     },
 
     abandon() {

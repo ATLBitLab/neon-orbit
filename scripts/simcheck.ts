@@ -13,10 +13,15 @@
 
 import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
+import type { Input, InputState } from '../src/core/input'
+import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
+import { createGame } from '../src/game/game'
+import type { Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
+import { mulberry32 } from '../src/core/rng'
 import { SHIPS } from '../src/ships/specs'
-import { ARENA_HARD_LIMIT, ARENA_RADIUS } from '../src/world/environment'
+import { ARENA_HARD_LIMIT, ARENA_RADIUS, type Environment } from '../src/world/environment'
 
 const STEP = 1 / 60
 
@@ -349,12 +354,187 @@ function testBoltPoolDoesNotLeak(): void {
 
 /* -------------------------------------------------------------------------- */
 
+/** The HUD is pure presentation, so a no-op satisfies the whole contract. */
+function stubHud(): Hud {
+  const noop = () => {}
+  return {
+    root: null as unknown as HTMLElement,
+    show: noop,
+    hide: noop,
+    setShip: noop,
+    update: noop,
+    updateContacts: noop,
+    flashDamage: noop,
+    callout: noop,
+    feed: noop,
+    setLockPrompt: noop,
+    tick: noop,
+    dispose: noop,
+  }
+}
+
+/**
+ * A directly-writable input. Unlike the browser's keyboard this gives real
+ * proportional deflection, which is what a mouse gives a human player — binary
+ * key steering swings past a manoeuvring target and never settles.
+ */
+function stubInput(): Input & { write: InputState } {
+  const state: InputState = {
+    pitch: 0,
+    yaw: 0,
+    roll: 0,
+    throttleUp: false,
+    throttleDown: false,
+    fire: false,
+    dash: false,
+  }
+  const noop = () => {}
+  return {
+    state,
+    write: state,
+    pointerLocked: true,
+    invertPitch: false,
+    update: noop,
+    requestPointerLock: noop,
+    releasePointerLock: noop,
+    onPointerLockLost: noop,
+    onKey: noop,
+    reset: noop,
+    dispose: noop,
+  } as Input & { write: InputState }
+}
+
+/** An empty arena: no stations, so this measures the dogfight and nothing else. */
+function stubEnvironment(): Environment {
+  const group = new THREE.Group()
+  return {
+    group,
+    stations: [],
+    hazards: [],
+    planet: {
+      group: new THREE.Group(),
+      radius: 1,
+      center: new THREE.Vector3(),
+      spin: 0,
+      update() {},
+      dispose() {},
+    },
+    update() {},
+    dispose() {},
+  }
+}
+
+/**
+ * Verifies the *win transition*, not the difficulty curve.
+ *
+ * Three things are pinned down so this is an assertion rather than a coin flip:
+ *
+ * - `Math.random` is seeded. Spawn placement, AI jink and roster order all use
+ *   it, so an unseeded run varies enormously — the first version of this check
+ *   passed and failed on alternate runs, which is worse than having no check.
+ * - Enemy hulls drop to one volley. A proportional controller is a poor stand-in
+ *   for a human: it treats a jinking target's lead point as raw signal and
+ *   oscillates, where a person reading the lead pip anticipates. Tuning an
+ *   autopilot until it beat the real balance would be testing the autopilot.
+ * - The player is made unkillable, so the only way the run can end is by
+ *   clearing the roster. That is the transition under test.
+ */
+function testARunCanBeWon(): void {
+  section('A cleared roster reports a win')
+
+  const realRandom = Math.random
+  Math.random = mulberry32(0x5120fa11)
+
+  const originalHulls = {
+    wasp: SHIPS.wasp.maxHull,
+    drone: SHIPS.drone.maxHull,
+    hornet: SHIPS.hornet.maxHull,
+  }
+  SHIPS.wasp.maxHull = 12
+  SHIPS.drone.maxHull = 12
+  SHIPS.hornet.maxHull = 1_000_000
+
+  const input = stubInput()
+  let result: RunResult | null = null
+
+  const game = createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input,
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: (r) => {
+      result = r
+    },
+  })
+
+  game.start('hornet')
+
+  const budget = Math.ceil(240 / STEP)
+  let frames = 0
+  for (; frames < budget && !result; frames++) {
+    const run = game.snapshot()
+    const target = run?.target ?? null
+
+    if (target) {
+      // Pursue the *lead* point of the locked target, proportionally. Aiming at
+      // where the hull is rather than where it will be misses almost every shot
+      // against something crossing at hundreds of units a second.
+      input.write.pitch = clampTo(target.pitch * 3, -1, 1)
+      input.write.yaw = clampTo(target.yaw * 3, -1, 1)
+      const gate = Math.atan2(26, Math.max(60, target.range))
+      input.write.fire =
+        Math.abs(target.pitch) < gate && Math.abs(target.yaw) < gate && target.range < 1000
+      input.write.throttleUp = target.range > 260
+      input.write.throttleDown = target.range < 170
+    } else {
+      input.write.pitch = 0
+      input.write.yaw = 0
+      input.write.fire = false
+      input.write.throttleUp = true
+      input.write.throttleDown = false
+    }
+
+    game.update(STEP)
+  }
+
+  SHIPS.wasp.maxHull = originalHulls.wasp
+  SHIPS.drone.maxHull = originalHulls.drone
+  SHIPS.hornet.maxHull = originalHulls.hornet
+  Math.random = realRandom
+
+  const run = result as RunResult | null
+  check('the run resolved', run !== null, `gave up after ${(frames * STEP).toFixed(0)}s`)
+  check('an emptied roster reports a win', run?.won === true, run ? `won=${run.won}, kills=${run.kills}` : 'no result')
+  check('every hostile in the roster was accounted for', run?.kills === 6, `kills=${run?.kills}`)
+  check('the run scored points', (run?.score ?? 0) > 0, `score=${run?.score}`)
+  check('accuracy was recorded', (run?.accuracy ?? 0) > 0, `accuracy=${run?.accuracy?.toFixed(3)}`)
+  check('a win awards the hull and time bonuses', (run?.score ?? 0) > 6 * SHIPS.wasp.bounty, `score=${run?.score}`)
+  check('the player spec was restored', SHIPS.hornet.maxHull === originalHulls.hornet)
+  if (run) {
+    console.log(
+      `       cleared in ${run.time.toFixed(1)}s · score ${run.score} · accuracy ${(run.accuracy * 100).toFixed(0)}%`,
+    )
+  }
+
+  game.dispose()
+}
+
+function clampTo(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v
+}
+
+/* -------------------------------------------------------------------------- */
+
 console.log('NEON ORBIT — headless simulation checks')
 testPlayerBoltsKillEnemies()
 testFriendlyFireIsOff()
 testBoundaryTurnsShipsAround()
 testQuirks()
 testBoltPoolDoesNotLeak()
+testARunCanBeWon()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

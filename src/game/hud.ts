@@ -23,6 +23,17 @@ export interface HudContact {
   accent: number
 }
 
+/** The locked hostile, plus where to aim to actually hit it. */
+export interface HudTarget {
+  name: string
+  accent: number
+  hullFraction: number
+  range: number
+  leadNdcX: number
+  leadNdcY: number
+  leadVisible: boolean
+}
+
 export interface HudFrame {
   hullFraction: number
   quirkValue: number
@@ -38,11 +49,16 @@ export interface HudFrame {
   locked: boolean
   /** True when the hull is low enough to warrant the red vignette. */
   critical: boolean
-  /** Screen pixels where the gun line crosses the far aim plane. */
-  reticleX: number
-  reticleY: number
+  /**
+   * Gun line projected to normalised device coordinates (-1..1). The HUD owns
+   * the conversion to pixels, so the game loop never has to know about the
+   * viewport — which also keeps it runnable outside a browser.
+   */
+  reticleNdcX: number
+  reticleNdcY: number
   /** Units past the patrol line, or 0 while inside it. */
   boundaryOvershoot: number
+  target: HudTarget | null
 }
 
 export interface Hud {
@@ -82,6 +98,13 @@ const RETICLE_SVG = `
 const CONTACT_SVG = `
 <svg viewBox="0 0 26 26" fill="none" stroke="currentColor" stroke-width="2">
   <path d="M13 3 L21 17 L13 13 L5 17 Z" fill="currentColor" opacity="0.9" stroke="none"/>
+</svg>`
+
+const LEAD_SVG = `
+<svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2">
+  <circle cx="20" cy="20" r="10" opacity="0.95"/>
+  <circle cx="20" cy="20" r="2.2" fill="currentColor" stroke="none"/>
+  <path d="M20 4 v5 M20 31 v5 M4 20 h5 M31 20 h5" opacity="0.8"/>
 </svg>`
 
 const BRACKET_SVG = `
@@ -136,12 +159,31 @@ export function createHud(parent: HTMLElement): Hud {
 
   const br = el('div', 'hud-corner hud-br')
   const contactCount = el('div', 'hud-ship', '0')
-  br.append(el('div', 'hud-label', 'HOSTILES'), contactCount, el('div', 'hint', 'ESC PAUSE · M MUTE'))
+  const targetName = el('div', 'target-name', 'NO LOCK')
+  const targetRange = el('div', 'hud-label', '—')
+  const targetGauge = el('div', 'gauge target')
+  const targetFill = el('i')
+  targetGauge.append(targetFill)
+  br.append(
+    el('div', 'hud-label', 'HOSTILES'),
+    contactCount,
+    el('div', 'hud-label', 'LOCK  ·  TAB TO SWITCH'),
+    targetName,
+    targetGauge,
+    targetRange,
+    el('div', 'hint', 'ESC PAUSE · M MUTE'),
+  )
 
   /* ---- Overlays --------------------------------------------------------- */
 
   const reticle = el('div', undefined, RETICLE_SVG)
   reticle.id = 'reticle'
+
+  // The lead pip is the difference between "shooting at" and "hitting" a target
+  // that crosses at 400 units a second. Put the nose on the pip, not the hull.
+  const leadPip = el('div', undefined, LEAD_SVG)
+  leadPip.id = 'lead'
+  leadPip.hidden = true
 
   const flash = el('div')
   flash.id = 'flash'
@@ -177,7 +219,7 @@ export function createHud(parent: HTMLElement): Hud {
     root.append(node)
   }
 
-  root.append(warn, flash, tl, tr, bl, br, reticle, callout, bounds, killfeed, lockPrompt)
+  root.append(warn, flash, tl, tr, bl, br, reticle, leadPip, callout, bounds, killfeed, lockPrompt)
   parent.append(root)
 
   /* ---- State ------------------------------------------------------------ */
@@ -246,13 +288,41 @@ export function createHud(parent: HTMLElement): Hud {
 
       contactCount.textContent = frame.enemiesRemaining.toString()
       reticle.classList.toggle('locked', frame.locked)
-      reticle.style.transform = `translate(${frame.reticleX.toFixed(1)}px, ${frame.reticleY.toFixed(1)}px) scale(${frame.locked ? 1.12 : 1})`
+      const rx = (frame.reticleNdcX * 0.5 + 0.5) * window.innerWidth
+      const ry = (-frame.reticleNdcY * 0.5 + 0.5) * window.innerHeight
+      reticle.style.transform = `translate(${rx.toFixed(1)}px, ${ry.toFixed(1)}px) scale(${frame.locked ? 1.12 : 1})`
       warn.classList.toggle('on', frame.critical)
 
       const straying = frame.boundaryOvershoot > 0
       bounds.hidden = !straying
       if (straying) {
         bounds.textContent = `▲ Leaving patrol zone — turn back · ${Math.round(frame.boundaryOvershoot)} u`
+      }
+
+      const target = frame.target
+      if (target) {
+        const colour = `#${target.accent.toString(16).padStart(6, '0')}`
+        targetName.textContent = target.name
+        targetName.style.color = colour
+        targetRange.textContent = `${Math.round(target.range)} u`
+        targetFill.style.width = `${target.hullFraction * 100}%`
+        targetFill.style.background = colour
+        targetFill.style.boxShadow = `0 0 10px ${colour}`
+        targetGauge.style.visibility = 'visible'
+
+        leadPip.hidden = !target.leadVisible
+        if (target.leadVisible) {
+          const lx = (target.leadNdcX * 0.5 + 0.5) * window.innerWidth
+          const ly = (-target.leadNdcY * 0.5 + 0.5) * window.innerHeight
+          leadPip.style.transform = `translate(${lx.toFixed(1)}px, ${ly.toFixed(1)}px)`
+          leadPip.style.color = colour
+        }
+      } else {
+        targetName.textContent = 'NO LOCK'
+        targetName.style.color = 'rgba(223, 246, 255, 0.35)'
+        targetRange.textContent = '—'
+        targetGauge.style.visibility = 'hidden'
+        leadPip.hidden = true
       }
     },
 

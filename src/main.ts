@@ -162,6 +162,12 @@ function boot() {
     else if (screen === 'paused') resumeRun()
   })
   input.onKey('KeyM', () => audio.toggleMute())
+  input.onKey('Tab', () => {
+    if (screen === 'flight') game.cycleTarget()
+  })
+  input.onKey('KeyT', () => {
+    if (screen === 'flight') game.cycleTarget()
+  })
   input.onKey('KeyI', () => {
     input.invertPitch = !input.invertPitch
   })

@@ -668,6 +668,36 @@ body {
   color: var(--magenta);
 }
 
+/* Lead pip — where to aim so the shot connects, not where the target is now. */
+#lead {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 40px;
+  height: 40px;
+  margin: -20px 0 0 -20px;
+  color: var(--magenta);
+  will-change: transform;
+}
+
+#lead[hidden] {
+  display: none;
+}
+
+.target-name {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.18em;
+  margin: 2px 0 4px;
+}
+
+.gauge.target {
+  width: 120px;
+  margin-left: auto;
+  height: 6px;
+}
+
 /* Off-screen contact arrows */
 .contact {
   position: absolute;
