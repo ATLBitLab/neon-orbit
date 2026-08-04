@@ -649,21 +649,23 @@ body {
   box-shadow: 0 0 8px var(--cyan);
 }
 
-/* Crosshair */
+/* Crosshair. Positioned every frame at the projected gun line, not at screen
+   centre — the chase camera puts the hull near the middle of the frame, so a
+   fixed centre crosshair would sit on top of your own ship. */
 #reticle {
   position: absolute;
-  left: 50%;
-  top: 50%;
+  left: 0;
+  top: 0;
   width: 90px;
   height: 90px;
   margin: -45px 0 0 -45px;
   color: rgba(53, 245, 255, 0.8);
-  transition: color 0.12s linear, transform 0.12s ease;
+  transition: color 0.12s linear;
+  will-change: transform;
 }
 
 #reticle.locked {
   color: var(--magenta);
-  transform: scale(1.12);
 }
 
 /* Off-screen contact arrows */
@@ -767,6 +769,29 @@ body {
     opacity: 0;
     transform: translateX(14px);
   }
+}
+
+/* Patrol-zone warning. Separate from #callout on purpose: a kill callout must
+   never be able to hide the reason your engines have stopped working. */
+#bounds {
+  position: absolute;
+  left: 50%;
+  top: 12%;
+  transform: translateX(-50%);
+  padding: 9px 22px;
+  border: 1px solid var(--amber);
+  background: rgba(40, 22, 0, 0.72);
+  color: var(--amber);
+  font-size: 12px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  text-shadow: 0 0 12px rgba(255, 176, 32, 0.8);
+  animation: warn-breathe 0.9s ease-in-out infinite;
+}
+
+#bounds[hidden] {
+  display: none;
 }
 
 /* Pointer-lock prompt */

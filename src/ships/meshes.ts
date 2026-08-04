@@ -14,6 +14,8 @@ import type { ShipSpec } from './specs'
 
 export interface ShipVisual {
   group: THREE.Group
+  /** The solid plates. Hidden during a phase dash, leaving a neon skeleton. */
+  hullMesh: THREE.Mesh
   /** Engine flare cones — scale on Z with throttle. */
   thrusters: THREE.Object3D[]
   /** Gun muzzle offsets in ship-local space. */
@@ -300,7 +302,8 @@ export function buildShip(spec: ShipSpec): ShipVisual {
   })
 
   const group = new THREE.Group()
-  group.add(new THREE.Mesh(baked.hull, hullMat))
+  const hullMesh = new THREE.Mesh(baked.hull, hullMat)
+  group.add(hullMesh)
   group.add(new THREE.LineSegments(baked.edges, trimMat))
   group.add(new THREE.Mesh(baked.accent, accentMat))
 
@@ -313,6 +316,7 @@ export function buildShip(spec: ShipSpec): ShipVisual {
 
   return {
     group,
+    hullMesh,
     thrusters,
     muzzles: baked.muzzles.map((m) => m.clone()),
     hullMat,
