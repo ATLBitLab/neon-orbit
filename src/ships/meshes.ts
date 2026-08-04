@@ -20,7 +20,10 @@ export interface ShipVisual {
   muzzles: THREE.Vector3[]
   hullMat: THREE.MeshPhongMaterial
   trimMat: THREE.LineBasicMaterial
-  glowMat: THREE.MeshBasicMaterial
+  /** Canopy and running-light glow. */
+  accentMat: THREE.MeshBasicMaterial
+  /** Engine flare glow — opacity is driven by throttle. */
+  thrusterMat: THREE.MeshBasicMaterial
   /** Longest dimension, used for camera framing. */
   length: number
 }
@@ -276,10 +279,21 @@ export function buildShip(spec: ShipSpec): ShipVisual {
     opacity: 0.95,
   })
 
-  const glowMat = new THREE.MeshBasicMaterial({
+  // Additive glow stacks fast under bloom. Canopies stay legible at 0.45;
+  // anything near 1.0 turns a 30-unit fighter into a white plasma ball.
+  const accentMat = new THREE.MeshBasicMaterial({
     color: accentColor,
     transparent: true,
-    opacity: 0.9,
+    opacity: 0.45,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  })
+
+  const thrusterMat = new THREE.MeshBasicMaterial({
+    color: accentColor.clone().lerp(new THREE.Color(0xffffff), 0.2),
+    transparent: true,
+    opacity: 0.42,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     side: THREE.DoubleSide,
@@ -288,10 +302,10 @@ export function buildShip(spec: ShipSpec): ShipVisual {
   const group = new THREE.Group()
   group.add(new THREE.Mesh(baked.hull, hullMat))
   group.add(new THREE.LineSegments(baked.edges, trimMat))
-  group.add(new THREE.Mesh(baked.accent, glowMat))
+  group.add(new THREE.Mesh(baked.accent, accentMat))
 
   const thrusters: THREE.Object3D[] = baked.thrusters.map((t) => {
-    const flare = thrusterMesh(t.radius, t.length, glowMat)
+    const flare = thrusterMesh(t.radius * 0.78, t.length * 0.8, thrusterMat)
     flare.position.set(t.x, t.y, t.z)
     group.add(flare)
     return flare
@@ -303,7 +317,8 @@ export function buildShip(spec: ShipSpec): ShipVisual {
     muzzles: baked.muzzles.map((m) => m.clone()),
     hullMat,
     trimMat,
-    glowMat,
+    accentMat,
+    thrusterMat,
     length: baked.length,
   }
 }
@@ -312,7 +327,8 @@ export function buildShip(spec: ShipSpec): ShipVisual {
 export function disposeShipVisual(v: ShipVisual): void {
   v.hullMat.dispose()
   v.trimMat.dispose()
-  v.glowMat.dispose()
+  v.accentMat.dispose()
+  v.thrusterMat.dispose()
   for (const t of v.thrusters) {
     if (t instanceof THREE.Mesh) t.geometry.dispose()
   }
