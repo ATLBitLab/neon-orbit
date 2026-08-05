@@ -85,8 +85,6 @@ const PROFILES: Record<ShipId, AiProfile> = {
 const STEER_GAIN = 2.6
 /** Enemies inside this distance of each other drift apart. */
 const SEPARATION_RANGE = 150
-/** Stations closer than this to an enemy start pushing its aim point away. */
-const HAZARD_AVOID_RANGE = 520
 /** Beyond this share of the arena radius, enemies steer back toward the middle. */
 const LEASH = 0.82
 
@@ -261,12 +259,18 @@ export class EnemyPilot {
       _aimPoint.addScaledVector(_push.multiplyScalar(1 / d), (SEPARATION_RANGE - d) * 2.4)
     }
 
-    // Station avoidance. Enemies bounce off hulls like the player does, but
-    // steering around is better than watching them grind along a habitat ring.
+    // Hazard avoidance — stations and mines both. Enemies bounce off station
+    // hulls like the player does, but steering around is better than watching
+    // them grind along a habitat ring. Each hazard carries its own avoid range,
+    // so a mine gets a tight berth and a station a wide one.
+    //
+    // This is deliberately imperfect: it is a steering bias, not a guarantee, so
+    // an enemy under pressure can still blunder into a mine. That is a good
+    // moment, not a bug.
     for (const hazard of hazards) {
       _push.subVectors(self.position, hazard.center)
       const d = _push.length()
-      const trigger = hazard.radius + HAZARD_AVOID_RANGE
+      const trigger = hazard.radius + hazard.avoidRange
       if (d > trigger || d < 1e-3) continue
       _aimPoint.addScaledVector(_push.multiplyScalar(1 / d), (trigger - d) * 2.2)
     }

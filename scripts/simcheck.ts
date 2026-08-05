@@ -21,7 +21,8 @@ import type { Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { mulberry32 } from '../src/core/rng'
 import { SHIPS } from '../src/ships/specs'
-import { ARENA_HARD_LIMIT, ARENA_RADIUS, type Environment } from '../src/world/environment'
+import { ARENA_HARD_LIMIT, ARENA_RADIUS, type Environment, type Hazard } from '../src/world/environment'
+import { buildMinefield, MINE_DAMAGE } from '../src/world/mines'
 
 const STEP = 1 / 60
 
@@ -404,13 +405,22 @@ function stubInput(): Input & { write: InputState } {
   } as Input & { write: InputState }
 }
 
-/** An empty arena: no stations, so this measures the dogfight and nothing else. */
+/**
+ * An empty arena: no stations and no mines, so this measures the dogfight and
+ * nothing else. Mines get their own dedicated checks below.
+ */
 function stubEnvironment(): Environment {
   const group = new THREE.Group()
   return {
     group,
     stations: [],
     hazards: [],
+    minefield: buildMinefield({
+      count: 0,
+      arenaRadius: ARENA_RADIUS,
+      hazards: [],
+      spawn: new THREE.Vector3(),
+    }),
     planet: {
       group: new THREE.Group(),
       radius: 1,
@@ -427,17 +437,31 @@ function stubEnvironment(): Environment {
 /**
  * Verifies the *win transition*, not the difficulty curve.
  *
- * Three things are pinned down so this is an assertion rather than a coin flip:
+ * The pilot here is a proportional controller, which is a poor stand-in for a
+ * human: it treats a jinking target's lead point as raw signal and oscillates,
+ * where a person reading the lead pip anticipates. Tuning it until it could beat
+ * the real balance would be testing the autopilot rather than the game. So the
+ * fight is stacked instead, and deliberately stacked *hard*:
  *
- * - `Math.random` is seeded. Spawn placement, AI jink and roster order all use
- *   it, so an unseeded run varies enormously — the first version of this check
- *   passed and failed on alternate runs, which is worse than having no check.
- * - Enemy hulls drop to one volley. A proportional controller is a poor stand-in
- *   for a human: it treats a jinking target's lead point as raw signal and
- *   oscillates, where a person reading the lead pip anticipates. Tuning an
- *   autopilot until it beat the real balance would be testing the autopilot.
- * - The player is made unkillable, so the only way the run can end is by
- *   clearing the roster. That is the transition under test.
+ * - the player cannot die, so the only way the run can end is a cleared roster;
+ * - enemy hulls fall to one hit;
+ * - the player's guns fire fast with near-instant bolts;
+ * - and enemy hit spheres are inflated to 350 units, so aim is removed from the
+ *   equation altogether.
+ *
+ * That last lever is what makes this an assertion rather than a coin flip.
+ * Stacking damage and rate of fire alone was not enough — measured across seven
+ * seeds it still failed two, because a proportional controller sometimes never
+ * closes to firing range at all, and no amount of volume fixes never being in
+ * range. Whether a pilot *can* hit is already covered by the bolt checks above;
+ * this test is only about the orchestration on top: the spawn queue draining,
+ * dead hostiles being retired, the win being detected, and the bonuses landing.
+ *
+ * The seed is still pinned so the reported numbers are reproducible, but nothing
+ * depends on it. It used to: an earlier version leaned on a lucky seed and broke
+ * the moment an unrelated change added two `THREE` objects to the scene, because
+ * `MathUtils.generateUUID` draws from `Math.random`, so constructing any
+ * geometry or material shifts the stream and the whole run diverges.
  */
 function testARunCanBeWon(): void {
   section('A cleared roster reports a win')
@@ -450,9 +474,20 @@ function testARunCanBeWon(): void {
     drone: SHIPS.drone.maxHull,
     hornet: SHIPS.hornet.maxHull,
   }
+  const originalGuns = {
+    fireInterval: SHIPS.hornet.fireInterval,
+    boltSpeed: SHIPS.hornet.boltSpeed,
+    damage: SHIPS.hornet.damage,
+  }
+  const originalRadii = { wasp: SHIPS.wasp.radius, drone: SHIPS.drone.radius }
   SHIPS.wasp.maxHull = 12
   SHIPS.drone.maxHull = 12
   SHIPS.hornet.maxHull = 1_000_000
+  SHIPS.hornet.fireInterval = 0.03
+  SHIPS.hornet.boltSpeed = 6000
+  SHIPS.hornet.damage = 200
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
 
   const input = stubInput()
   let result: RunResult | null = null
@@ -484,9 +519,12 @@ function testARunCanBeWon(): void {
       // against something crossing at hundreds of units a second.
       input.write.pitch = clampTo(target.pitch * 3, -1, 1)
       input.write.yaw = clampTo(target.yaw * 3, -1, 1)
-      const gate = Math.atan2(26, Math.max(60, target.range))
+      // A generous cone on purpose. Gating on the angle a hull actually subtends
+      // is a 0.026 rad needle at 1000 units, and a proportional controller
+      // almost never sits inside it — one seed in four never fired enough to
+      // finish. Volume of fire is what makes this seed-independent.
       input.write.fire =
-        Math.abs(target.pitch) < gate && Math.abs(target.yaw) < gate && target.range < 1000
+        Math.abs(target.pitch) < 0.35 && Math.abs(target.yaw) < 0.35 && target.range < 1200
       input.write.throttleUp = target.range > 260
       input.write.throttleDown = target.range < 170
     } else {
@@ -503,6 +541,11 @@ function testARunCanBeWon(): void {
   SHIPS.wasp.maxHull = originalHulls.wasp
   SHIPS.drone.maxHull = originalHulls.drone
   SHIPS.hornet.maxHull = originalHulls.hornet
+  SHIPS.hornet.fireInterval = originalGuns.fireInterval
+  SHIPS.hornet.boltSpeed = originalGuns.boltSpeed
+  SHIPS.hornet.damage = originalGuns.damage
+  SHIPS.wasp.radius = originalRadii.wasp
+  SHIPS.drone.radius = originalRadii.drone
   Math.random = realRandom
 
   const run = result as RunResult | null
@@ -512,7 +555,13 @@ function testARunCanBeWon(): void {
   check('the run scored points', (run?.score ?? 0) > 0, `score=${run?.score}`)
   check('accuracy was recorded', (run?.accuracy ?? 0) > 0, `accuracy=${run?.accuracy?.toFixed(3)}`)
   check('a win awards the hull and time bonuses', (run?.score ?? 0) > 6 * SHIPS.wasp.bounty, `score=${run?.score}`)
-  check('the player spec was restored', SHIPS.hornet.maxHull === originalHulls.hornet)
+  check(
+    'the player spec was restored',
+    SHIPS.hornet.maxHull === originalHulls.hornet &&
+      SHIPS.hornet.damage === originalGuns.damage &&
+      SHIPS.hornet.fireInterval === originalGuns.fireInterval &&
+      SHIPS.wasp.radius === originalRadii.wasp,
+  )
   if (run) {
     console.log(
       `       cleared in ${run.time.toFixed(1)}s · score ${run.score} · accuracy ${(run.accuracy * 100).toFixed(0)}%`,
@@ -526,6 +575,87 @@ function clampTo(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v
 }
 
+function testMines(): void {
+  section('Mines detonate on contact and stay detonated')
+
+  const stations: Hazard[] = [
+    { center: new THREE.Vector3(0, 0, -2000), radius: 80, avoidRange: 520, name: 'TEST STATION' },
+  ]
+  const spawn = new THREE.Vector3(0, 120, 1400)
+
+  const field = buildMinefield({ count: 26, arenaRadius: ARENA_RADIUS, hazards: stations, spawn })
+
+  check('the field placed mines', field.mines.length > 0, `placed=${field.mines.length}`)
+  check('all mines start armed', field.mines.every((m) => m.live))
+  check('every live mine is offered to the AI', field.avoidance.length === field.mines.length)
+
+  // Placement contract: nothing inside the player spawn, a station, or another mine.
+  const tooCloseToSpawn = field.mines.filter((m) => m.position.distanceTo(spawn) < 620).length
+  const insideStation = field.mines.filter((m) =>
+    stations.some((s) => m.position.distanceTo(s.center) < s.radius + 240),
+  ).length
+  let clustered = 0
+  for (let i = 0; i < field.mines.length; i++) {
+    for (let j = i + 1; j < field.mines.length; j++) {
+      if (field.mines[i].position.distanceTo(field.mines[j].position) < 260) clustered++
+    }
+  }
+  const outsideArena = field.mines.filter((m) => m.position.length() > ARENA_RADIUS).length
+
+  check('none sit on the player spawn', tooCloseToSpawn === 0, `${tooCloseToSpawn} too close`)
+  check('none sit inside a station', insideStation === 0, `${insideStation} overlapping`)
+  check('none are clustered together', clustered === 0, `${clustered} pairs under 260u`)
+  check('all are inside the arena', outsideArena === 0, `${outsideArena} outside`)
+
+  /* ---- Contact ---------------------------------------------------------- */
+
+  const bolts = createBolts()
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+
+  const target = field.mines[0]
+  const ship = new Ship(SHIPS.hornet, 'player')
+  ship.spawn(target.position.clone(), new THREE.Vector3(0, 0, 0))
+  ship.warpTimer = 0
+
+  check('a ship on top of a mine registers contact', field.findContact(ship.position, ship.radius) === target)
+
+  const before = ship.hull
+  field.detonate(target)
+  ship.takeDamage(MINE_DAMAGE, 'enemy')
+
+  check('detonation damages the ship', ship.hull === before - MINE_DAMAGE, `hull=${ship.hull}`)
+  check('a detonated mine is dead', !target.live)
+  check(
+    'a detonated mine no longer registers contact',
+    field.findContact(ship.position, ship.radius) === null,
+  )
+  check('the AI avoid list shrank', field.avoidance.length === field.mines.length - 1)
+
+  // The same mine must not keep hurting a ship parked inside its shell.
+  const parked = ship.hull
+  for (let i = 0; i < 60; i++) {
+    if (field.findContact(ship.position, ship.radius)) ship.takeDamage(MINE_DAMAGE, 'enemy')
+    ship.step(controls(), STEP, ctx)
+  }
+  check('a dead mine cannot re-trigger', ship.hull === parked, `hull=${ship.hull} vs ${parked}`)
+
+  /* ---- Reset ------------------------------------------------------------ */
+
+  field.reset()
+  check('reset re-arms the whole field', field.mines.every((m) => m.live))
+  check('reset restores the avoid list', field.avoidance.length === field.mines.length)
+
+  // A mine is a serious punishment but must not one-shot any airframe.
+  const survives = (['wasp', 'hornet', 'drone'] as const).every(
+    (id) => SHIPS[id].maxHull > MINE_DAMAGE,
+  )
+  check('no airframe is one-shot by a mine', survives, `mine=${MINE_DAMAGE}, wasp=${SHIPS.wasp.maxHull}`)
+
+  bolts.dispose()
+  ship.dispose()
+  field.dispose()
+}
+
 /* -------------------------------------------------------------------------- */
 
 console.log('NEON ORBIT — headless simulation checks')
@@ -534,6 +664,7 @@ testFriendlyFireIsOff()
 testBoundaryTurnsShipsAround()
 testQuirks()
 testBoltPoolDoesNotLeak()
+testMines()
 testARunCanBeWon()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)

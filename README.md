@@ -50,6 +50,18 @@ Whichever you pick, three of each of the other two types make up the opposing sq
 all six to win; lose your hull and the run is recorded as a loss. High scores are per-airframe,
 in `localStorage`.
 
+## Hazards
+
+**Stations** are solid on their core only — rings, trusses and solar panels are fly-through, so
+threading a habitat ring at full throttle stays available. Hitting a core scrapes your hull and
+bounces you off.
+
+**Mines** are the red spiky ones. Twenty-six of them, scattered on a fixed seed, and they take
+45 hull off anything that touches them — you, or a hostile that gets chased into one. That is
+survivable in every airframe but costs a Wasp two thirds of its hull. Enemies steer around them,
+but only loosely, so pressure can still push one onto a mine. They detonate once and stay gone
+for the rest of the run.
+
 ## How it fits together
 
 ```

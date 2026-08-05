@@ -9,6 +9,7 @@
 import * as THREE from 'three'
 import { chunk } from '../core/geo'
 import { makeRng, WORLD_SEED } from '../core/rng'
+import { buildMinefield, type Minefield } from './mines'
 import { buildPlanet, type Planet } from './planet'
 import { buildSky, type Sky } from './sky'
 import { buildStations, type Station } from './stations'
@@ -20,6 +21,17 @@ export const ARENA_HARD_LIMIT = 4300
 
 export const SUN_DIRECTION = new THREE.Vector3(0.52, 0.34, -0.78).normalize()
 
+/**
+ * Where the player enters the arena. Lives here rather than in the game loop so
+ * the minefield can be laid out around it — nobody should spawn inside a mine.
+ */
+export const PLAYER_SPAWN = new THREE.Vector3(0, 120, 1400)
+/** Player's initial heading target. */
+export const PLAYER_SPAWN_LOOK = new THREE.Vector3(0, 0, -200)
+
+/** How wide a berth an AI gives a station. */
+const STATION_AVOID_RANGE = 520
+
 const PLANET_RADIUS = 6000
 const PLANET_CENTER = new THREE.Vector3(0, -10500, -2600)
 
@@ -27,13 +39,23 @@ const PLANET_CENTER = new THREE.Vector3(0, -10500, -2600)
 export interface Hazard {
   center: THREE.Vector3
   radius: number
+  /**
+   * How far out an AI starts steering around this. Per-hazard rather than one
+   * global constant because the two kinds differ by an order of magnitude: a
+   * station needs a wide berth, while giving two dozen mines the same 520-unit
+   * bubble would shove enemies around the arena permanently.
+   */
+  avoidRange: number
   name: string
 }
 
 export interface Environment {
   group: THREE.Group
   stations: Station[]
+  /** Solid obstacles: ships bounce off these and bolts stop on them. */
   hazards: Hazard[]
+  /** Mines detonate on contact instead, so they are tracked separately. */
+  minefield: Minefield
   planet: Planet
   update(dt: number): void
   dispose(): void
@@ -186,18 +208,30 @@ export function buildEnvironment(): Environment {
   const hazards: Hazard[] = stations.map((s) => ({
     center: s.center,
     radius: s.hazardRadius,
+    avoidRange: STATION_AVOID_RANGE,
     name: s.name,
   }))
+
+  // Mines are placed after the stations so they can be kept out of them.
+  const minefield = buildMinefield({
+    count: 26,
+    arenaRadius: ARENA_RADIUS,
+    hazards,
+    spawn: PLAYER_SPAWN,
+  })
+  group.add(minefield.group)
 
   return {
     group,
     stations,
     hazards,
+    minefield,
     planet,
     update(dt: number) {
       sky.update(dt)
       planet.update(dt)
       debris.update(dt)
+      minefield.update(dt)
       for (const s of stations) s.update(dt)
     },
     dispose() {
@@ -205,6 +239,7 @@ export function buildEnvironment(): Environment {
       planet.dispose()
       debris.dispose()
       boundary.dispose()
+      minefield.dispose()
     },
   }
 }
