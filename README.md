@@ -71,13 +71,41 @@ survivable in every airframe but costs a Wasp two thirds of its hull. Enemies st
 but only loosely, so pressure can still push one onto a mine. They detonate once and stay gone
 for the rest of the run.
 
+## Power-ups
+
+Nine pods on a fixed seed, floating and slowly turning. Fly through one to collect it.
+
+| | Repair pod | Overdrive pod |
+|---|---|---|
+| Looks like | A green heart | A violet double chevron |
+| Count | 6 | 3 |
+| Effect | +35 hull | 2× fire rate and 2× damage for 18s |
+| Comes back after | 25s | 45s |
+
+**The pods are the minefield pointed the other way** — same seeded placement, same instanced
+geometry, same contact test. That is deliberate. A mine is 45 flat damage and a repair pod is 35
+flat healing, so both matter most to the thinnest hull: the Wasp fears the minefield exactly as
+much as it loves the pods. The repair number stays *under* the mine number on purpose, or the
+minefield stops being terrain you route around and becomes a toll you pay on the way through.
+
+**Overdrive multiplies out to 4× damage, but not for everyone.** It does not discount gun heat,
+so a boosted Wasp banks heat twice as fast and redlines in half the time — 3.1× sustained where
+the Hornet and the Drone get the full 4×. The airframe that already fires fastest gains least
+from firing faster still, which is the argument the heat quirk makes everywhere else.
+`scripts/balance.ts` measures both and prints the table.
+
+A second pod **refreshes** the clock rather than stacking it. The HUD carries a violet gauge for
+the whole buff and a centre countdown for the last ten seconds. Pods are player-only: nothing in
+`EnemyPilot` steers toward one, so a hostile collecting one would be a coin flip that quadrupled
+its damage with no tell and no counterplay — see the note at the top of `src/world/pickups.ts`.
+
 ## How it fits together
 
 ```
 src/
   core/     stage (renderer + bloom), input, audio, scores, geo, rng
   ships/    stat specs, procedural hull geometry
-  world/    planet, stations, sky, arena assembly
+  world/    planet, stations, mines, power-up pods, sky, arena assembly
   game/     flight model, AI, projectiles, effects, camera, HUD, orchestration
   ui/       hangar, pause and debrief screens
 scripts/
@@ -121,7 +149,8 @@ all pure maths over three.js vector types, no canvas needed. It exists because i
 verification proved unreliable: a throttled tab stops firing `requestAnimationFrame`, which
 silently freezes the loop and makes every behavioural observation meaningless. It asserts the
 combat contract (hits land, kills register, friendly fire is off), the hull quirks, the
-boundary, and that clearing the roster reports a win.
+boundary, the power-up pods (placement, collection, respawn, and that Overdrive expires and does
+not survive a respawn) and that clearing the roster reports a win.
 
 `scripts/balance.ts` is the same idea pointed at fairness instead of correctness. It flies pinned
 duels — every airframe against every other, every bolt on target — and prints alpha strike,

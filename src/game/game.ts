@@ -24,6 +24,13 @@ import {
   type Hazard,
 } from '../world/environment'
 import { MINE_DAMAGE } from '../world/mines'
+import {
+  OVERDRIVE_DURATION,
+  OVERDRIVE_WARN_AT,
+  PICKUP_COLOR,
+  REPAIR_AMOUNT,
+  type PickupKind,
+} from '../world/pickups'
 import { EnemyPilot } from './ai'
 import { createBolts, type Bolts } from './bolts'
 import { createChaseCamera, type ChaseCamera } from './chase'
@@ -54,6 +61,12 @@ const RETICLE_RANGE = 900
 
 /** Mine detonation colour — matches the hull, not the shooter's accent. */
 const MINE_FLASH = new THREE.Color(0xff3324)
+
+/** Collection flashes, matching each pod's own glow. */
+const PICKUP_FLASH = {
+  repair: new THREE.Color(PICKUP_COLOR.repair),
+  overdrive: new THREE.Color(PICKUP_COLOR.overdrive),
+}
 
 const _spawnDir = new THREE.Vector3()
 const _spawnPos = new THREE.Vector3()
@@ -102,6 +115,10 @@ export interface RunSnapshot {
    *  reason as the bearing below: so the burn is inspectable from the console
    *  rather than only visible as a hull bar going down. */
   solarExposure: number
+  /** Seconds of Overdrive left, 0 when the guns are stock. Exposed for the same
+   *  reason as `solarExposure`: a scripted pilot should be able to see the buff
+   *  it is flying under without inferring it from its own rate of fire. */
+  overdrive: number
   /**
    * Body-frame bearing to the locked target's **lead point** — where to point
    * the nose for the shot to connect — in radians, plus range. Plain numbers
@@ -109,6 +126,15 @@ export interface RunSnapshot {
    * console and a scripted pilot can fly the game.
    */
   target: { yaw: number; pitch: number; range: number; hull: number } | null
+  /**
+   * The same bearing to the nearest armed pod of each kind. Here for the same
+   * reason as `target`: a scripted pilot that cannot see where the pods are
+   * cannot fly to one, which leaves the whole feature untestable outside a
+   * human's hands. Split by kind rather than one nearest-overall, because the
+   * two are worth different detours and "where is my next heal" is a different
+   * question from "where is my next gun buff".
+   */
+  pickups: Record<PickupKind, { yaw: number; pitch: number; range: number } | null>
 }
 
 export interface GameDeps {
@@ -151,6 +177,9 @@ export function createGame(deps: GameDeps): Game {
   /** Whether the player was in the star's light last frame, so the callout
    *  fires on entry instead of every frame. */
   let wasSearing = false
+  /** Set once Overdrive crosses the warning threshold, so the callout and the
+   *  chirp fire on the crossing rather than every frame of the countdown. */
+  let overdriveWarned = false
   /** The hostile the player is holding. Damage only becomes kills with a lock. */
   let lockedTarget: Ship | null = null
   /** Set on the frame the run resolves, so the loop stops before reporting. */
@@ -328,6 +357,46 @@ export function createGame(deps: GameDeps): Game {
   }
 
   /* ------------------------------------------------------------------------ */
+  /* Power-up pods                                                            */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * The counterpart to `resolveMines`, with one deliberate difference: only the
+   * player's hull is offered. Hostiles fly straight through pods. The reasoning
+   * lives in `world/pickups.ts`; the short version is that nothing steers toward
+   * a pod, so an AI collecting one would be a coin flip that quadrupled its
+   * damage with no tell.
+   *
+   * Checked after everyone has moved, like mines, so contact resolves against
+   * final positions rather than a stale frame.
+   */
+  function resolvePickups(): void {
+    if (!player || !player.alive || player.warpTimer > 0) return
+
+    const field = environment.pickups
+    const pod = field.findContact(player.position, player.radius)
+    if (!pod) return
+
+    if (pod.kind === 'repair') {
+      const healed = player.repair(REPAIR_AMOUNT)
+      // Nothing to repair: leave the pad armed rather than burning it on a full
+      // hull. Flying over spare parts you do not need should cost you nothing.
+      if (healed <= 0) return
+      hud.feed(`HULL +${Math.round(healed)}`)
+      hud.callout('HULL REPAIRED', PICKUP_COLOR.repair, 0.9)
+    } else {
+      player.engageOverdrive(OVERDRIVE_DURATION)
+      overdriveWarned = false
+      hud.feed('OVERDRIVE ENGAGED')
+      hud.callout('OVERDRIVE', PICKUP_COLOR.overdrive, 1.2)
+    }
+
+    field.collect(pod)
+    fx.collect(pod.position, PICKUP_FLASH[pod.kind])
+    audio.pickup(pod.kind === 'overdrive')
+  }
+
+  /* ------------------------------------------------------------------------ */
   /* Targeting                                                                */
   /* ------------------------------------------------------------------------ */
 
@@ -493,6 +562,7 @@ export function createGame(deps: GameDeps): Game {
     /* Mines. Checked after everyone has moved, so contact is resolved against
        final positions rather than a stale frame. */
     resolveMines()
+    resolvePickups()
 
     /* Presentation */
     player.syncVisual()
@@ -553,6 +623,13 @@ export function createGame(deps: GameDeps): Game {
       reticleNdcY: _reticle.y,
       boundaryOvershoot: player.boundaryOvershoot,
       solarExposure: player.solarExposure,
+      overdrive: player.overdriven
+        ? {
+            remaining: player.overdriveTimer,
+            fraction: player.overdriveTimer / OVERDRIVE_DURATION,
+            expiring: player.overdriveTimer <= OVERDRIVE_WARN_AT,
+          }
+        : null,
       target: targetReadout(),
     })
     hud.updateContacts(contactBuffer, camera)
@@ -581,6 +658,18 @@ export function createGame(deps: GameDeps): Game {
       searAlarmTimer = 0
     }
     wasSearing = exposure > 0
+
+    /* Overdrive running out. One chirp on the crossing and nothing after — an
+       alarm every frame of the last ten seconds would train the player to
+       ignore the alarm that means a low hull.
+       No callout to go with it: the banner appearing, the gauge turning amber
+       and starting to flash, and this chirp are already three signals, and a
+       fourth saying the same words landed on top of the banner it was
+       announcing. The banner arriving *is* the announcement. */
+    if (player.overdriven && player.overdriveTimer <= OVERDRIVE_WARN_AT && !overdriveWarned) {
+      overdriveWarned = true
+      audio.alarm()
+    }
 
     retireDead()
 
@@ -641,12 +730,14 @@ export function createGame(deps: GameDeps): Game {
       alarmTimer = 0
       searAlarmTimer = 0
       wasSearing = false
+      overdriveWarned = false
       lockedTarget = null
       ending = false
       best = deps.bestScoreFor(shipId)
       playerControls.throttle = 0.6
 
       environment.minefield.reset()
+      environment.pickups.reset()
       rebuildAvoidList()
 
       hud.setShip(spec)
@@ -676,18 +767,34 @@ export function createGame(deps: GameDeps): Game {
     snapshot() {
       if (!player) return null
 
+      /** World point → yaw/pitch in the player's own frame. */
+      function bearingTo(point: THREE.Vector3): { yaw: number; pitch: number } {
+        _toEnemy.subVectors(point, player!.position)
+        _inverseQuat.copy(player!.quaternion).invert()
+        _toEnemy.applyQuaternion(_inverseQuat)
+        return {
+          yaw: Math.atan2(_toEnemy.x, -_toEnemy.z),
+          pitch: Math.atan2(_toEnemy.y, Math.hypot(_toEnemy.x, _toEnemy.z)),
+        }
+      }
+
       let bearing: RunSnapshot['target'] = null
       if (lockedTarget && lockedTarget.alive) {
         solveLead(lockedTarget, _lead)
-        _toEnemy.subVectors(_lead, player.position)
-        _inverseQuat.copy(player.quaternion).invert()
-        _toEnemy.applyQuaternion(_inverseQuat)
         bearing = {
-          yaw: Math.atan2(_toEnemy.x, -_toEnemy.z),
-          pitch: Math.atan2(_toEnemy.y, Math.hypot(_toEnemy.x, _toEnemy.z)),
+          ...bearingTo(_lead),
           range: lockedTarget.position.distanceTo(player.position),
           hull: lockedTarget.hullFraction,
         }
+      }
+
+      const nearestPods: RunSnapshot['pickups'] = { repair: null, overdrive: null }
+      for (const pod of environment.pickups.pods) {
+        if (!pod.live) continue
+        const range = pod.position.distanceTo(player.position)
+        const held = nearestPods[pod.kind]
+        if (held && held.range <= range) continue
+        nearestPods[pod.kind] = { ...bearingTo(pod.position), range }
       }
 
       return {
@@ -700,7 +807,9 @@ export function createGame(deps: GameDeps): Game {
         enemiesQueued: queue.length,
         elapsed,
         solarExposure: player.solarExposure,
+        overdrive: player.overdriveTimer,
         target: bearing,
+        pickups: nearestPods,
       }
     },
 

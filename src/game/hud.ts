@@ -60,6 +60,13 @@ export interface HudFrame {
   boundaryOvershoot: number
   /** How hard the star is cooking the hull, 0..1. */
   solarExposure: number
+  /**
+   * Overdrive state, or null when the guns are stock. A fraction *and* a raw
+   * second count rather than the seconds plus a duration constant, so the HUD
+   * never has to import a balance number to draw a bar — same reason the hull
+   * arrives here as `hullFraction` instead of hull and max.
+   */
+  overdrive: { remaining: number; fraction: number; expiring: boolean } | null
   target: HudTarget | null
 }
 
@@ -130,6 +137,18 @@ export function createHud(parent: HTMLElement): Hud {
   const quirkGauge = el('div', 'gauge quirk')
   const quirkFill = el('i')
   quirkGauge.append(quirkFill)
+
+  // Overdrive lives in the airframe panel rather than with the warnings,
+  // because it is a system readout: it belongs next to hull and gun heat, not
+  // next to "you are leaving the patrol zone". The panel grows when the buff is
+  // up and collapses when it is not, so it costs nothing on a stock run.
+  const odBlock = el('div', 'hud-od')
+  const odGauge = el('div', 'gauge overdrive')
+  const odFill = el('i')
+  odGauge.append(odFill)
+  odBlock.append(el('div', 'hud-label', 'OVERDRIVE'), odGauge)
+  odBlock.hidden = true
+
   tl.append(
     el('div', 'hud-label', 'AIRFRAME'),
     shipName,
@@ -138,6 +157,7 @@ export function createHud(parent: HTMLElement): Hud {
     hullReadout,
     quirkLabel,
     quirkGauge,
+    odBlock,
   )
 
   const tr = el('div', 'hud-corner hud-tr')
@@ -211,6 +231,14 @@ export function createHud(parent: HTMLElement): Hud {
   sear.id = 'sear'
   sear.hidden = true
 
+  // The last-ten-seconds countdown, third in the top-centre banner stack. It
+  // reads as violet against the warnings' amber, which is what keeps "your buff
+  // is ending" from being mistaken for "you are being hurt" — see the note in
+  // style.css for why it is not somewhere further from them.
+  const overdrive = el('div')
+  overdrive.id = 'overdrive'
+  overdrive.hidden = true
+
   const searGlare = el('div')
   searGlare.id = 'searglare'
 
@@ -241,6 +269,7 @@ export function createHud(parent: HTMLElement): Hud {
     callout,
     bounds,
     sear,
+    overdrive,
     killfeed,
     lockPrompt,
   )
@@ -336,6 +365,22 @@ export function createHud(parent: HTMLElement): Hud {
       // the overlay only has to push the edges — much past this and the
       // reticle stops being readable exactly when you need to fly out.
       searGlare.style.opacity = (frame.solarExposure * 0.55).toFixed(3)
+
+      // The gauge is up for the whole buff so you always know you have it; the
+      // banner only appears for the last stretch, so the countdown itself is
+      // the signal that it is running out.
+      const od = frame.overdrive
+      odBlock.hidden = !od
+      overdrive.hidden = !od?.expiring
+      if (od) {
+        odFill.style.width = `${od.fraction * 100}%`
+        odGauge.classList.toggle('expiring', od.expiring)
+        if (od.expiring) {
+          // One decimal: a whole-second counter looks stalled at 60fps, and
+          // two decimals is noise nobody can read while flying.
+          overdrive.textContent = `⏱ OVERDRIVE  ${od.remaining.toFixed(1)}`
+        }
+      }
 
       const target = frame.target
       if (target) {

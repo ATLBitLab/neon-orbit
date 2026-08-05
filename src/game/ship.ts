@@ -22,6 +22,7 @@ import {
   solarExposure as solarExposureAt,
   type Hazard,
 } from '../world/environment'
+import { OVERDRIVE_DAMAGE_MULT, OVERDRIVE_RATE_MULT } from '../world/pickups'
 import type { BoltTarget, Bolts, Team } from './bolts'
 
 export interface Controls {
@@ -112,6 +113,18 @@ export class Ship implements BoltTarget {
   fireTimer = 0
   shotsFired = 0
 
+  /**
+   * Seconds of Overdrive remaining; zero when the guns are running stock.
+   *
+   * Lives on `Ship` rather than on the player specifically because everything
+   * else about the guns already does, and a buff that only existed on one of
+   * two ship classes would be the first thing in this file to make the player
+   * and an AI structurally different. Nothing sets it on an enemy today — see
+   * the note in `world/pickups.ts` — but the flight model does not need to know
+   * that.
+   */
+  overdriveTimer = 0
+
   /** 0 inside the patrol zone, 1 at the hard limit. Refreshed once per step. */
   private boundaryDepth = 0
 
@@ -144,6 +157,10 @@ export class Ship implements BoltTarget {
   /** False while materialising or phase-dashing — bolts pass straight through. */
   get targetable(): boolean {
     return this.alive && this.warpTimer <= 0 && this.dashTimer <= 0
+  }
+
+  get overdriven(): boolean {
+    return this.overdriveTimer > 0
   }
 
   get hullFraction(): number {
@@ -207,7 +224,38 @@ export class Ship implements BoltTarget {
     this.sinceHit = 99
     this.solarExposure = 0
     this.searTimer = 0
+    this.overdriveTimer = 0
     this.syncVisual()
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Power-ups                                                                */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Restore hull, capped at the airframe's maximum. Returns what was actually
+   * taken, so the caller can leave a pod armed rather than burning it on a hull
+   * that had nothing to repair.
+   *
+   * Deliberately does not touch `sinceHit`. That field is the Drone's repair
+   * timer, and letting a pod reset it would mean collecting one *delays* nanite
+   * repair — a heal that switches your healing off.
+   */
+  repair(amount: number): number {
+    if (!this.alive || amount <= 0) return 0
+    const before = this.hull
+    this.hull = Math.min(this.spec.maxHull, this.hull + amount)
+    return this.hull - before
+  }
+
+  /**
+   * Grant Overdrive. Refreshes rather than stacking: collecting a second pod
+   * with time still on the clock resets it to full, but two pods can never buy
+   * thirty-six seconds. Stacking a multiplicative gun buff is how a run stops
+   * being a dogfight.
+   */
+  engageOverdrive(seconds: number): void {
+    this.overdriveTimer = Math.max(this.overdriveTimer, seconds)
   }
 
   /* ------------------------------------------------------------------------ */
@@ -221,6 +269,7 @@ export class Ship implements BoltTarget {
     this.sinceHit += dt
     this.flash = Math.max(0, this.flash - dt * 3.5)
     if (this.fireTimer > 0) this.fireTimer -= dt
+    if (this.overdriveTimer > 0) this.overdriveTimer = Math.max(0, this.overdriveTimer - dt)
 
     this.applyRotation(controls, dt)
     this.applyThrottle(controls, dt)
@@ -441,6 +490,8 @@ export class Ship implements BoltTarget {
     }
 
     const boltSpeed = this.spec.boltSpeed + Math.max(0, this.speed) * 0.35
+    const boosted = this.overdriveTimer > 0
+    const damage = boosted ? this.spec.damage * OVERDRIVE_DAMAGE_MULT : this.spec.damage
 
     for (const local of this.visual.muzzles) {
       _muzzle.copy(local).applyQuaternion(this.quaternion).add(this.position)
@@ -448,7 +499,7 @@ export class Ship implements BoltTarget {
         origin: _muzzle,
         direction,
         speed: boltSpeed,
-        damage: this.spec.damage,
+        damage,
         team: this.team,
         color: this.accent,
       })
@@ -461,10 +512,18 @@ export class Ship implements BoltTarget {
     // practice), and the error shrank on a 144Hz display, which quietly made
     // refresh rate a balance lever. Bounded by one frame, so a stalled tab
     // cannot bank shots.
-    this.fireTimer = this.spec.fireInterval + Math.min(0, this.fireTimer)
+    const interval = boosted ? this.spec.fireInterval / OVERDRIVE_RATE_MULT : this.spec.fireInterval
+    this.fireTimer = interval + Math.min(0, this.fireTimer)
     this.shotsFired++
     ctx.audio.laser(this.team)
 
+    // Heat is charged per shot and Overdrive does not discount it, so a boosted
+    // heat gun banks heat twice as fast and reaches the lockout in half the
+    // time. That is left alone rather than compensated for: it self-balances the
+    // buff, handing the Wasp roughly 3.2x sustained damage where the two guns
+    // without a heat quirk get the full 4x. The airframe that already fires
+    // fastest gains least from firing faster still, which is the same argument
+    // the quirk makes everywhere else. `scripts/balance.ts` measures both.
     const q = this.spec.quirk
     if (q.kind === 'heat') {
       this.heat += q.perShot
@@ -520,7 +579,11 @@ export class Ship implements BoltTarget {
     for (const flare of this.visual.thrusters) {
       flare.scale.set(0.6 + t * 0.5, 0.6 + t * 0.5, (0.25 + t * 1.15) * flicker)
     }
-    this.visual.thrusterMat.opacity = (0.12 + t * 0.42) * (phasing ? 0.4 : 1)
+    // Overdrive rides the exhaust rather than the hull. The hull emissive is
+    // already the damage flash's channel, and a buff that tints the hull would
+    // be competing for the same pixels as "you are being shot".
+    this.visual.thrusterMat.opacity =
+      (0.12 + t * 0.42) * (phasing ? 0.4 : 1) * (this.overdriveTimer > 0 ? 1.7 : 1)
 
     // Damage flash rides the hull emissive so it reads on every facet at once.
     // Written unconditionally: gating on `flash > 0` skips the frame it reaches

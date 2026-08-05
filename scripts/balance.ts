@@ -38,6 +38,13 @@ import {
 } from '../src/ships/specs'
 import { ARENA_HARD_LIMIT, SEAR_INNER, SUN_DIRECTION, SUN_DISTANCE } from '../src/world/environment'
 import { MINE_DAMAGE } from '../src/world/mines'
+import {
+  OVERDRIVE_DAMAGE_MULT,
+  OVERDRIVE_DURATION,
+  OVERDRIVE_RATE_MULT,
+  OVERDRIVE_WARN_AT,
+  REPAIR_AMOUNT,
+} from '../src/world/pickups'
 
 const STEP = 1 / 60
 /** Duel range. Close enough that flight time is noise, far enough to be real. */
@@ -83,6 +90,7 @@ function silentAudio(): Audio {
     explosion() {},
     warp() {},
     dash() {},
+    pickup() {},
     overheat() {},
     alarm() {},
     uiSelect() {},
@@ -184,7 +192,7 @@ function rig(attackerId: ShipId, targetId: ShipId): Rig {
  * every frame and the damage counted on the way in, so a twelve-second sample
  * covers several full heat cycles instead of ending at the first kill.
  */
-function measureDps(id: ShipId, policy: Policy): number {
+function measureDps(id: ShipId, policy: Policy, overdrive = false): number {
   const r = rig(id, 'drone')
   const wantsFire = trigger(SHIPS[id], policy)
 
@@ -195,6 +203,11 @@ function measureDps(id: ShipId, policy: Policy): number {
 
   for (let i = 0; i < WINDOW / STEP; i++) {
     r.target.hull = r.target.spec.maxHull
+    // Topped up every frame for the same reason the dummy's hull is: the sample
+    // window is longer than a single pod lasts, and what is being measured is
+    // the buff's ceiling, not how long it runs. Its duration is a separate
+    // lever, checked in the contract below.
+    if (overdrive) r.attacker.overdriveTimer = OVERDRIVE_DURATION
     r.step(wantsFire(r.attacker))
   }
   // Bolts fired inside the window still count; they just have not arrived yet.
@@ -208,13 +221,16 @@ function measureDps(id: ShipId, policy: Policy): number {
 }
 
 /** Seconds for a pinned attacker to kill a pinned, unresisting defender. */
-function measureTtk(attackerId: ShipId, defenderId: ShipId): number {
+function measureTtk(attackerId: ShipId, defenderId: ShipId, overdrive = false): number {
   const r = rig(attackerId, defenderId)
   const wantsFire = trigger(SHIPS[attackerId], 'feathered')
 
   let frames = 0
   const cap = 60 / STEP
-  for (; frames < cap && r.target.alive; frames++) r.step(wantsFire(r.attacker))
+  for (; frames < cap && r.target.alive; frames++) {
+    if (overdrive) r.attacker.overdriveTimer = OVERDRIVE_DURATION
+    r.step(wantsFire(r.attacker))
+  }
 
   const alive = r.target.alive
   r.dispose()
@@ -321,6 +337,49 @@ for (const id of SHIP_ORDER) {
   )
 }
 console.log('  Both hazards are flat, so both are hardest on the thinnest hull. Intentional.')
+
+section('Power-ups')
+console.log(
+  `  ${pad('', 8)}${padLeft('stock', 8)}${padLeft('overdrive', 11)}${padLeft('gain', 7)}` +
+    `${padLeft('alpha', 8)}${padLeft('repair', 9)}`,
+)
+const overdriven = new Map<ShipId, number>()
+for (const id of SHIP_ORDER) {
+  const spec = SHIPS[id]
+  const boosted = measureDps(id, 'feathered', true)
+  overdriven.set(id, boosted)
+  const share = ((REPAIR_AMOUNT / spec.maxHull) * 100).toFixed(0)
+  console.log(
+    `  ${pad(spec.name, 8)}${padLeft(best(id).toFixed(1), 8)}${padLeft(boosted.toFixed(1), 11)}` +
+      `${padLeft(`${(boosted / best(id)).toFixed(2)}x`, 7)}` +
+      `${padLeft((alphaStrike(spec) * OVERDRIVE_DAMAGE_MULT).toFixed(0), 8)}` +
+      `${padLeft(`${share}%`, 9)}`,
+  )
+}
+console.log(
+  `  Overdrive: ${OVERDRIVE_RATE_MULT}x rate, ${OVERDRIVE_DAMAGE_MULT}x damage, ` +
+    `${OVERDRIVE_DURATION}s, countdown at ${OVERDRIVE_WARN_AT}s. Repair pod: ${REPAIR_AMOUNT} hull.`,
+)
+console.log(
+  '  The heat airframe gains least, because Overdrive does not discount heat per shot.',
+)
+
+section('Time to kill under Overdrive (seconds, attacker down the side)')
+console.log(`  ${pad('', 8)}${SHIP_ORDER.map((id) => padLeft(SHIPS[id].name, 9)).join('')}`)
+const boostedTtk = new Map<string, number>()
+for (const attacker of SHIP_ORDER) {
+  const cells: string[] = []
+  for (const defender of SHIP_ORDER) {
+    if (attacker === defender) {
+      cells.push(padLeft('—', 9))
+      continue
+    }
+    const t = measureTtk(attacker, defender, true)
+    boostedTtk.set(`${attacker}>${defender}`, t)
+    cells.push(padLeft(Number.isFinite(t) ? `${t.toFixed(2)}` : '∞', 9))
+  }
+  console.log(`  ${pad(SHIPS[attacker].name, 8)}${cells.join('')}`)
+}
 
 section('Hangar cards')
 for (const id of SHIP_ORDER) {
@@ -443,6 +502,69 @@ for (const id of SHIP_ORDER) {
     `${Number.isFinite(t) ? `${t.toFixed(1)}s` : 'never'}`,
   )
 }
+
+/**
+ * A power-up you would not break off a fight to collect is set dressing. The
+ * pods sit hundreds of units off any line you were already flying, so the buff
+ * has to be worth the detour and the exposure of flying straight to get there.
+ */
+for (const id of SHIP_ORDER) {
+  const gain = overdriven.get(id)! / best(id)
+  check(
+    `Overdrive is worth the detour on a ${SHIPS[id].name}`,
+    gain > 2.5,
+    `${gain.toFixed(2)}x sustained DPS`,
+  )
+}
+
+/**
+ * Overdrive deliberately breaks the sub-second floor the stock matchups hold to
+ * — an overdriven Drone's volley is 80 damage into a 70-hull Wasp, so it does
+ * delete one. That is the payoff, not a bug. What still has to hold is that a
+ * death is *visible*: a hit flash and an explosion the player can connect to
+ * their own trigger pull. Under a quarter of a second and the Wasp is simply
+ * gone between frames.
+ */
+for (const [matchup, t] of boostedTtk) {
+  const [attacker, defender] = matchup.split('>')
+  check(
+    `an overdriven ${SHIPS[attacker as ShipId].name} kill on a ${SHIPS[defender as ShipId].name} is still readable`,
+    t > 0.25,
+    `${t.toFixed(2)}s`,
+  )
+}
+
+/**
+ * The repair pod is the mine's mirror and has to stay the smaller number. If a
+ * pod fully paid back a mine the minefield would stop being terrain you route
+ * around and become a toll — fly through anything, top up on the way out.
+ */
+check(
+  'a repair pod does not fully undo a mine',
+  REPAIR_AMOUNT < MINE_DAMAGE,
+  `${REPAIR_AMOUNT} hull back against ${MINE_DAMAGE} taken`,
+)
+
+/**
+ * Flat healing is worth least to the biggest hull, which is intended — it is
+ * the same argument as flat mine damage, pointed the other way. But it still
+ * has to be worth turning for on a Drone, or the pods are a Wasp-only feature.
+ */
+for (const id of SHIP_ORDER) {
+  const share = REPAIR_AMOUNT / SHIPS[id].maxHull
+  check(
+    `a repair pod is worth collecting on a ${SHIPS[id].name}`,
+    share > 0.15,
+    `${(share * 100).toFixed(0)}% of the hull`,
+  )
+}
+
+/** A buff with no clock is a stat change. */
+check(
+  'Overdrive runs out, and warns before it does',
+  OVERDRIVE_DURATION > 0 && OVERDRIVE_WARN_AT > 0 && OVERDRIVE_WARN_AT < OVERDRIVE_DURATION,
+  `${OVERDRIVE_DURATION}s with a countdown from ${OVERDRIVE_WARN_AT}s`,
+)
 
 console.log(
   failures === 0

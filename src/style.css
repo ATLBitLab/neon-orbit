@@ -11,6 +11,9 @@
   --lime: #b6ff3d;
   --amber: #ffb020;
   --red: #ff3b4e;
+  /* Overdrive. The one palette slot not already spoken for by an airframe
+     accent (cyan / magenta / amber), a hull state (lime / red) or a mine. */
+  --violet: #c94fff;
   --ink: rgba(4, 6, 16, 0.74);
   --ink-solid: #070a18;
   --hair: rgba(53, 245, 255, 0.28);
@@ -588,6 +591,28 @@ body {
   box-shadow: 0 0 14px var(--red);
 }
 
+/* Overdrive block. Collapses entirely on a stock run rather than sitting there
+   greyed out — an always-present gauge reading zero is a permanent reminder of
+   something you do not have. */
+.hud-od {
+  margin-top: 8px;
+}
+
+.hud-od[hidden] {
+  display: none;
+}
+
+.gauge.overdrive i {
+  background: var(--violet);
+  box-shadow: 0 0 12px var(--violet);
+}
+
+.gauge.overdrive.expiring i {
+  background: var(--amber);
+  box-shadow: 0 0 14px var(--amber);
+  animation: crit-pulse 0.55s steps(2, end) infinite;
+}
+
 .readout-row {
   display: flex;
   justify-content: space-between;
@@ -851,6 +876,39 @@ body {
 }
 
 #sear[hidden] {
+  display: none;
+}
+
+/* Overdrive countdown — the last ten seconds of the buff.
+   Third in the top-centre banner stack, under #bounds and #sear. It was
+   originally low-centre, on the reasoning that those two mean "you are being
+   hurt" while this means "you are about to be ordinary" and the two classes
+   deserve different parts of the screen. That lost to geometry: the chase
+   camera parks the hull around two thirds down, so a low-centre banner sits on
+   top of your own ship. Colour carries the distinction instead — violet against
+   the warnings' amber — which it was doing anyway. */
+#overdrive {
+  position: absolute;
+  left: 50%;
+  top: 12%;
+  margin-top: 88px;
+  transform: translateX(-50%);
+  padding: 8px 20px;
+  border: 1px solid var(--violet);
+  background: rgba(34, 8, 52, 0.74);
+  color: #f0d5ff;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 12px rgba(201, 79, 255, 0.9);
+  animation: warn-breathe 0.7s ease-in-out infinite;
+}
+
+#overdrive[hidden] {
   display: none;
 }
 
