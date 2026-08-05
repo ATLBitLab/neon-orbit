@@ -130,6 +130,10 @@ function boot() {
 
   function pauseRun() {
     if (screen !== 'flight') return
+    // The run is over and the wreck is still burning. Escape here — or the
+    // pointer lock the browser drops when you press it — must not park a pause
+    // menu in front of the explosion with a debrief already queued behind it.
+    if (game.dying) return
     screen = 'paused'
     game.pause()
     pause.show(input.invertPitch, audio.muted)
