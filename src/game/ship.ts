@@ -454,7 +454,14 @@ export class Ship implements BoltTarget {
       })
     }
 
-    this.fireTimer = this.spec.fireInterval
+    // Carry the overshoot. `fireTimer` stops decrementing once it passes zero,
+    // so the leftover is a record of how far into the frame the gun was ready —
+    // throwing it away rounds every fire interval up to a whole frame. At 60Hz
+    // that cost the Wasp's 0.085s interval a sixth of its rate (0.1s in
+    // practice), and the error shrank on a 144Hz display, which quietly made
+    // refresh rate a balance lever. Bounded by one frame, so a stalled tab
+    // cannot bank shots.
+    this.fireTimer = this.spec.fireInterval + Math.min(0, this.fireTimer)
     this.shotsFired++
     ctx.audio.laser(this.team)
 
