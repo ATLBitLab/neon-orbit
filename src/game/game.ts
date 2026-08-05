@@ -98,6 +98,10 @@ export interface RunSnapshot {
   enemiesAirborne: number
   enemiesQueued: number
   elapsed: number
+  /** How hard the star is cooking the player, 0..1. Exposed for the same
+   *  reason as the bearing below: so the burn is inspectable from the console
+   *  rather than only visible as a hull bar going down. */
+  solarExposure: number
   /**
    * Body-frame bearing to the locked target's **lead point** — where to point
    * the nose for the shot to connect — in radians, plus range. Plain numbers
@@ -143,6 +147,10 @@ export function createGame(deps: GameDeps): Game {
   let playerHits = 0
   let best = 0
   let alarmTimer = 0
+  let searAlarmTimer = 0
+  /** Whether the player was in the star's light last frame, so the callout
+   *  fires on entry instead of every frame. */
+  let wasSearing = false
   /** The hostile the player is holding. Damage only becomes kills with a lock. */
   let lockedTarget: Ship | null = null
   /** Set on the frame the run resolves, so the loop stops before reporting. */
@@ -546,6 +554,7 @@ export function createGame(deps: GameDeps): Game {
       reticleNdcX: _reticle.x,
       reticleNdcY: _reticle.y,
       boundaryOvershoot: player.boundaryOvershoot,
+      solarExposure: player.solarExposure,
       target: targetReadout(),
     })
     hud.updateContacts(contactBuffer, camera)
@@ -559,6 +568,21 @@ export function createGame(deps: GameDeps): Game {
         alarmTimer = 1.4
       }
     }
+
+    /* Solar proximity. The alarm tightens as the hull heats, so the interval
+       itself tells you whether you are getting out or getting worse. */
+    const exposure = player.solarExposure
+    if (exposure > 0) {
+      if (!wasSearing) hud.callout('SOLAR PROXIMITY', '#ffb020', 1.2)
+      searAlarmTimer -= dt
+      if (searAlarmTimer <= 0) {
+        audio.alarm()
+        searAlarmTimer = 1.3 - exposure * 0.95
+      }
+    } else {
+      searAlarmTimer = 0
+    }
+    wasSearing = exposure > 0
 
     retireDead()
 
@@ -617,6 +641,8 @@ export function createGame(deps: GameDeps): Game {
       multiplier = 1
       playerHits = 0
       alarmTimer = 0
+      searAlarmTimer = 0
+      wasSearing = false
       lockedTarget = null
       ending = false
       best = deps.bestScoreFor(shipId)
@@ -678,6 +704,7 @@ export function createGame(deps: GameDeps): Game {
         enemiesAirborne: pilots.length,
         enemiesQueued: queue.length,
         elapsed,
+        solarExposure: player.solarExposure,
         target: bearing,
       }
     },

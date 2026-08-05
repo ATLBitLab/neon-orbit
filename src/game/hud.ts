@@ -58,6 +58,8 @@ export interface HudFrame {
   reticleNdcY: number
   /** Units past the patrol line, or 0 while inside it. */
   boundaryOvershoot: number
+  /** How hard the star is cooking the hull, 0..1. */
+  solarExposure: number
   target: HudTarget | null
 }
 
@@ -205,6 +207,13 @@ export function createHud(parent: HTMLElement): Hud {
   bounds.id = 'bounds'
   bounds.hidden = true
 
+  const sear = el('div')
+  sear.id = 'sear'
+  sear.hidden = true
+
+  const searGlare = el('div')
+  searGlare.id = 'searglare'
+
   const contacts: { node: HTMLElement; arrow: HTMLElement; bracket: HTMLElement }[] = []
   for (let i = 0; i < MAX_CONTACTS; i++) {
     const node = el('div', 'contact')
@@ -219,7 +228,22 @@ export function createHud(parent: HTMLElement): Hud {
     root.append(node)
   }
 
-  root.append(warn, flash, tl, tr, bl, br, reticle, leadPip, callout, bounds, killfeed, lockPrompt)
+  root.append(
+    warn,
+    searGlare,
+    flash,
+    tl,
+    tr,
+    bl,
+    br,
+    reticle,
+    leadPip,
+    callout,
+    bounds,
+    sear,
+    killfeed,
+    lockPrompt,
+  )
   parent.append(root)
 
   /* ---- State ------------------------------------------------------------ */
@@ -298,6 +322,20 @@ export function createHud(parent: HTMLElement): Hud {
       if (straying) {
         bounds.textContent = `▲ Leaving patrol zone — turn back · ${Math.round(frame.boundaryOvershoot)} u`
       }
+
+      // The banner names the danger; the glare is the peripheral cue you can
+      // read without looking away from the reticle. Opacity is driven straight
+      // off exposure so the screen brightening *is* the warning.
+      const burning = frame.solarExposure > 0
+      sear.hidden = !burning
+      if (burning) {
+        sear.textContent = `☀ Solar proximity — hull searing · ${Math.round(frame.solarExposure * 100)}%`
+        sear.classList.toggle('critical', frame.solarExposure > 0.6)
+      }
+      // The star's own corona already fills most of the frame this close, so
+      // the overlay only has to push the edges — much past this and the
+      // reticle stops being readable exactly when you need to fly out.
+      searGlare.style.opacity = (frame.solarExposure * 0.55).toFixed(3)
 
       const target = frame.target
       if (target) {

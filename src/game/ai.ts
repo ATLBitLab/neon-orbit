@@ -13,7 +13,7 @@
  */
 
 import * as THREE from 'three'
-import { ARENA_RADIUS, type Hazard } from '../world/environment'
+import { ARENA_RADIUS, SEAR_OUTER, SUN_POSITION, type Hazard } from '../world/environment'
 import type { ShipId } from '../ships/specs'
 import type { Controls } from './ship'
 import { Ship } from './ship'
@@ -273,6 +273,18 @@ export class EnemyPilot {
       const trigger = hazard.radius + hazard.avoidRange
       if (d > trigger || d < 1e-3) continue
       _aimPoint.addScaledVector(_push.multiplyScalar(1 / d), (trigger - d) * 2.2)
+    }
+
+    // Sun avoidance, on the same push-away principle as the stations. Enemies
+    // burn on exactly the same curve the player does, so without this a pilot
+    // chasing you sunward cooks itself and the star becomes a free kill button.
+    // Deliberately only as strong as the station push: a hostile committed to a
+    // firing pass will still clip the edge of the zone and take a tick or two,
+    // which is what makes baiting one in there a real tactic rather than a bug.
+    _push.subVectors(self.position, SUN_POSITION)
+    const sunDist = _push.length()
+    if (sunDist < SEAR_OUTER && sunDist > 1e-3) {
+      _aimPoint.addScaledVector(_push.multiplyScalar(1 / sunDist), (SEAR_OUTER - sunDist) * 2.2)
     }
 
     // Leash to the arena. Without this a breaking or evading enemy happily flies

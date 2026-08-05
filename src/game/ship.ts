@@ -16,7 +16,12 @@ import * as THREE from 'three'
 import type { Audio } from '../core/audio'
 import { buildShip, disposeShipVisual, type ShipVisual } from '../ships/meshes'
 import type { ShipSpec } from '../ships/specs'
-import { ARENA_HARD_LIMIT, ARENA_RADIUS, type Hazard } from '../world/environment'
+import {
+  ARENA_HARD_LIMIT,
+  ARENA_RADIUS,
+  solarExposure as solarExposureAt,
+  type Hazard,
+} from '../world/environment'
 import type { BoltTarget, Bolts, Team } from './bolts'
 
 export interface Controls {
@@ -49,6 +54,15 @@ export const LOCAL_FORWARD = new THREE.Vector3(0, 0, -1)
 
 /** Seconds a ship spends materialising, during which it cannot be shot. */
 const WARP_DURATION = 0.85
+
+/** Hull damage per second at full solar exposure. */
+const SEAR_DPS = 30
+/**
+ * Burn is banked and spent in discrete ticks rather than applied every frame,
+ * so the damage flash, the hull thump and the camera shake fire at a readable
+ * rate instead of sixty times a second.
+ */
+const SEAR_TICK = 0.4
 
 // Module-level scratch. Ship.step runs for every ship every frame.
 const _euler = new THREE.Euler()
@@ -100,6 +114,11 @@ export class Ship implements BoltTarget {
 
   /** 0 inside the patrol zone, 1 at the hard limit. Refreshed once per step. */
   private boundaryDepth = 0
+
+  /** 0 clear of the star, 1 at the full burn rate. Refreshed once per step. */
+  solarExposure = 0
+  /** Seconds of burn banked since the last sear tick. */
+  private searTimer = 0
 
   onDeath?: (ship: Ship) => void
   onDamaged?: (ship: Ship, amount: number, from: Team) => void
@@ -186,6 +205,8 @@ export class Ship implements BoltTarget {
     this.fireTimer = 0
     this.flash = 0
     this.sinceHit = 99
+    this.solarExposure = 0
+    this.searTimer = 0
     this.syncVisual()
   }
 
@@ -208,6 +229,7 @@ export class Ship implements BoltTarget {
     this.integrate(dt)
     this.applyBoundary(dt)
     this.applyHazards(ctx.hazards)
+    this.applySolarSear(dt)
     this.applyQuirks(controls, dt)
 
     if (controls.fire) this.tryFire(ctx, controls.aim, controls.spread)
@@ -335,6 +357,37 @@ export class Ship implements BoltTarget {
         this.onCollide?.(this, impact)
       }
     }
+  }
+
+  /**
+   * Radiant damage from the star.
+   *
+   * Credited to the burning ship's *own* team, unlike a station scrape, which
+   * is credited to the opposition. Sear damage ticks for as long as a hull
+   * stays in the light, so crediting it to the player would count every tick
+   * as a shot landed and quietly destroy the accuracy stat. Baiting a hostile
+   * into the sun still clears it from the roster and still pays the bounty —
+   * it just is not recorded as marksmanship.
+   */
+  private applySolarSear(dt: number): void {
+    this.solarExposure = solarExposureAt(this.position)
+
+    // A materialising ship cannot steer, so burning one is a spawn killed for
+    // free rather than a pilot error.
+    if (this.solarExposure <= 0 || this.warpTimer > 0) {
+      this.searTimer = 0
+      return
+    }
+
+    this.searTimer += dt
+    if (this.searTimer < SEAR_TICK) return
+
+    const elapsed = this.searTimer
+    this.searTimer = 0
+    // Squared, so the outer edge is a warning you can back out of and the
+    // core is unsurvivable rather than the whole zone being uniformly bad.
+    const rate = SEAR_DPS * this.solarExposure * this.solarExposure
+    this.takeDamage(rate * elapsed, this.team)
   }
 
   private applyQuirks(controls: Controls, dt: number): void {
