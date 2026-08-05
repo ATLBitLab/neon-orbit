@@ -43,12 +43,21 @@ panel shows the locked target's hull and range.
 | Hull | 70 | 120 | 200 |
 | Top speed | 470 | 355 | 250 |
 | Turn rate | 1.95 rad/s | 1.45 rad/s | 0.95 rad/s |
-| Guns | 5 dmg @ 0.085s | 12 dmg × 2 @ 0.22s | 20 dmg × 2 @ 0.86s |
+| Guns | 5 dmg @ 0.085s | 10 dmg × 2 @ 0.30s | 20 dmg × 2 @ 0.86s |
+| Sustained DPS | 47 | 67 | 47 |
 | Quirk | Guns overheat and lock out | Phase dash — untargetable mid-dash | Hull self-repairs after 6.5s |
 
 Whichever you pick, three of each of the other two types make up the opposing squadron. Clear
 all six to win; lose your hull and the run is recorded as a loss. High scores are per-airframe,
 in `localStorage`.
+
+**Sustained DPS is what you hold, not what you peak at.** The Wasp's trigger is the fastest in
+the fleet and its heat bar is the reason it does not run away with the game: heat vents only
+while the trigger is up, so the airframe fires about three quarters of the time and a pilot who
+feathers it out-damages a pilot who holds it down by roughly half. Let it redline and the guns
+lock out for 2.9 seconds, which costs a third of your output. The card bars in the hangar are
+*derived* from these numbers rather than typed in, so they cannot drift away from the flight
+model — see `sustainedDps` in `src/ships/specs.ts`.
 
 ## Hazards
 
@@ -101,9 +110,10 @@ comment in `Ship.integrate`.
 ## Checks
 
 ```bash
-npm run check        # typecheck + headless simulation
-npm run check:sim    # simulation only, ~1s
-npm run build        # typecheck + production bundle
+npm run check          # typecheck + headless simulation + balance
+npm run check:sim      # simulation only, ~1s
+npm run check:balance  # the balance matrix and its contract, ~4s
+npm run build          # typecheck + production bundle
 ```
 
 `scripts/simcheck.ts` runs the real flight model, projectiles, AI and game loop in Node — it is
@@ -112,6 +122,15 @@ verification proved unreliable: a throttled tab stops firing `requestAnimationFr
 silently freezes the loop and makes every behavioural observation meaningless. It asserts the
 combat contract (hits land, kills register, friendly fire is off), the hull quirks, the
 boundary, and that clearing the roster reports a win.
+
+`scripts/balance.ts` is the same idea pointed at fairness instead of correctness. It flies pinned
+duels — every airframe against every other, every bolt on target — and prints alpha strike,
+burst and sustained DPS, a time-to-kill matrix, and what each hazard costs each hull. Those are
+*ceilings* with the flying removed, which is the only way to compare guns; the Wasp's actual
+defence is that nobody gets to shoot it under laboratory conditions. It then asserts the design
+contract: trigger discipline must out-damage mashing, the spec sheet must match what the guns
+measure, no airframe may run away with the firepower ranking, no matchup may end in under 0.6s,
+and no hazard may one-shot a hull.
 
 In `npm run dev`, `window.__neon` exposes the current screen, a read-only run snapshot
 (including the bearing to the locked target's lead point) and `start(shipId)`. Dev builds only.

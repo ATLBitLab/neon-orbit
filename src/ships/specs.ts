@@ -36,7 +36,7 @@ export type Quirk =
       impulse: number
     }
 
-export interface ShipSpec {
+export interface ShipStats {
   id: ShipId
   name: string
   callsign: string
@@ -77,12 +77,15 @@ export interface ShipSpec {
 
   strengths: string[]
   weaknesses: string[]
+}
 
-  /** 0..1 bars for the hangar cards. */
+/** A stat block plus the card bars derived from it. */
+export interface ShipSpec extends ShipStats {
+  /** 0..1 bars for the hangar cards, each stat as a fraction of the fleet best. */
   bars: { speed: number; agility: number; armor: number; firepower: number }
 }
 
-export const SHIPS: Record<ShipId, ShipSpec> = {
+const STATS: Record<ShipId, ShipStats> = {
   wasp: {
     id: 'wasp',
     name: 'Wasp',
@@ -103,10 +106,21 @@ export const SHIPS: Record<ShipId, ShipSpec> = {
     barrelSpread: 0,
     radius: 9,
     bounty: 150,
-    quirk: { kind: 'heat', max: 100, perShot: 7.5, coolRate: 36, lockout: 2.2 },
-    strengths: ['Highest top speed and turn rate', 'Machine-gun laser, huge sustained DPS'],
+    /**
+     * Tuned so that *releasing* the trigger is the strong play. The old numbers
+     * inverted that: heat climbed at 88/s against a 36/s vent that only ran
+     * while not firing, so the bar filled in 1.1s and the 2.2s lockout vented it
+     * faster than pulsing could. Mashing beat discipline, and the fleet's
+     * fastest gun averaged 21 DPS — the lowest in the game, on the airframe
+     * whose card sells sustained fire.
+     *
+     * Now: 2.4s of held fire before lockout, and a vent quick enough that a
+     * pilot who feathers the trigger holds ~75% uptime. Mashing still works,
+     * it just costs about a third of your damage.
+     */
+    quirk: { kind: 'heat', max: 100, perShot: 3.6, coolRate: 125, lockout: 2.9 },
+    strengths: ['Highest top speed and turn rate', 'Machine-gun laser that rewards trigger control'],
     weaknesses: ['Thinnest hull in the fleet', 'Guns overheat and lock out if you hold the trigger'],
-    bars: { speed: 1.0, agility: 1.0, armor: 0.22, firepower: 0.78 },
   },
 
   drone: {
@@ -132,7 +146,6 @@ export const SHIPS: Record<ShipId, ShipSpec> = {
     quirk: { kind: 'regen', delay: 6.5, rate: 9 },
     strengths: ['Triple the Wasp hull', 'Twin siege cannons — two volleys end a Wasp'],
     weaknesses: ['Slowest airframe, wallows through turns', 'Long reload punishes every miss'],
-    bars: { speed: 0.34, agility: 0.26, armor: 1.0, firepower: 0.92 },
   },
 
   hornet: {
@@ -148,8 +161,15 @@ export const SHIPS: Record<ShipId, ShipSpec> = {
     turnRate: 1.45,
     rollRate: 2.25,
     grip: 2.6,
-    fireInterval: 0.22,
-    damage: 12,
+    /**
+     * The fleet standard is not supposed to also be the best gun in the fleet.
+     * At 12 x 2 per 0.22s it did 109 DPS — 2.3x the Drone's siege cannons and
+     * 5x the Wasp's, with no heat, no reload tell and a dash on top. A steadier
+     * 10 x 2 per 0.30s keeps the twin-laser rhythm and puts it 1.4x over the
+     * Drone instead: better than both, dominant over neither.
+     */
+    fireInterval: 0.3,
+    damage: 10,
     boltSpeed: 1180,
     barrels: 2,
     barrelSpread: 5.4,
@@ -158,9 +178,69 @@ export const SHIPS: Record<ShipId, ShipSpec> = {
     quirk: { kind: 'dash', cooldown: 5, duration: 0.55, impulse: 900 },
     strengths: ['Balanced hull, speed and twin lasers', 'Phase dash slips punches and closes gaps'],
     weaknesses: ['Loses a straight race to a Wasp', 'Loses a slugging match to a Drone'],
-    bars: { speed: 0.62, agility: 0.62, armor: 0.58, firepower: 0.66 },
   },
 }
+
+/* -------------------------------------------------------------------------- */
+/* Derived firepower                                                          */
+/* -------------------------------------------------------------------------- */
+
+/** Damage landed by a single trigger pull, every barrel connecting. */
+export function alphaStrike(spec: ShipStats): number {
+  return spec.damage * spec.barrels
+}
+
+/** Damage per second while the trigger is down and the guns still answer. */
+export function burstDps(spec: ShipStats): number {
+  return alphaStrike(spec) / spec.fireInterval
+}
+
+/**
+ * Damage per second a pilot can actually hold indefinitely.
+ *
+ * Only the heat quirk limits this. Heat vents only while the trigger is up, so
+ * a heat gun has to spend part of every second cooling no matter how fast it
+ * vents, and the share left for firing is the equilibrium of the two rates —
+ * fire for `f`, vent for `1 - f`, with `f * heatRate == (1 - f) * coolRate`.
+ * That is the ceiling a pilot with perfect trigger discipline approaches;
+ * overheating into the lockout lands well below it, which is the whole point of
+ * the quirk. Slightly conservative in practice: a real pilot swings past the
+ * redline and back, and the gun is always ready the instant they re-trigger.
+ * `scripts/balance.ts` measures the real figure and checks it against this one.
+ */
+export function sustainedDps(spec: ShipStats): number {
+  const burst = burstDps(spec)
+  const q = spec.quirk
+  if (q.kind !== 'heat') return burst
+
+  const heatRate = q.perShot / spec.fireInterval
+  return burst * (q.coolRate / (heatRate + q.coolRate))
+}
+
+/**
+ * Card bars are derived, never hand-authored.
+ *
+ * A typed-in bar is a claim that goes stale the moment someone edits the stat
+ * above it, and this is not hypothetical: the Wasp shipped advertising 0.78
+ * firepower against the Hornet's 0.66 while actually doing a fifth of its
+ * damage. Deriving them means the hangar cannot lie about the flight model,
+ * only render it.
+ */
+function deriveBars(spec: ShipStats, fleet: ShipStats[]): ShipSpec['bars'] {
+  const best = (stat: (s: ShipStats) => number): number => Math.max(...fleet.map(stat))
+  return {
+    speed: spec.maxSpeed / best((s) => s.maxSpeed),
+    agility: spec.turnRate / best((s) => s.turnRate),
+    armor: spec.maxHull / best((s) => s.maxHull),
+    firepower: sustainedDps(spec) / best(sustainedDps),
+  }
+}
+
+const FLEET = Object.values(STATS)
+
+export const SHIPS: Record<ShipId, ShipSpec> = Object.fromEntries(
+  Object.entries(STATS).map(([id, spec]) => [id, { ...spec, bars: deriveBars(spec, FLEET) }]),
+) as Record<ShipId, ShipSpec>
 
 export const SHIP_ORDER: ShipId[] = ['wasp', 'hornet', 'drone']
 
