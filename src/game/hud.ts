@@ -61,13 +61,22 @@ export interface HudFrame {
   /** How hard the star is cooking the hull, 0..1. */
   solarExposure: number
   /**
-   * Overdrive state, or null when the guns are stock. A fraction *and* a raw
-   * second count rather than the seconds plus a duration constant, so the HUD
-   * never has to import a balance number to draw a bar — same reason the hull
-   * arrives here as `hullFraction` instead of hull and max.
+   * Timed power-up state, or null when that buff is not up. A fraction *and* a
+   * raw second count rather than the seconds plus a duration constant, so the
+   * HUD never has to import a balance number to draw a bar — same reason the
+   * hull arrives here as `hullFraction` instead of hull and max. Because pods
+   * stack, the fraction is already clamped by the caller and the seconds are
+   * the honest figure.
    */
-  overdrive: { remaining: number; fraction: number; expiring: boolean } | null
+  overdrive: HudBuff | null
+  shield: HudBuff | null
   target: HudTarget | null
+}
+
+export interface HudBuff {
+  remaining: number
+  fraction: number
+  expiring: boolean
 }
 
 export interface Hud {
@@ -138,16 +147,33 @@ export function createHud(parent: HTMLElement): Hud {
   const quirkFill = el('i')
   quirkGauge.append(quirkFill)
 
-  // Overdrive lives in the airframe panel rather than with the warnings,
-  // because it is a system readout: it belongs next to hull and gun heat, not
-  // next to "you are leaving the patrol zone". The panel grows when the buff is
-  // up and collapses when it is not, so it costs nothing on a stock run.
-  const odBlock = el('div', 'hud-od')
-  const odGauge = el('div', 'gauge overdrive')
-  const odFill = el('i')
-  odGauge.append(odFill)
-  odBlock.append(el('div', 'hud-label', 'OVERDRIVE'), odGauge)
-  odBlock.hidden = true
+  /**
+   * A timed power-up's readout. These live in the airframe panel rather than
+   * with the warnings, because they are system readouts: they belong next to
+   * hull and gun heat, not next to "you are leaving the patrol zone". Each
+   * block collapses entirely when its buff is down, so a stock run pays nothing
+   * for them.
+   *
+   * The seconds sit beside the label and are shown the whole time rather than
+   * only during the countdown. Pods stack, so the bar saturates at one pod's
+   * worth and the number is the only thing that can tell you whether you are
+   * holding ten seconds or twenty-five.
+   */
+  function buffBlock(label: string, cls: string) {
+    const block = el('div', 'hud-buff')
+    const head = el('div', 'buff-head')
+    const secs = el('div', 'hud-label buff-secs')
+    head.append(el('div', 'hud-label', label), secs)
+    const gauge = el('div', `gauge ${cls}`)
+    const fill = el('i')
+    gauge.append(fill)
+    block.append(head, gauge)
+    block.hidden = true
+    return { block, gauge, fill, secs }
+  }
+
+  const odUi = buffBlock('OVERDRIVE', 'overdrive')
+  const shUi = buffBlock('SHIELD', 'shield')
 
   tl.append(
     el('div', 'hud-label', 'AIRFRAME'),
@@ -157,7 +183,8 @@ export function createHud(parent: HTMLElement): Hud {
     hullReadout,
     quirkLabel,
     quirkGauge,
-    odBlock,
+    odUi.block,
+    shUi.block,
   )
 
   const tr = el('div', 'hud-corner hud-tr')
@@ -231,13 +258,18 @@ export function createHud(parent: HTMLElement): Hud {
   sear.id = 'sear'
   sear.hidden = true
 
-  // The last-ten-seconds countdown, third in the top-centre banner stack. It
-  // reads as violet against the warnings' amber, which is what keeps "your buff
-  // is ending" from being mistaken for "you are being hurt" — see the note in
-  // style.css for why it is not somewhere further from them.
-  const overdrive = el('div')
-  overdrive.id = 'overdrive'
-  overdrive.hidden = true
+  // The last-five-seconds countdowns, centred just under the callout line.
+  // Both buffs can be up at once, so they share a grid container and stack
+  // without leaving a hole when only one is running. They read as violet and
+  // blue against the warnings' amber, which is what keeps "your buff is ending"
+  // from being mistaken for "you are being hurt".
+  const buffBanners = el('div')
+  buffBanners.id = 'buffbanners'
+  const odBanner = el('div', 'buff-banner overdrive')
+  const shBanner = el('div', 'buff-banner shield')
+  odBanner.hidden = true
+  shBanner.hidden = true
+  buffBanners.append(odBanner, shBanner)
 
   const searGlare = el('div')
   searGlare.id = 'searglare'
@@ -269,7 +301,7 @@ export function createHud(parent: HTMLElement): Hud {
     callout,
     bounds,
     sear,
-    overdrive,
+    buffBanners,
     killfeed,
     lockPrompt,
   )
@@ -368,19 +400,27 @@ export function createHud(parent: HTMLElement): Hud {
 
       // The gauge is up for the whole buff so you always know you have it; the
       // banner only appears for the last stretch, so the countdown itself is
-      // the signal that it is running out.
-      const od = frame.overdrive
-      odBlock.hidden = !od
-      overdrive.hidden = !od?.expiring
-      if (od) {
-        odFill.style.width = `${od.fraction * 100}%`
-        odGauge.classList.toggle('expiring', od.expiring)
-        if (od.expiring) {
-          // One decimal: a whole-second counter looks stalled at 60fps, and
-          // two decimals is noise nobody can read while flying.
-          overdrive.textContent = `⏱ OVERDRIVE  ${od.remaining.toFixed(1)}`
-        }
+      // the signal that it is running out. One decimal on both: a whole-second
+      // counter looks stalled at 60fps, and two decimals is noise nobody can
+      // read while flying.
+      function drawBuff(
+        ui: { block: HTMLElement; gauge: HTMLElement; fill: HTMLElement; secs: HTMLElement },
+        banner: HTMLElement,
+        glyph: string,
+        label: string,
+        data: HudBuff | null,
+      ): void {
+        ui.block.hidden = !data
+        banner.hidden = !data?.expiring
+        if (!data) return
+        ui.fill.style.width = `${data.fraction * 100}%`
+        ui.gauge.classList.toggle('expiring', data.expiring)
+        ui.secs.textContent = `${data.remaining.toFixed(1)}s`
+        if (data.expiring) banner.textContent = `${glyph} ${label}  ${data.remaining.toFixed(1)}`
       }
+
+      drawBuff(odUi, odBanner, '⏱', 'OVERDRIVE', frame.overdrive)
+      drawBuff(shUi, shBanner, '⛊', 'SHIELD', frame.shield)
 
       const target = frame.target
       if (target) {

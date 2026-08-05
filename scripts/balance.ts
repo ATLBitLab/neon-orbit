@@ -39,11 +39,11 @@ import {
 import { ARENA_HARD_LIMIT, SEAR_INNER, SUN_DIRECTION, SUN_DISTANCE } from '../src/world/environment'
 import { MINE_DAMAGE } from '../src/world/mines'
 import {
-  OVERDRIVE_DAMAGE_MULT,
   OVERDRIVE_DURATION,
   OVERDRIVE_RATE_MULT,
-  OVERDRIVE_WARN_AT,
   REPAIR_AMOUNT,
+  SHIELD_DURATION,
+  TIMED_WARN_AT,
 } from '../src/world/pickups'
 
 const STEP = 1 / 60
@@ -352,13 +352,20 @@ for (const id of SHIP_ORDER) {
   console.log(
     `  ${pad(spec.name, 8)}${padLeft(best(id).toFixed(1), 8)}${padLeft(boosted.toFixed(1), 11)}` +
       `${padLeft(`${(boosted / best(id)).toFixed(2)}x`, 7)}` +
-      `${padLeft((alphaStrike(spec) * OVERDRIVE_DAMAGE_MULT).toFixed(0), 8)}` +
+      `${padLeft(alphaStrike(spec).toFixed(0), 8)}` +
       `${padLeft(`${share}%`, 9)}`,
   )
 }
 console.log(
-  `  Overdrive: ${OVERDRIVE_RATE_MULT}x rate, ${OVERDRIVE_DAMAGE_MULT}x damage, ` +
-    `${OVERDRIVE_DURATION}s, countdown at ${OVERDRIVE_WARN_AT}s. Repair pod: ${REPAIR_AMOUNT} hull.`,
+  `  Overdrive: ${OVERDRIVE_RATE_MULT}x rate, bolt damage untouched, ${OVERDRIVE_DURATION}s, ` +
+    `stacking, countdown at ${TIMED_WARN_AT}s.`,
+)
+console.log(
+  `  Shield: ${SHIELD_DURATION}s, stacking, countdown at ${TIMED_WARN_AT}s. ` +
+    `Repair pod: ${REPAIR_AMOUNT} hull.`,
+)
+console.log(
+  '  alpha is the *unboosted* column and stays that way — Overdrive adds bolts, not bolt damage.',
 )
 console.log(
   '  The heat airframe gains least, because Overdrive does not discount heat per shot.',
@@ -507,29 +514,57 @@ for (const id of SHIP_ORDER) {
  * A power-up you would not break off a fight to collect is set dressing. The
  * pods sit hundreds of units off any line you were already flying, so the buff
  * has to be worth the detour and the exposure of flying straight to get there.
+ * The ceiling is 2x by construction, so this is really asking whether any
+ * airframe's quirk eats so much of the buff that it stops being worth having.
  */
 for (const id of SHIP_ORDER) {
   const gain = overdriven.get(id)! / best(id)
   check(
     `Overdrive is worth the detour on a ${SHIPS[id].name}`,
-    gain > 2.5,
+    gain > 1.5,
+    `${gain.toFixed(2)}x sustained DPS`,
+  )
+}
+
+/** And it must never exceed the rate multiplier, or bolt damage crept back in. */
+for (const id of SHIP_ORDER) {
+  const gain = overdriven.get(id)! / best(id)
+  check(
+    `Overdrive does not exceed ${OVERDRIVE_RATE_MULT}x on a ${SHIPS[id].name}`,
+    gain <= OVERDRIVE_RATE_MULT * 1.05,
     `${gain.toFixed(2)}x sustained DPS`,
   )
 }
 
 /**
- * Overdrive deliberately breaks the sub-second floor the stock matchups hold to
- * — an overdriven Drone's volley is 80 damage into a 70-hull Wasp, so it does
- * delete one. That is the payoff, not a bug. What still has to hold is that a
- * death is *visible*: a hit flash and an explosion the player can connect to
- * their own trigger pull. Under a quarter of a second and the Wasp is simply
- * gone between frames.
+ * The reason Overdrive adds bolts rather than bolt damage.
+ *
+ * Alpha strike is what decides whether a single volley can delete a hull, and
+ * an earlier version that doubled damage per bolt pushed a Drone's volley to 80
+ * against a 70-hull Wasp — gone between frames, no hit flash, nothing to read.
+ * Leaving `spec.damage` alone means every one-volley threshold in the game is
+ * exactly where the stock matrix pinned it, boosted or not.
+ */
+for (const id of SHIP_ORDER) {
+  const worst = Math.min(...SHIP_ORDER.filter((d) => d !== id).map((d) => SHIPS[d].maxHull))
+  check(
+    `an overdriven ${SHIPS[id].name} volley cannot one-shot any hull`,
+    alphaStrike(SHIPS[id]) < worst,
+    `alpha ${alphaStrike(SHIPS[id])} into ${worst} hull`,
+  )
+}
+
+/**
+ * Boosted kills roughly halve the stock time-to-kill, which is the point. The
+ * floor is looser than the stock 0.6s because a power-up is allowed to feel
+ * unfair — but a death still has to be *visible*: a hit flash and an explosion
+ * the player can connect to their own trigger pull.
  */
 for (const [matchup, t] of boostedTtk) {
   const [attacker, defender] = matchup.split('>')
   check(
     `an overdriven ${SHIPS[attacker as ShipId].name} kill on a ${SHIPS[defender as ShipId].name} is still readable`,
-    t > 0.25,
+    t > 0.4,
     `${t.toFixed(2)}s`,
   )
 }
@@ -560,10 +595,29 @@ for (const id of SHIP_ORDER) {
 }
 
 /** A buff with no clock is a stat change. */
+for (const [name, duration] of [
+  ['Overdrive', OVERDRIVE_DURATION],
+  ['Shield', SHIELD_DURATION],
+] as const) {
+  check(
+    `${name} runs out, and warns before it does`,
+    duration > 0 && TIMED_WARN_AT > 0 && TIMED_WARN_AT < duration,
+    `${duration}s with a countdown from ${TIMED_WARN_AT}s`,
+  )
+}
+
+/**
+ * A Shield refuses damage outright, so its only limit is the clock. It has to
+ * be short against the thing it is protecting you from: long enough to cross
+ * the star's burn zone or a knot of hostiles, short enough that it cannot carry
+ * you through a whole run. Measured against the *toughest* survival window in
+ * the game, the Drone's seven seconds parked at full solar exposure.
+ */
+const longestBurn = Math.max(...SHIP_ORDER.map((id) => searDeath.get(id)!).filter(Number.isFinite))
 check(
-  'Overdrive runs out, and warns before it does',
-  OVERDRIVE_DURATION > 0 && OVERDRIVE_WARN_AT > 0 && OVERDRIVE_WARN_AT < OVERDRIVE_DURATION,
-  `${OVERDRIVE_DURATION}s with a countdown from ${OVERDRIVE_WARN_AT}s`,
+  'a Shield cannot outlast the worst the arena can do',
+  SHIELD_DURATION < longestBurn * 2,
+  `${SHIELD_DURATION}s shield against a ${longestBurn.toFixed(1)}s burn`,
 )
 
 console.log(

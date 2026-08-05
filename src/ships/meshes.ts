@@ -26,6 +26,9 @@ export interface ShipVisual {
   accentMat: THREE.MeshBasicMaterial
   /** Engine flare glow — opacity is driven by throttle. */
   thrusterMat: THREE.MeshBasicMaterial
+  /** Shield bubble. Hidden unless a Shield power-up is holding. */
+  shieldMesh: THREE.Mesh
+  shieldMat: THREE.MeshBasicMaterial
   /** Longest dimension, used for camera framing. */
   length: number
 }
@@ -255,6 +258,29 @@ function bake(spec: ShipSpec): Baked {
   return baked
 }
 
+/**
+ * The Shield bubble.
+ *
+ * Faceted rather than smooth — a detail-1 icosahedron, so it reads as a
+ * hexagonal energy shell rather than a soap bubble and matches the hard facets
+ * everything else in the arena is made of. Front faces only and additive, so it
+ * brightens the hull it is wrapping instead of hiding it; drawn with
+ * `depthWrite` off so it never sorts against its own far side.
+ *
+ * Blue is fixed rather than taken from the airframe accent. It is the *power-up*
+ * that is blue, and a Hornet whose shield matched its own cyan trim would just
+ * look like a Hornet with the brightness turned up.
+ */
+const SHIELD_COLOR = 0x4d8cff
+
+function shieldMesh(length: number, mat: THREE.MeshBasicMaterial): THREE.Mesh {
+  const g = new THREE.IcosahedronGeometry(length * 0.62, 1)
+  // Squashed along Z so the bubble follows the airframe rather than sitting in
+  // a perfect sphere around a shape that is twice as long as it is wide.
+  g.scale(1, 0.82, 1.18)
+  return new THREE.Mesh(g, mat)
+}
+
 /** Cheap additive flare cone pointing aft. */
 function thrusterMesh(radius: number, length: number, mat: THREE.MeshBasicMaterial): THREE.Mesh {
   const g = new THREE.ConeGeometry(radius, length, 7, 1, true)
@@ -314,6 +340,19 @@ export function buildShip(spec: ShipSpec): ShipVisual {
     return flare
   })
 
+  const shieldMat = new THREE.MeshBasicMaterial({
+    color: SHIELD_COLOR,
+    transparent: true,
+    opacity: 0,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.FrontSide,
+    wireframe: true,
+  })
+  const shield = shieldMesh(baked.length, shieldMat)
+  shield.visible = false
+  group.add(shield)
+
   return {
     group,
     hullMesh,
@@ -323,6 +362,8 @@ export function buildShip(spec: ShipSpec): ShipVisual {
     trimMat,
     accentMat,
     thrusterMat,
+    shieldMesh: shield,
+    shieldMat,
     length: baked.length,
   }
 }
@@ -333,6 +374,8 @@ export function disposeShipVisual(v: ShipVisual): void {
   v.trimMat.dispose()
   v.accentMat.dispose()
   v.thrusterMat.dispose()
+  v.shieldMat.dispose()
+  v.shieldMesh.geometry.dispose()
   for (const t of v.thrusters) {
     if (t instanceof THREE.Mesh) t.geometry.dispose()
   }

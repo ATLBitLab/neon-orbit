@@ -73,14 +73,19 @@ for the rest of the run.
 
 ## Power-ups
 
-Nine pods on a fixed seed, floating and slowly turning. Fly through one to collect it.
+Thirteen pods on a fixed seed, floating and slowly turning. Fly through one to collect it.
 
-| | Repair pod | Overdrive pod |
-|---|---|---|
-| Looks like | A green heart | A violet double chevron |
-| Count | 6 | 3 |
-| Effect | +35 hull | 2× fire rate and 2× damage for 18s |
-| Comes back after | 25s | 45s |
+| | Repair pod | Overdrive pod | Shield pod |
+|---|---|---|---|
+| Looks like | A green heart | A violet lightning bolt | A blue shield crest |
+| Count | 5 | 4 | 4 |
+| Effect | +35 hull | 2× fire rate for 10s | Damage refused for 10s |
+| Comes back after | 25s | 30s | 30s |
+
+Every pod is a **glyph inside a ring**. The ring is not decoration: the glyph is a flat extruded
+plate, so it thins to a line twice per rotation, and a pickup you have to *recognise* rather than
+merely spot cannot afford to vanish. The ring lies horizontal while the glyph stands upright in
+it, so the two are never edge-on together.
 
 **The pods are the minefield pointed the other way** — same seeded placement, same instanced
 geometry, same contact test. That is deliberate. A mine is 45 flat damage and a repair pod is 35
@@ -88,16 +93,28 @@ flat healing, so both matter most to the thinnest hull: the Wasp fears the minef
 much as it loves the pods. The repair number stays *under* the mine number on purpose, or the
 minefield stops being terrain you route around and becomes a toll you pay on the way through.
 
-**Overdrive multiplies out to 4× damage, but not for everyone.** It does not discount gun heat,
-so a boosted Wasp banks heat twice as fast and redlines in half the time — 3.1× sustained where
-the Hornet and the Drone get the full 4×. The airframe that already fires fastest gains least
-from firing faster still, which is the argument the heat quirk makes everywhere else.
-`scripts/balance.ts` measures both and prints the table.
+**Overdrive halves the fire interval and leaves bolt damage alone.** Total output goes up 2×, and
+the way you see it is the rate of fire. That matters more than it sounds: because `spec.damage` is
+untouched, alpha strike stays exactly where the balance harness pinned it, so no boosted volley
+can one-shot a hull it could not one-shot before. It also does not discount gun heat, so a boosted
+Wasp banks heat twice as fast and redlines in half the time — 1.6× sustained where the Hornet and
+the Drone get the full 2×. The airframe that already fires fastest gains least from firing faster
+still, which is the argument the heat quirk makes everywhere else. `scripts/balance.ts` measures
+it and prints the table.
 
-A second pod **refreshes** the clock rather than stacking it. The HUD carries a violet gauge for
-the whole buff and a centre countdown for the last ten seconds. Pods are player-only: nothing in
-`EnemyPilot` steers toward one, so a hostile collecting one would be a coin flip that quadrupled
-its damage with no tell and no counterplay — see the note at the top of `src/world/pickups.ts`.
+**A Shield refuses damage outright** — bolts, mines, station scrapes, the star. Three things
+deliberately do not happen while it holds: the damage clock does not reset, so a shielded Drone
+keeps repairing; the refused hit is not credited to the shooter, so it cannot inflate the accuracy
+stat; and the ship stays targetable, so bolts still arrive and splash. A shield you cannot see
+working is a shield nobody believes in.
+
+Both timed pods **stack** — two Overdrives back to back buy twenty seconds, not ten. Stacking
+duration is safe in a way stacking magnitude is not: the effect is a fixed 2× whether you hold one
+pod or four, so the ceiling never moves and there is only one number to check. The HUD carries a
+gauge and a live second count for each buff, and a centre countdown for the last five seconds.
+
+Pods are player-only: nothing in `EnemyPilot` steers toward one, so a hostile collecting one would
+be a coin flip with no tell and no counterplay — see the note at the top of `src/world/pickups.ts`.
 
 ## How it fits together
 
@@ -149,8 +166,10 @@ all pure maths over three.js vector types, no canvas needed. It exists because i
 verification proved unreliable: a throttled tab stops firing `requestAnimationFrame`, which
 silently freezes the loop and makes every behavioural observation meaningless. It asserts the
 combat contract (hits land, kills register, friendly fire is off), the hull quirks, the
-boundary, the power-up pods (placement, collection, respawn, and that Overdrive expires and does
-not survive a respawn) and that clearing the roster reports a win.
+boundary, the power-up pods (placement, collection, respawn, that a boosted bolt still does
+exactly its spec damage, that a Shield refuses damage without crediting the shooter, and that
+both timed buffs stack, expire and do not survive a respawn) and that clearing the roster reports
+a win.
 
 `scripts/balance.ts` is the same idea pointed at fairness instead of correctness. It flies pinned
 duels — every airframe against every other, every bolt on target — and prints alpha strike,

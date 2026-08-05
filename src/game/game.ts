@@ -26,9 +26,11 @@ import {
 import { MINE_DAMAGE } from '../world/mines'
 import {
   OVERDRIVE_DURATION,
-  OVERDRIVE_WARN_AT,
   PICKUP_COLOR,
+  PICKUP_KINDS,
   REPAIR_AMOUNT,
+  SHIELD_DURATION,
+  TIMED_WARN_AT,
   type PickupKind,
 } from '../world/pickups'
 import { EnemyPilot } from './ai'
@@ -63,10 +65,9 @@ const RETICLE_RANGE = 900
 const MINE_FLASH = new THREE.Color(0xff3324)
 
 /** Collection flashes, matching each pod's own glow. */
-const PICKUP_FLASH = {
-  repair: new THREE.Color(PICKUP_COLOR.repair),
-  overdrive: new THREE.Color(PICKUP_COLOR.overdrive),
-}
+const PICKUP_FLASH = Object.fromEntries(
+  PICKUP_KINDS.map((k) => [k, new THREE.Color(PICKUP_COLOR[k])]),
+) as Record<PickupKind, THREE.Color>
 
 const _spawnDir = new THREE.Vector3()
 const _spawnPos = new THREE.Vector3()
@@ -115,10 +116,12 @@ export interface RunSnapshot {
    *  reason as the bearing below: so the burn is inspectable from the console
    *  rather than only visible as a hull bar going down. */
   solarExposure: number
-  /** Seconds of Overdrive left, 0 when the guns are stock. Exposed for the same
-   *  reason as `solarExposure`: a scripted pilot should be able to see the buff
-   *  it is flying under without inferring it from its own rate of fire. */
+  /** Seconds of Overdrive and Shield left, 0 when neither is up. Exposed for
+   *  the same reason as `solarExposure`: a scripted pilot should be able to see
+   *  the buffs it is flying under rather than inferring them from its own rate
+   *  of fire and a hull that stopped going down. */
   overdrive: number
+  shield: number
   /**
    * Body-frame bearing to the locked target's **lead point** — where to point
    * the nose for the shot to connect — in radians, plus range. Plain numbers
@@ -177,9 +180,11 @@ export function createGame(deps: GameDeps): Game {
   /** Whether the player was in the star's light last frame, so the callout
    *  fires on entry instead of every frame. */
   let wasSearing = false
-  /** Set once Overdrive crosses the warning threshold, so the callout and the
-   *  chirp fire on the crossing rather than every frame of the countdown. */
+  /** Set once each timed buff crosses the warning threshold, so the chirp fires
+   *  on the crossing rather than every frame of the countdown. Cleared when a
+   *  fresh pod pushes the clock back above the threshold. */
   let overdriveWarned = false
+  let shieldWarned = false
   /** The hostile the player is holding. Damage only becomes kills with a lock. */
   let lockedTarget: Ship | null = null
   /** Set on the frame the run resolves, so the loop stops before reporting. */
@@ -384,11 +389,21 @@ export function createGame(deps: GameDeps): Game {
       if (healed <= 0) return
       hud.feed(`HULL +${Math.round(healed)}`)
       hud.callout('HULL REPAIRED', PICKUP_COLOR.repair, 0.9)
-    } else {
+    } else if (pod.kind === 'overdrive') {
       player.engageOverdrive(OVERDRIVE_DURATION)
+      // Clear the warning latch: a stacked pod has pushed the clock back above
+      // the threshold, so the countdown has to be able to fire again.
       overdriveWarned = false
-      hud.feed('OVERDRIVE ENGAGED')
+      // "SEC" rather than "s": the HUD uppercases everything, and in this font
+      // a trailing capital S against a digit reads as another 5 — "+10s" came
+      // out looking like "+105".
+      hud.feed(`OVERDRIVE +${OVERDRIVE_DURATION} SEC`)
       hud.callout('OVERDRIVE', PICKUP_COLOR.overdrive, 1.2)
+    } else {
+      player.engageShield(SHIELD_DURATION)
+      shieldWarned = false
+      hud.feed(`SHIELD +${SHIELD_DURATION} SEC`)
+      hud.callout('SHIELD UP', PICKUP_COLOR.shield, 1.2)
     }
 
     field.collect(pod)
@@ -524,7 +539,7 @@ export function createGame(deps: GameDeps): Game {
   /* ------------------------------------------------------------------------ */
 
   function update(dt: number): void {
-    environment.update(dt)
+    environment.update(dt, camera)
 
     if (!active || paused || !player) {
       fx.update(dt, camera)
@@ -623,11 +638,20 @@ export function createGame(deps: GameDeps): Game {
       reticleNdcY: _reticle.y,
       boundaryOvershoot: player.boundaryOvershoot,
       solarExposure: player.solarExposure,
+      // Both buffs stack, so the bar is clamped: past one pod's worth the
+      // fraction stops meaning anything and the seconds carry the truth.
       overdrive: player.overdriven
         ? {
             remaining: player.overdriveTimer,
-            fraction: player.overdriveTimer / OVERDRIVE_DURATION,
-            expiring: player.overdriveTimer <= OVERDRIVE_WARN_AT,
+            fraction: Math.min(1, player.overdriveTimer / OVERDRIVE_DURATION),
+            expiring: player.overdriveTimer <= TIMED_WARN_AT,
+          }
+        : null,
+      shield: player.shielded
+        ? {
+            remaining: player.shieldTimer,
+            fraction: Math.min(1, player.shieldTimer / SHIELD_DURATION),
+            expiring: player.shieldTimer <= TIMED_WARN_AT,
           }
         : null,
       target: targetReadout(),
@@ -659,15 +683,19 @@ export function createGame(deps: GameDeps): Game {
     }
     wasSearing = exposure > 0
 
-    /* Overdrive running out. One chirp on the crossing and nothing after — an
-       alarm every frame of the last ten seconds would train the player to
+    /* Timed buffs running out. One chirp on each crossing and nothing after —
+       an alarm every frame of the last five seconds would train the player to
        ignore the alarm that means a low hull.
        No callout to go with it: the banner appearing, the gauge turning amber
        and starting to flash, and this chirp are already three signals, and a
        fourth saying the same words landed on top of the banner it was
        announcing. The banner arriving *is* the announcement. */
-    if (player.overdriven && player.overdriveTimer <= OVERDRIVE_WARN_AT && !overdriveWarned) {
+    if (player.overdriven && player.overdriveTimer <= TIMED_WARN_AT && !overdriveWarned) {
       overdriveWarned = true
+      audio.alarm()
+    }
+    if (player.shielded && player.shieldTimer <= TIMED_WARN_AT && !shieldWarned) {
+      shieldWarned = true
       audio.alarm()
     }
 
@@ -707,6 +735,13 @@ export function createGame(deps: GameDeps): Game {
         audio.hullHit()
         chase.shake(Math.min(1.6, 0.25 + amount * 0.02))
       }
+      // A shielded hit has to feel like *something* or the player cannot tell
+      // the shield from a lull in enemy fire. Deliberately a much smaller nudge
+      // than a hull hit, and no red flash: this is the good outcome.
+      player.onShielded = (self, amount) => {
+        fx.spark(self.position, PICKUP_FLASH.shield, 10)
+        chase.shake(Math.min(0.35, 0.06 + amount * 0.004))
+      }
       player.onCollide = (_self, speed) => {
         hud.callout('HULL SCRAPE', '#ffb020', 0.8)
         chase.shake(Math.min(2.4, speed * 0.006))
@@ -731,6 +766,7 @@ export function createGame(deps: GameDeps): Game {
       searAlarmTimer = 0
       wasSearing = false
       overdriveWarned = false
+      shieldWarned = false
       lockedTarget = null
       ending = false
       best = deps.bestScoreFor(shipId)
@@ -788,7 +824,9 @@ export function createGame(deps: GameDeps): Game {
         }
       }
 
-      const nearestPods: RunSnapshot['pickups'] = { repair: null, overdrive: null }
+      const nearestPods = Object.fromEntries(
+        PICKUP_KINDS.map((k) => [k, null]),
+      ) as RunSnapshot['pickups']
       for (const pod of environment.pickups.pods) {
         if (!pod.live) continue
         const range = pod.position.distanceTo(player.position)
@@ -808,6 +846,7 @@ export function createGame(deps: GameDeps): Game {
         elapsed,
         solarExposure: player.solarExposure,
         overdrive: player.overdriveTimer,
+        shield: player.shieldTimer,
         target: bearing,
         pickups: nearestPods,
       }

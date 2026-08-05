@@ -22,7 +22,7 @@ import {
   solarExposure as solarExposureAt,
   type Hazard,
 } from '../world/environment'
-import { OVERDRIVE_DAMAGE_MULT, OVERDRIVE_RATE_MULT } from '../world/pickups'
+import { OVERDRIVE_RATE_MULT } from '../world/pickups'
 import type { BoltTarget, Bolts, Team } from './bolts'
 
 export interface Controls {
@@ -125,6 +125,9 @@ export class Ship implements BoltTarget {
    */
   overdriveTimer = 0
 
+  /** Seconds of Shield remaining. While this is up, damage is refused. */
+  shieldTimer = 0
+
   /** 0 inside the patrol zone, 1 at the hard limit. Refreshed once per step. */
   private boundaryDepth = 0
 
@@ -135,6 +138,8 @@ export class Ship implements BoltTarget {
 
   onDeath?: (ship: Ship) => void
   onDamaged?: (ship: Ship, amount: number, from: Team) => void
+  /** Fired instead of `onDamaged` when a Shield ate the hit. */
+  onShielded?: (ship: Ship, amount: number) => void
   /** Fired when the hull scrapes a station. */
   onCollide?: (ship: Ship, speed: number) => void
 
@@ -161,6 +166,10 @@ export class Ship implements BoltTarget {
 
   get overdriven(): boolean {
     return this.overdriveTimer > 0
+  }
+
+  get shielded(): boolean {
+    return this.shieldTimer > 0
   }
 
   get hullFraction(): number {
@@ -225,6 +234,7 @@ export class Ship implements BoltTarget {
     this.solarExposure = 0
     this.searTimer = 0
     this.overdriveTimer = 0
+    this.shieldTimer = 0
     this.syncVisual()
   }
 
@@ -249,13 +259,23 @@ export class Ship implements BoltTarget {
   }
 
   /**
-   * Grant Overdrive. Refreshes rather than stacking: collecting a second pod
-   * with time still on the clock resets it to full, but two pods can never buy
-   * thirty-six seconds. Stacking a multiplicative gun buff is how a run stops
-   * being a dogfight.
+   * Grant Overdrive. Pods **stack** — two collected back to back buy twenty
+   * seconds, not ten.
+   *
+   * Stacking duration is safe in a way stacking magnitude is not. The effect is
+   * a fixed 2x rate whether you are holding one pod or four, so the ceiling
+   * never moves and the balance harness only has one number to check; all a
+   * second pod buys is more time at that same ceiling. Deliberately uncapped:
+   * there are four pads on a 30-second respawn, so the real limit is how much
+   * of the arena you are willing to cross instead of fighting.
    */
   engageOverdrive(seconds: number): void {
-    this.overdriveTimer = Math.max(this.overdriveTimer, seconds)
+    this.overdriveTimer += seconds
+  }
+
+  /** Grant Shield. Stacks the same way, and for the same reason. */
+  engageShield(seconds: number): void {
+    this.shieldTimer += seconds
   }
 
   /* ------------------------------------------------------------------------ */
@@ -270,6 +290,7 @@ export class Ship implements BoltTarget {
     this.flash = Math.max(0, this.flash - dt * 3.5)
     if (this.fireTimer > 0) this.fireTimer -= dt
     if (this.overdriveTimer > 0) this.overdriveTimer = Math.max(0, this.overdriveTimer - dt)
+    if (this.shieldTimer > 0) this.shieldTimer = Math.max(0, this.shieldTimer - dt)
 
     this.applyRotation(controls, dt)
     this.applyThrottle(controls, dt)
@@ -490,16 +511,18 @@ export class Ship implements BoltTarget {
     }
 
     const boltSpeed = this.spec.boltSpeed + Math.max(0, this.speed) * 0.35
-    const boosted = this.overdriveTimer > 0
-    const damage = boosted ? this.spec.damage * OVERDRIVE_DAMAGE_MULT : this.spec.damage
 
+    // Note what is *not* here: Overdrive does not touch `spec.damage`. Every
+    // bolt in the game carries the damage its airframe's spec sheet says it
+    // does, boosted or not, which is what keeps alpha strike — and therefore
+    // every one-volley-kill threshold the balance harness pins — invariant.
     for (const local of this.visual.muzzles) {
       _muzzle.copy(local).applyQuaternion(this.quaternion).add(this.position)
       ctx.bolts.fire({
         origin: _muzzle,
         direction,
         speed: boltSpeed,
-        damage,
+        damage: this.spec.damage,
         team: this.team,
         color: this.accent,
       })
@@ -512,7 +535,9 @@ export class Ship implements BoltTarget {
     // practice), and the error shrank on a 144Hz display, which quietly made
     // refresh rate a balance lever. Bounded by one frame, so a stalled tab
     // cannot bank shots.
-    const interval = boosted ? this.spec.fireInterval / OVERDRIVE_RATE_MULT : this.spec.fireInterval
+    const interval = this.overdriven
+      ? this.spec.fireInterval / OVERDRIVE_RATE_MULT
+      : this.spec.fireInterval
     this.fireTimer = interval + Math.min(0, this.fireTimer)
     this.shotsFired++
     ctx.audio.laser(this.team)
@@ -520,8 +545,8 @@ export class Ship implements BoltTarget {
     // Heat is charged per shot and Overdrive does not discount it, so a boosted
     // heat gun banks heat twice as fast and reaches the lockout in half the
     // time. That is left alone rather than compensated for: it self-balances the
-    // buff, handing the Wasp roughly 3.2x sustained damage where the two guns
-    // without a heat quirk get the full 4x. The airframe that already fires
+    // buff, handing the Wasp roughly 1.6x sustained damage where the two guns
+    // without a heat quirk get the full 2x. The airframe that already fires
     // fastest gains least from firing faster still, which is the same argument
     // the quirk makes everywhere else. `scripts/balance.ts` measures both.
     const q = this.spec.quirk
@@ -539,6 +564,25 @@ export class Ship implements BoltTarget {
 
   takeDamage(amount: number, from: Team): void {
     if (!this.alive || amount <= 0) return
+
+    /**
+     * A held Shield refuses the damage outright — bolts, mines, station
+     * scrapes, the star, all of it.
+     *
+     * Three things deliberately do *not* happen here. `sinceHit` is not reset,
+     * because nothing reached the hull and a shielded Drone should keep
+     * repairing. `onDamaged` does not fire, because that callback is what
+     * credits a hit to the shooter, and a bolt that accomplished nothing is not
+     * a hit landed — letting it through would inflate the accuracy stat exactly
+     * the way sear damage used to. And the ship stays `targetable`, so bolts
+     * still arrive and splash rather than passing through: a shield you cannot
+     * see working is a shield the player will not believe in.
+     */
+    if (this.shieldTimer > 0) {
+      this.onShielded?.(this, amount)
+      return
+    }
+
     this.hull -= amount
     this.sinceHit = 0
     this.flash = 1
@@ -584,6 +628,20 @@ export class Ship implements BoltTarget {
     // be competing for the same pixels as "you are being shot".
     this.visual.thrusterMat.opacity =
       (0.12 + t * 0.42) * (phasing ? 0.4 : 1) * (this.overdriveTimer > 0 ? 1.7 : 1)
+
+    // Shield bubble. Hidden outright when down rather than faded to zero, so a
+    // stock run never pays for an invisible additive shell. The pulse is fast
+    // enough to read as energised, and it brightens sharply over the last two
+    // seconds — a second channel saying the same thing as the HUD countdown,
+    // for a pilot whose eyes are on the reticle rather than the corner panel.
+    const shielding = this.shieldTimer > 0
+    this.visual.shieldMesh.visible = shielding
+    if (shielding) {
+      const pulse = 0.5 + Math.sin(performance.now() * 0.006) * 0.5
+      const urgency = this.shieldTimer < 2 ? 1 - this.shieldTimer / 2 : 0
+      this.visual.shieldMat.opacity = 0.22 + pulse * 0.12 + urgency * 0.3
+      this.visual.shieldMesh.rotation.y += 0.004
+    }
 
     // Damage flash rides the hull emissive so it reads on every facet at once.
     // Written unconditionally: gating on `flash > 0` skips the frame it reaches

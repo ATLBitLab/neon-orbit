@@ -11,9 +11,12 @@
   --lime: #b6ff3d;
   --amber: #ffb020;
   --red: #ff3b4e;
-  /* Overdrive. The one palette slot not already spoken for by an airframe
-     accent (cyan / magenta / amber), a hull state (lime / red) or a mine. */
+  /* Power-up colours. The two slots not already spoken for by an airframe
+     accent (cyan / magenta / amber), a hull state (lime / red) or a mine.
+     --shield is pushed well off --cyan on purpose: the Hornet already wears
+     cyan, and a shield that matched it would read as a contact. */
   --violet: #c94fff;
+  --shield: #4d8cff;
   --ink: rgba(4, 6, 16, 0.74);
   --ink-solid: #070a18;
   --hair: rgba(53, 245, 255, 0.28);
@@ -591,15 +594,27 @@ body {
   box-shadow: 0 0 14px var(--red);
 }
 
-/* Overdrive block. Collapses entirely on a stock run rather than sitting there
-   greyed out — an always-present gauge reading zero is a permanent reminder of
-   something you do not have. */
-.hud-od {
+/* Timed power-up blocks. Each collapses entirely when its buff is down rather
+   than sitting there greyed out — an always-present gauge reading zero is a
+   permanent reminder of something you do not have. */
+.hud-buff {
   margin-top: 8px;
 }
 
-.hud-od[hidden] {
+.hud-buff[hidden] {
   display: none;
+}
+
+.buff-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+/* Tabular figures, or the seconds jitter the label sideways as they tick. */
+.buff-secs {
+  font-variant-numeric: tabular-nums;
+  color: rgba(223, 246, 255, 0.75);
 }
 
 .gauge.overdrive i {
@@ -607,7 +622,17 @@ body {
   box-shadow: 0 0 12px var(--violet);
 }
 
-.gauge.overdrive.expiring i {
+.gauge.shield i {
+  background: var(--shield);
+  box-shadow: 0 0 12px var(--shield);
+}
+
+/* Both expiring states go amber rather than each dimming its own colour: the
+   pilot has already learned amber means "about to lose something" from the
+   patrol and solar banners, and it survives peripheral vision better than a
+   violet that has merely gone darker. */
+.gauge.overdrive.expiring i,
+.gauge.shield.expiring i {
   background: var(--amber);
   box-shadow: 0 0 14px var(--amber);
   animation: crit-pulse 0.55s steps(2, end) infinite;
@@ -879,24 +904,32 @@ body {
   display: none;
 }
 
-/* Overdrive countdown — the last ten seconds of the buff.
-   Third in the top-centre banner stack, under #bounds and #sear. It was
+/* Power-up countdowns — the last five seconds of each timed buff.
+   Third in the top-centre banner stack, under #bounds and #sear. These were
    originally low-centre, on the reasoning that those two mean "you are being
    hurt" while this means "you are about to be ordinary" and the two classes
    deserve different parts of the screen. That lost to geometry: the chase
    camera parks the hull around two thirds down, so a low-centre banner sits on
-   top of your own ship. Colour carries the distinction instead — violet against
-   the warnings' amber — which it was doing anyway. */
-#overdrive {
+   top of your own ship. Colour carries the distinction instead, which it was
+   doing anyway.
+   A grid rather than two absolutely-placed banners, because both buffs can run
+   at once and a fixed offset each would leave a hole whenever only one was.
+   Below #callout rather than above it. Slotting them into the warning stack put
+   them hard against the callout's baseline, and a "SHIELD UP" callout landing
+   on top of an Overdrive countdown is two unrelated messages sharing a line.
+   Down here they clear the callout, and still sit well above the reticle. */
+#buffbanners {
   position: absolute;
   left: 50%;
-  top: 12%;
-  margin-top: 88px;
+  top: 32%;
   transform: translateX(-50%);
+  display: grid;
+  gap: 7px;
+  justify-items: center;
+}
+
+.buff-banner {
   padding: 8px 20px;
-  border: 1px solid var(--violet);
-  background: rgba(34, 8, 52, 0.74);
-  color: #f0d5ff;
   font-family: var(--font-display);
   font-weight: 700;
   font-size: 13px;
@@ -904,12 +937,25 @@ body {
   text-transform: uppercase;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
-  text-shadow: 0 0 12px rgba(201, 79, 255, 0.9);
   animation: warn-breathe 0.7s ease-in-out infinite;
 }
 
-#overdrive[hidden] {
+.buff-banner[hidden] {
   display: none;
+}
+
+.buff-banner.overdrive {
+  border: 1px solid var(--violet);
+  background: rgba(34, 8, 52, 0.74);
+  color: #f0d5ff;
+  text-shadow: 0 0 12px rgba(201, 79, 255, 0.9);
+}
+
+.buff-banner.shield {
+  border: 1px solid var(--shield);
+  background: rgba(6, 20, 58, 0.74);
+  color: #d6e6ff;
+  text-shadow: 0 0 12px rgba(77, 140, 255, 0.9);
 }
 
 /* Peripheral glare. Opacity is set per-frame from exposure, so no transition —

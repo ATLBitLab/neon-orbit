@@ -91,7 +91,8 @@ export interface Environment {
   /** Power-up pods. Harmless, so they are not hazards and the AI ignores them. */
   pickups: Pickups
   planet: Planet
-  update(dt: number): void
+  /** The camera is needed because power-up pods billboard — see `pickups.ts`. */
+  update(dt: number, camera: THREE.Camera): void
   dispose(): void
 }
 
@@ -256,12 +257,11 @@ export function buildEnvironment(): Environment {
   group.add(minefield.group)
 
   // Pods are placed last, so they can be kept out of the stations *and* out of
-  // the minefield. Six repair pads to three overdrive: the heal is the routine
-  // one you plan a run around, the gun buff is the one worth breaking off a
-  // fight for.
+  // the minefield. Repair is the most common because it is the routine resource
+  // you plan a run around; the two timed buffs are the ones worth breaking off
+  // a fight for, and are rarer for it.
   const pickups = buildPickups({
-    repairCount: 6,
-    overdriveCount: 3,
+    counts: { repair: 5, overdrive: 4, shield: 4 },
     arenaRadius: ARENA_RADIUS,
     hazards,
     mines: minefield.mines.map((m) => m.position),
@@ -276,12 +276,12 @@ export function buildEnvironment(): Environment {
     minefield,
     pickups,
     planet,
-    update(dt: number) {
+    update(dt: number, camera: THREE.Camera) {
       sky.update(dt)
       planet.update(dt)
       debris.update(dt)
       minefield.update(dt)
-      pickups.update(dt)
+      pickups.update(dt, camera)
       for (const s of stations) s.update(dt)
     },
     dispose() {
