@@ -31,6 +31,8 @@ export interface Audio {
   explosion(big: boolean): void
   warp(): void
   dash(): void
+  /** Collecting a power-up pod. `big` marks the rarer Overdrive pod. */
+  pickup(big: boolean): void
   overheat(): void
   alarm(): void
   uiSelect(): void
@@ -179,6 +181,15 @@ export function createAudio(): Audio {
     dash() {
       tone('sine', 300, 1500, 0.24, 0.12)
       noise(0.28, 0.12, 'highpass', 900, 4200)
+    },
+
+    // A rising arpeggio, which nothing else in the mix does — every other cue
+    // here falls. That contour alone says "gained" without needing volume, and
+    // volume is exactly what a pickup should not have in the middle of a
+    // firefight. Overdrive gets a third note and a touch more level.
+    pickup(big) {
+      const notes = big ? [523, 784, 1175] : [659, 988]
+      notes.forEach((f, i) => tone('triangle', f, f * 1.5, 0.16, big ? 0.13 : 0.1, i * 0.07))
     },
 
     overheat() {

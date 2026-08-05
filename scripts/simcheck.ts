@@ -33,6 +33,16 @@ import {
   type Hazard,
 } from '../src/world/environment'
 import { buildMinefield, MINE_DAMAGE } from '../src/world/mines'
+import {
+  buildPickups,
+  OVERDRIVE_DURATION,
+  OVERDRIVE_RATE_MULT,
+  PICKUP_KINDS,
+  PICKUP_RADIUS,
+  REPAIR_AMOUNT,
+  SHIELD_DURATION,
+  TIMED_WARN_AT,
+} from '../src/world/pickups'
 
 const STEP = 1 / 60
 
@@ -69,6 +79,7 @@ function silentAudio(): Audio & { laserCount: number } {
     explosion() {},
     warp() {},
     dash() {},
+    pickup() {},
     overheat() {},
     alarm() {},
     uiSelect() {},
@@ -547,8 +558,8 @@ function stubInput(): Input & { write: InputState } {
 }
 
 /**
- * An empty arena: no stations and no mines, so this measures the dogfight and
- * nothing else. Mines get their own dedicated checks below.
+ * An empty arena: no stations, no mines and no pods, so this measures the
+ * dogfight and nothing else. Both get their own dedicated checks below.
  */
 function stubEnvironment(): Environment {
   const group = new THREE.Group()
@@ -560,6 +571,13 @@ function stubEnvironment(): Environment {
       count: 0,
       arenaRadius: ARENA_RADIUS,
       hazards: [],
+      spawn: new THREE.Vector3(),
+    }),
+    pickups: buildPickups({
+      counts: { repair: 0, overdrive: 0, shield: 0 },
+      arenaRadius: ARENA_RADIUS,
+      hazards: [],
+      mines: [],
       spawn: new THREE.Vector3(),
     }),
     planet: {
@@ -797,6 +815,348 @@ function testMines(): void {
   field.dispose()
 }
 
+function testPickups(): void {
+  section('Power-up pods place, collect and re-arm')
+
+  const stations: Hazard[] = [
+    { center: new THREE.Vector3(0, 0, -2000), radius: 80, avoidRange: 520, name: 'TEST STATION' },
+  ]
+  const spawn = new THREE.Vector3(0, 120, 1400)
+  const mines = buildMinefield({ count: 26, arenaRadius: ARENA_RADIUS, hazards: stations, spawn })
+  const minePositions = mines.mines.map((m) => m.position)
+
+  const counts = { repair: 5, overdrive: 4, shield: 4 }
+  const total = counts.repair + counts.overdrive + counts.shield
+
+  const field = buildPickups({
+    counts,
+    arenaRadius: ARENA_RADIUS,
+    hazards: stations,
+    mines: minePositions,
+    spawn,
+  })
+
+  /* ---- Placement --------------------------------------------------------- */
+
+  check('every requested pad was placed', field.pods.length === total, `placed=${field.pods.length}`)
+  check('all pads start armed', field.pods.every((p) => p.live))
+  for (const kind of PICKUP_KINDS) {
+    const got = field.pods.filter((p) => p.kind === kind).length
+    check(`the field laid out ${counts[kind]} ${kind} pads`, got === counts[kind], `got ${got}`)
+  }
+
+  const nearSpawn = field.pods.filter((p) => p.position.distanceTo(spawn) < 700).length
+  const inStation = field.pods.filter((p) =>
+    stations.some((s) => p.position.distanceTo(s.center) < s.radius + 260),
+  ).length
+  // A pod sitting inside a mine's blast would be a 45-damage tax on a 35-hull
+  // heal, which is the exact trade this placement exists to prevent.
+  const onAMine = field.pods.filter((p) =>
+    minePositions.some((m) => p.position.distanceTo(m) < 240),
+  ).length
+  const outside = field.pods.filter((p) => p.position.length() > ARENA_RADIUS).length
+  let crowded = 0
+  for (let i = 0; i < field.pods.length; i++) {
+    for (let j = i + 1; j < field.pods.length; j++) {
+      if (field.pods[i].position.distanceTo(field.pods[j].position) < 700) crowded++
+    }
+  }
+
+  check('none sit on the player spawn', nearSpawn === 0, `${nearSpawn} too close`)
+  check('none sit inside a station', inStation === 0, `${inStation} overlapping`)
+  check('none sit on top of a mine', onAMine === 0, `${onAMine} inside a blast`)
+  check('none are crowded together', crowded === 0, `${crowded} pairs under 700u`)
+  check('all are inside the arena', outside === 0, `${outside} outside`)
+
+  /* ---- Repair ------------------------------------------------------------ */
+
+  const bolts = createBolts()
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+
+  const repairPad = field.pods.find((p) => p.kind === 'repair')!
+  const ship = new Ship(SHIPS.hornet, 'player')
+  ship.spawn(repairPad.position.clone(), new THREE.Vector3(0, 0, 0))
+  ship.warpTimer = 0
+
+  check(
+    'a hull on top of a pad registers contact',
+    field.findContact(ship.position, ship.radius) === repairPad,
+  )
+  // The reach has to survive the worst frame the loop will accept (1/20s), or a
+  // fast airframe would step straight over a pod on a stutter.
+  check(
+    'the contact sphere is wider than the fastest hull moves in one clamped frame',
+    PICKUP_RADIUS + SHIPS.wasp.radius > SHIPS.wasp.maxSpeed / 20,
+    `reach ${PICKUP_RADIUS + SHIPS.wasp.radius} vs ${(SHIPS.wasp.maxSpeed / 20).toFixed(1)}u per frame`,
+  )
+
+  // A full hull must not consume the pad.
+  check('a pod over a full hull heals nothing', ship.repair(REPAIR_AMOUNT) === 0)
+
+  ship.takeDamage(60, 'enemy')
+  const wounded = ship.hull
+  const healed = ship.repair(REPAIR_AMOUNT)
+  check('a wounded hull is repaired', healed === REPAIR_AMOUNT, `healed=${healed}`)
+  check('repair lands on the hull', ship.hull === wounded + REPAIR_AMOUNT, `hull=${ship.hull}`)
+
+  // Overheal is clipped, not banked.
+  ship.repair(1000)
+  check('repair never exceeds max hull', ship.hull === ship.spec.maxHull, `hull=${ship.hull}`)
+
+  /**
+   * Repairing must not reset the damage clock. `sinceHit` is the Drone's nanite
+   * timer, so a pod that touched it would mean collecting a heal *postpones*
+   * your other heal.
+   */
+  const drone = new Ship(SHIPS.drone, 'player')
+  drone.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  drone.warpTimer = 0
+  drone.takeDamage(120, 'enemy')
+  for (let i = 0; i < 60 * 3; i++) drone.step(controls(), STEP, ctx)
+  const clockBefore = drone.sinceHit
+  drone.repair(REPAIR_AMOUNT)
+  check(
+    'repairing does not restart the nanite delay',
+    drone.sinceHit === clockBefore,
+    `${clockBefore.toFixed(2)}s → ${drone.sinceHit.toFixed(2)}s`,
+  )
+
+  /* ---- Collection and respawn -------------------------------------------- */
+
+  field.collect(repairPad)
+  check('a collected pad goes dark', !repairPad.live)
+  check(
+    'a collected pad stops registering contact',
+    field.findContact(repairPad.position, 40) === null,
+  )
+  check('a collected pad has a respawn clock', repairPad.respawnIn > 0)
+
+  // Halfway through the clock it must still be gone; past it, back. A real
+  // camera rather than a stub, so the billboard maths runs here too — it is the
+  // only thing in this module that touches an external object per frame.
+  const eye = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
+  eye.position.set(0, 0, 800)
+  eye.updateMatrixWorld()
+
+  const half = repairPad.respawnIn / 2
+  for (let i = 0; i < Math.round(half / STEP); i++) field.update(STEP, eye)
+  check('it stays gone while the clock runs', !repairPad.live, `${repairPad.respawnIn.toFixed(1)}s left`)
+  for (let i = 0; i < Math.round((half + 1) / STEP); i++) field.update(STEP, eye)
+  check('it re-arms once the clock expires', repairPad.live)
+  check('a re-armed pad registers contact again', field.findContact(repairPad.position, 40) === repairPad)
+
+  field.collect(repairPad)
+  field.reset()
+  check('reset re-arms the whole field', field.pods.every((p) => p.live && p.respawnIn === 0))
+
+  /* ---- Overdrive --------------------------------------------------------- */
+
+  const gunner = new Ship(SHIPS.hornet, 'player')
+  gunner.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  gunner.warpTimer = 0
+
+  check('a stock ship is not overdriven', !gunner.overdriven)
+
+  // Count shots and total damage over a fixed window, stock and boosted, with
+  // the ship pinned — this is the same trick the balance harness uses.
+  function fireFor(ship: Ship, seconds: number): { shots: number; damage: number } {
+    const dummy = new Ship(SHIPS.drone, 'enemy')
+    dummy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -4000))
+    dummy.warpTimer = 0
+    let damage = 0
+    dummy.onDamaged = (_s, amount) => {
+      damage += amount
+    }
+    const before = ship.shotsFired
+    for (let i = 0; i < Math.round(seconds / STEP); i++) {
+      ship.position.set(0, 0, 0)
+      ship.velocity.set(0, 0, 0)
+      dummy.hull = dummy.spec.maxHull
+      dummy.position.set(0, 0, -400)
+      dummy.velocity.set(0, 0, 0)
+      ship.step(controls({ fire: true }), STEP, ctx)
+      dummy.step(controls(), STEP, ctx)
+      bolts.update(STEP, [ship, dummy], [])
+    }
+    dummy.dispose()
+    return { shots: ship.shotsFired - before, damage }
+  }
+
+  const stock = fireFor(gunner, 4)
+  gunner.engageOverdrive(OVERDRIVE_DURATION)
+  check('overdrive engages', gunner.overdriven && gunner.overdriveTimer === OVERDRIVE_DURATION)
+  const boosted = fireFor(gunner, 4)
+
+  // Twice the shots, and — the whole point of the design — the *same* damage on
+  // each, so total output lands on 2x rather than 4x. Banded rather than exact:
+  // the fire timer carries its overshoot between frames, so a fixed window lands
+  // within a shot of the ideal rather than on it.
+  const rateGain = boosted.shots / stock.shots
+  const damageGain = boosted.damage / stock.damage
+  check(
+    `overdrive roughly ${OVERDRIVE_RATE_MULT}x the rate of fire`,
+    rateGain > OVERDRIVE_RATE_MULT * 0.9 && rateGain < OVERDRIVE_RATE_MULT * 1.1,
+    `${stock.shots} → ${boosted.shots} shots (${rateGain.toFixed(2)}x)`,
+  )
+  check(
+    `overdrive totals ${OVERDRIVE_RATE_MULT}x damage, not ${OVERDRIVE_RATE_MULT ** 2}x`,
+    damageGain > OVERDRIVE_RATE_MULT * 0.85 && damageGain < OVERDRIVE_RATE_MULT * 1.15,
+    `${stock.damage} → ${boosted.damage} damage (${damageGain.toFixed(2)}x)`,
+  )
+
+  /**
+   * The invariant that makes the above safe. A boosted bolt has to carry the
+   * damage its spec sheet says it does, or alpha strike moves and one-volley
+   * kill thresholds move with it — an earlier version that doubled bolt damage
+   * let a boosted Drone delete a Wasp between frames.
+   */
+  const boostedBolt = new Ship(SHIPS.drone, 'player')
+  boostedBolt.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  boostedBolt.warpTimer = 0
+  boostedBolt.engageOverdrive(OVERDRIVE_DURATION)
+  const mark = new Ship(SHIPS.wasp, 'enemy')
+  mark.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -4000))
+  mark.warpTimer = 0
+  let biggestHit = 0
+  mark.onDamaged = (_s, amount) => {
+    biggestHit = Math.max(biggestHit, amount)
+  }
+  for (let i = 0; i < 120; i++) {
+    boostedBolt.position.set(0, 0, 0)
+    boostedBolt.velocity.set(0, 0, 0)
+    mark.hull = mark.spec.maxHull
+    mark.position.set(0, 0, -400)
+    mark.velocity.set(0, 0, 0)
+    boostedBolt.step(controls({ fire: true }), STEP, ctx)
+    bolts.update(STEP, [boostedBolt, mark], [])
+  }
+  check(
+    'a boosted bolt still does exactly its spec damage',
+    biggestHit === SHIPS.drone.damage,
+    `${biggestHit} vs spec ${SHIPS.drone.damage}`,
+  )
+
+  /* Stack, not refresh. */
+  gunner.overdriveTimer = 0
+  gunner.engageOverdrive(OVERDRIVE_DURATION)
+  gunner.engageOverdrive(OVERDRIVE_DURATION)
+  check(
+    'a second pod stacks onto the clock',
+    gunner.overdriveTimer === OVERDRIVE_DURATION * 2,
+    `${gunner.overdriveTimer.toFixed(1)}s`,
+  )
+
+  /* And it has to actually end. */
+  for (let i = 0; i < Math.round((OVERDRIVE_DURATION * 2 + 1) / STEP); i++) {
+    gunner.step(controls(), STEP, ctx)
+  }
+  check('overdrive expires', !gunner.overdriven, `${gunner.overdriveTimer.toFixed(2)}s left`)
+
+  /* A fresh spawn must not inherit the previous run's buff. */
+  gunner.engageOverdrive(OVERDRIVE_DURATION)
+  gunner.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  check('respawning clears overdrive', !gunner.overdriven)
+
+  /* ---- Shield ------------------------------------------------------------ */
+
+  const guarded = new Ship(SHIPS.hornet, 'player')
+  guarded.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  guarded.warpTimer = 0
+
+  check('a stock ship is not shielded', !guarded.shielded)
+
+  let credited = 0
+  let absorbed = 0
+  guarded.onDamaged = () => {
+    credited++
+  }
+  guarded.onShielded = (_s, amount) => {
+    absorbed += amount
+  }
+
+  guarded.engageShield(SHIELD_DURATION)
+  const full = guarded.hull
+  guarded.takeDamage(40, 'enemy')
+  check('a shielded hull takes no damage', guarded.hull === full, `hull=${guarded.hull}`)
+  check('the absorbed hit is reported', absorbed === 40, `absorbed=${absorbed}`)
+  /**
+   * A refused hit must not be credited to the shooter. `onDamaged` is what the
+   * game loop counts as "a hit landed", so letting it fire here would inflate
+   * the accuracy stat with bolts that accomplished nothing — the same trap sear
+   * damage already has a comment about in `Ship.applySolarSear`.
+   */
+  check('a refused hit is not credited as a hit landed', credited === 0, `${credited} credited`)
+
+  /* Every damage source, not just bolts. */
+  guarded.takeDamage(MINE_DAMAGE, 'enemy')
+  check('a shield eats a mine too', guarded.hull === full, `hull=${guarded.hull}`)
+
+  /**
+   * The shield must not reset the damage clock. `sinceHit` is the Drone's
+   * nanite timer, so a shielded Drone should keep repairing right through
+   * incoming fire — nothing reached its hull.
+   */
+  const guardedDrone = new Ship(SHIPS.drone, 'player')
+  guardedDrone.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  guardedDrone.warpTimer = 0
+  guardedDrone.takeDamage(120, 'enemy')
+  for (let i = 0; i < 60 * 8; i++) guardedDrone.step(controls(), STEP, ctx)
+  const repairing = guardedDrone.hull
+  guardedDrone.engageShield(SHIELD_DURATION)
+  for (let i = 0; i < 60; i++) {
+    guardedDrone.takeDamage(10, 'enemy')
+    guardedDrone.step(controls(), STEP, ctx)
+  }
+  check(
+    'a shielded Drone keeps repairing under fire',
+    guardedDrone.hull > repairing,
+    `${repairing.toFixed(1)} → ${guardedDrone.hull.toFixed(1)}`,
+  )
+
+  /* Stacking, expiry and respawn, same contract as Overdrive. */
+  guarded.shieldTimer = 0
+  guarded.engageShield(SHIELD_DURATION)
+  guarded.engageShield(SHIELD_DURATION)
+  check(
+    'shield pods stack onto the clock',
+    guarded.shieldTimer === SHIELD_DURATION * 2,
+    `${guarded.shieldTimer.toFixed(1)}s`,
+  )
+  for (let i = 0; i < Math.round((SHIELD_DURATION * 2 + 1) / STEP); i++) {
+    guarded.step(controls(), STEP, ctx)
+  }
+  check('shield expires', !guarded.shielded, `${guarded.shieldTimer.toFixed(2)}s left`)
+
+  const after = guarded.hull
+  guarded.takeDamage(20, 'enemy')
+  check('damage lands again once the shield drops', guarded.hull === after - 20, `hull=${guarded.hull}`)
+
+  guarded.engageShield(SHIELD_DURATION)
+  guarded.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  check('respawning clears the shield', !guarded.shielded)
+
+  /* ---- The shared countdown threshold ------------------------------------ */
+
+  check(
+    'the countdown threshold leaves real un-warned time on both buffs',
+    TIMED_WARN_AT > 0 &&
+      TIMED_WARN_AT < OVERDRIVE_DURATION &&
+      TIMED_WARN_AT < SHIELD_DURATION,
+    `warn at ${TIMED_WARN_AT}s of ${OVERDRIVE_DURATION}s / ${SHIELD_DURATION}s`,
+  )
+
+  bolts.dispose()
+  ship.dispose()
+  drone.dispose()
+  gunner.dispose()
+  boostedBolt.dispose()
+  mark.dispose()
+  guarded.dispose()
+  guardedDrone.dispose()
+  field.dispose()
+  mines.dispose()
+}
+
 /* -------------------------------------------------------------------------- */
 
 console.log('NEON ORBIT — headless simulation checks')
@@ -807,6 +1167,7 @@ testQuirks()
 testSolarSear()
 testBoltPoolDoesNotLeak()
 testMines()
+testPickups()
 testARunCanBeWon()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)

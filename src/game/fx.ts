@@ -51,6 +51,8 @@ export interface Fx {
   explode(at: THREE.Vector3, color: THREE.Color, scale?: number): void
   /** Rising motes as a ship warps in. */
   warpIn(at: THREE.Vector3, color: THREE.Color): void
+  /** A power-up pod being absorbed: one tight ring and a bright puff. */
+  collect(at: THREE.Vector3, color: THREE.Color): void
   update(dt: number, camera: THREE.Camera): void
   clear(): void
   dispose(): void
@@ -196,6 +198,14 @@ export function createFx(): Fx {
     warpIn(at, color) {
       emit(at, color, 44, 46, 4.2, 0.85, 2.2, 26)
       ring(at, color, 70, 0.5)
+    },
+
+    // Shorter and snappier than a warp-in: this fires while the player is flying
+    // through the thing at speed, so it has to resolve before the pod is behind
+    // them. Heavy drag keeps the puff from smearing into a trail.
+    collect(at, color) {
+      emit(at, color, 34, 130, 4.4, 0.55, 4.2, 10)
+      ring(at, color, 100, 0.42)
     },
 
     update(dt, camera) {

@@ -10,6 +10,7 @@ import * as THREE from 'three'
 import { chunk } from '../core/geo'
 import { makeRng, WORLD_SEED } from '../core/rng'
 import { buildMinefield, type Minefield } from './mines'
+import { buildPickups, type Pickups } from './pickups'
 import { buildPlanet, type Planet } from './planet'
 import { buildSky, type Sky } from './sky'
 import { buildStations, type Station } from './stations'
@@ -87,8 +88,11 @@ export interface Environment {
   hazards: Hazard[]
   /** Mines detonate on contact instead, so they are tracked separately. */
   minefield: Minefield
+  /** Power-up pods. Harmless, so they are not hazards and the AI ignores them. */
+  pickups: Pickups
   planet: Planet
-  update(dt: number): void
+  /** The camera is needed because power-up pods billboard — see `pickups.ts`. */
+  update(dt: number, camera: THREE.Camera): void
   dispose(): void
 }
 
@@ -252,17 +256,32 @@ export function buildEnvironment(): Environment {
   })
   group.add(minefield.group)
 
+  // Pods are placed last, so they can be kept out of the stations *and* out of
+  // the minefield. Repair is the most common because it is the routine resource
+  // you plan a run around; the two timed buffs are the ones worth breaking off
+  // a fight for, and are rarer for it.
+  const pickups = buildPickups({
+    counts: { repair: 5, overdrive: 4, shield: 4 },
+    arenaRadius: ARENA_RADIUS,
+    hazards,
+    mines: minefield.mines.map((m) => m.position),
+    spawn: PLAYER_SPAWN,
+  })
+  group.add(pickups.group)
+
   return {
     group,
     stations,
     hazards,
     minefield,
+    pickups,
     planet,
-    update(dt: number) {
+    update(dt: number, camera: THREE.Camera) {
       sky.update(dt)
       planet.update(dt)
       debris.update(dt)
       minefield.update(dt)
+      pickups.update(dt, camera)
       for (const s of stations) s.update(dt)
     },
     dispose() {
@@ -271,6 +290,7 @@ export function buildEnvironment(): Environment {
       debris.dispose()
       boundary.dispose()
       minefield.dispose()
+      pickups.dispose()
     },
   }
 }

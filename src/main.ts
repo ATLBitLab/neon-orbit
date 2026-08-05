@@ -216,7 +216,7 @@ function boot() {
     const dt = Math.min(clock.getDelta(), MAX_STEP)
 
     if (screen === 'hangar') {
-      environment.update(dt)
+      environment.update(dt, stage.camera)
       hangar.update(dt)
     } else {
       input.update(dt)
