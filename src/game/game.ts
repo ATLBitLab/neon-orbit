@@ -434,7 +434,6 @@ export function createGame(deps: GameDeps): Game {
     }
 
     audio.fanfare(won)
-    audio.setEngine(0)
     input.releasePointerLock()
     hud.hide()
 
@@ -500,7 +499,6 @@ export function createGame(deps: GameDeps): Game {
     for (const pilot of pilots) pilot.ship.syncVisual()
     fx.update(dt, camera)
     chase.update(player, dt)
-    audio.setEngine(player.speedFraction)
 
     /* HUD */
     contactBuffer.length = 0
@@ -655,7 +653,6 @@ export function createGame(deps: GameDeps): Game {
       hud.show()
       hud.callout('ENGAGE', `#${spec.accent.toString(16).padStart(6, '0')}`, 1.6)
       chase.reset(player)
-      audio.setEngine(0.6)
 
       active = true
       paused = false
@@ -668,14 +665,12 @@ export function createGame(deps: GameDeps): Game {
       paused = true
       input.reset()
       input.releasePointerLock()
-      audio.setEngine(0)
     },
 
     resume() {
       if (!active) return
       paused = false
       input.reset()
-      audio.setEngine(player?.speedFraction ?? 0)
     },
 
     snapshot() {
@@ -723,7 +718,6 @@ export function createGame(deps: GameDeps): Game {
       active = false
       paused = false
       ending = false
-      audio.setEngine(0)
       input.releasePointerLock()
       hud.hide()
       clearArena()
