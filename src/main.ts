@@ -113,7 +113,6 @@ function boot() {
     hud.hide()
     hud.setLockPrompt(false)
     input.releasePointerLock()
-    audio.setEngine(0)
     audio.setMusic('hangar')
     hangar.open(pendingResult?.ship ?? lastShip() ?? 'hornet')
   }

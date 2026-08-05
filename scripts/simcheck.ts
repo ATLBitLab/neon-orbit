@@ -60,7 +60,6 @@ function silentAudio(): Audio & { laserCount: number } {
     toggleMute() {
       return true
     },
-    setEngine() {},
     setMusic() {},
     laser() {
       stub.laserCount++

@@ -2,9 +2,10 @@
  * Procedural sound effects, plus the bus the streamed music rides on.
  *
  * Every effect is a short oscillator or noise burst built on demand, so the
- * whole effects layer costs no download at all. The engine hum is the only
- * persistent voice; it is created lazily on the first user gesture, because
- * browsers suspend an AudioContext that is constructed before one.
+ * whole effects layer costs no download at all. No effect is a persistent
+ * voice — each is a transient fired by an event and scheduled to stop. The
+ * AudioContext itself is created lazily on the first user gesture, because
+ * browsers suspend one constructed before then.
  *
  * Music is the one thing here that is not synthesised — see `music.ts`. It is
  * routed through this module's master gain rather than played independently,
@@ -22,8 +23,6 @@ export interface Audio {
   /** Must be called from a user gesture (the hangar Launch click). */
   resume(): void
   toggleMute(): boolean
-  /** Engine note follows normalised speed 0..1. */
-  setEngine(intensity: number): void
   /** Crossfade the background track, or pass null to fade to silence. */
   setMusic(track: MusicTrack | null): void
   laser(accent: 'player' | 'enemy'): void
@@ -43,10 +42,6 @@ export interface Audio {
 export function createAudio(): Audio {
   let ctx: AudioContext | null = null
   let master: GainNode | null = null
-  let engineOsc: OscillatorNode | null = null
-  let engineSub: OscillatorNode | null = null
-  let engineGain: GainNode | null = null
-  let engineFilter: BiquadFilterNode | null = null
   let noiseBuffer: AudioBuffer | null = null
   let music: Music | null = null
   let muted = false
@@ -67,30 +62,6 @@ export function createAudio(): Audio {
     noiseBuffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate)
     const data = noiseBuffer.getChannelData(0)
     for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1
-
-    // Engine: a detuned saw pair through a lowpass, always running.
-    engineFilter = ctx.createBiquadFilter()
-    engineFilter.type = 'lowpass'
-    engineFilter.frequency.value = 420
-    engineFilter.Q.value = 4
-
-    engineGain = ctx.createGain()
-    engineGain.gain.value = 0
-
-    engineOsc = ctx.createOscillator()
-    engineOsc.type = 'sawtooth'
-    engineOsc.frequency.value = 62
-
-    engineSub = ctx.createOscillator()
-    engineSub.type = 'square'
-    engineSub.frequency.value = 31
-
-    engineOsc.connect(engineFilter)
-    engineSub.connect(engineFilter)
-    engineFilter.connect(engineGain)
-    engineGain.connect(master)
-    engineOsc.start()
-    engineSub.start()
 
     music = createMusic(ctx, master)
     if (wantedTrack) music.play(wantedTrack)
@@ -174,17 +145,6 @@ export function createAudio(): Audio {
       return muted
     },
 
-    setEngine(intensity: number) {
-      if (!ctx || !engineGain || !engineOsc || !engineSub || !engineFilter) return
-      const i = Math.max(0, Math.min(1, intensity))
-      const now = ctx.currentTime
-      // setTargetAtTime smooths the ramp so throttle changes do not click.
-      engineGain.gain.setTargetAtTime(0.05 + i * 0.11, now, 0.08)
-      engineOsc.frequency.setTargetAtTime(52 + i * 78, now, 0.12)
-      engineSub.frequency.setTargetAtTime(26 + i * 39, now, 0.12)
-      engineFilter.frequency.setTargetAtTime(300 + i * 900, now, 0.12)
-    },
-
     laser(accent) {
       // Player lasers sit higher so your own fire is distinguishable in a swarm.
       const base = accent === 'player' ? 1500 : 900
@@ -249,8 +209,6 @@ export function createAudio(): Audio {
     dispose() {
       music?.dispose()
       music = null
-      engineOsc?.stop()
-      engineSub?.stop()
       void ctx?.close()
       ctx = null
     },
