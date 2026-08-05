@@ -20,6 +20,7 @@ npm run dev          # http://127.0.0.1:5173
 | `↑` `↓` `A` `D` | Steer without a mouse |
 | `Q` / `E` | Roll left / right |
 | `Space` or left click | Fire |
+| `F` or right click | Hold to spool the BFG, release to abort |
 | `Shift` | Phase dash (Hornet only) |
 | `Tab` / `T` | Switch target lock |
 | `Esc` / `P` | Pause |
@@ -58,6 +59,35 @@ feathers it out-damages a pilot who holds it down by roughly half. Let it redlin
 lock out for 2.9 seconds, which costs a third of your output. The card bars in the hangar are
 *derived* from these numbers rather than typed in, so they cannot drift away from the flight
 model — see `sustainedDps` in `src/ships/specs.ts`.
+
+## The BFG
+
+Officially a Bulk Fusion Generator. Nobody calls it that.
+
+**Two rounds a run, no refills.** Hold `F` for 1.3 seconds and a slow green ball
+leaves the nose; anything within 340 units of where it stops takes up to 260
+damage, falling off sharply toward the edge. That kills any airframe in the game
+outright at the centre and is a hard shove and a scare at the rim.
+
+Three things make it a decision rather than a button:
+
+**Charging costs you everything else.** While it spools the guns are cold, the
+dash is locked and the throttle is capped at 55%. You are committing to a
+heading for a second and a half in an arena where everyone else is still
+manoeuvring.
+
+**The blast does not care who fired it.** The pilot takes 60% — 156 damage at
+point-blank, which kills a Wasp outright and takes a bite out of a Drone. The
+distance you keep is the price of the damage you get.
+
+**Hostiles run from a live round.** Each one registers as a steering hazard the
+size of its own blast, so the AI scatters as it crosses the arena. A round that
+hits nothing still breaks a formation off your tail, which makes it a zoning
+tool as much as a killing one: fire it where you want people to *not be*. It
+also chain-detonates any mines it goes off near.
+
+Aborting a charge keeps the round, so a mispress costs you a moment rather than
+a third of your firepower. The numbers all live at the top of `src/game/bfg.ts`.
 
 ## Hazards
 
@@ -168,8 +198,9 @@ silently freezes the loop and makes every behavioural observation meaningless. I
 combat contract (hits land, kills register, friendly fire is off), the hull quirks, the
 boundary, the power-up pods (placement, collection, respawn, that a boosted bolt still does
 exactly its spec damage, that a Shield refuses damage without crediting the shooter, and that
-both timed buffs stack, expire and do not survive a respawn) and that clearing the roster reports
-a win.
+both timed buffs stack, expire and do not survive a respawn), the BFG (spool, abort, ammo,
+falloff, self-damage, mine chaining, and that charging really does silence the guns), and that
+clearing the roster reports a win.
 
 `scripts/balance.ts` is the same idea pointed at fairness instead of correctness. It flies pinned
 duels — every airframe against every other, every bolt on target — and prints alpha strike,

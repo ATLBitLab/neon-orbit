@@ -15,6 +15,17 @@ import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
+import {
+  createBfg,
+  blastFraction,
+  BFG_CHARGES,
+  BLAST_DAMAGE,
+  BLAST_RADIUS,
+  SELF_DAMAGE,
+  SPOOL_TIME,
+  ROUND_LIFETIME,
+  type BfgEvent,
+} from '../src/game/bfg'
 import { createBolts } from '../src/game/bolts'
 import { createGame } from '../src/game/game'
 import type { Hud } from '../src/game/hud'
@@ -82,6 +93,9 @@ function silentAudio(): Audio & { laserCount: number } {
     pickup() {},
     overheat() {},
     alarm() {},
+    charge() {},
+    siege() {},
+    detonation() {},
     uiSelect() {},
     uiLaunch() {},
     fanfare() {},
@@ -540,6 +554,7 @@ function stubInput(): Input & { write: InputState } {
     throttleDown: false,
     fire: false,
     dash: false,
+    secondary: false,
   }
   const noop = () => {}
   return {
@@ -1157,6 +1172,262 @@ function testPickups(): void {
   mines.dispose()
 }
 
+function testBfg(): void {
+  section('The BFG charges, detonates and hurts everyone')
+
+  const forward = new THREE.Vector3(0, 0, -1)
+
+  const owner = new Ship(SHIPS.hornet, 'player')
+  owner.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  owner.warpTimer = 0
+
+  const near = new Ship(SHIPS.drone, 'enemy')
+  near.spawn(new THREE.Vector3(0, 0, -600), new THREE.Vector3(0, 0, -4000))
+  near.warpTimer = 0
+
+  const grazed = new Ship(SHIPS.hornet, 'enemy')
+  grazed.spawn(new THREE.Vector3(200, 0, -600), new THREE.Vector3(0, 0, -4000))
+  grazed.warpTimer = 0
+
+  const clear = new Ship(SHIPS.hornet, 'enemy')
+  clear.spawn(new THREE.Vector3(520, 0, -600), new THREE.Vector3(0, 0, -4000))
+  clear.warpTimer = 0
+
+  const bfg = createBfg()
+  const ships = [owner, near, grazed, clear]
+
+  function frame(hold: boolean): BfgEvent[] {
+    // Pinned: this measures the weapon, not the flight model.
+    owner.position.set(0, 0, 0)
+    near.position.set(0, 0, -600)
+    grazed.position.set(200, 0, -600)
+    clear.position.set(520, 0, -600)
+    for (const ship of ships) ship.velocity.set(0, 0, 0)
+    return bfg.update(STEP, {
+      owner,
+      forward,
+      hold,
+      targets: ships,
+      hazards: [],
+      minefield: null,
+      arenaLimit: ARENA_HARD_LIMIT,
+    })
+  }
+
+  /* ---- Spool ------------------------------------------------------------- */
+
+  const early = Math.floor((SPOOL_TIME / STEP) * 0.6)
+  for (let i = 0; i < early; i++) frame(true)
+  check('holding the trigger spools rather than firing', bfg.spool > 0.5 && bfg.spool < 1)
+  check('nothing has launched yet', bfg.roundsInFlight === 0 && bfg.charges === BFG_CHARGES)
+
+  /* ---- Abort ------------------------------------------------------------- */
+
+  const aborted = frame(false)
+  check('letting go aborts the charge', aborted.some((e) => e.kind === 'abort'))
+  check('an aborted charge is not spent', bfg.charges === BFG_CHARGES, `charges=${bfg.charges}`)
+  check('the spool resets to empty', bfg.spool === 0)
+
+  /* ---- Launch ------------------------------------------------------------ */
+
+  // Past the abort recovery, then a full charge.
+  for (let i = 0; i < Math.ceil((SPOOL_TIME + 1) / STEP); i++) frame(false)
+  let launched: BfgEvent | undefined
+  for (let i = 0; i < Math.ceil((SPOOL_TIME + 0.2) / STEP) && !launched; i++) {
+    launched = frame(true).find((e) => e.kind === 'launch')
+  }
+  check('a full charge launches a round', launched !== undefined)
+  check('the launch spends a charge', bfg.charges === BFG_CHARGES - 1, `charges=${bfg.charges}`)
+  check('the round is in flight', bfg.roundsInFlight === 1)
+  check('the AI is told to steer around it', bfg.avoidance.length === 1)
+  check(
+    'its avoid bubble covers the blast',
+    bfg.avoidance[0]?.avoidRange >= BLAST_RADIUS,
+    `avoidRange=${bfg.avoidance[0]?.avoidRange}`,
+  )
+
+  /* ---- Detonation -------------------------------------------------------- */
+
+  const nearHull = near.hull
+  const grazedHull = grazed.hull
+  let blast: Extract<BfgEvent, { kind: 'detonate' }> | undefined
+  for (let i = 0; i < Math.ceil(ROUND_LIFETIME / STEP) && !blast; i++) {
+    blast = frame(false).find((e) => e.kind === 'detonate') as typeof blast
+  }
+
+  check('the round detonates on contact', blast !== undefined)
+  check('the hull it hit is destroyed', !near.alive, `hull=${near.hull.toFixed(0)}/${nearHull}`)
+  check('a hull at the edge of the sphere is hurt, not deleted', grazed.alive && grazed.hull < grazedHull, `hull=${grazed.hull.toFixed(0)}/${grazedHull}`)
+  check('damage falls off with distance', grazed.hull > grazedHull - BLAST_DAMAGE * 0.5, `took ${(grazedHull - grazed.hull).toFixed(0)}`)
+  check('a hull outside the sphere is untouched', clear.hull === clear.spec.maxHull, `hull=${clear.hull}`)
+  check('the blast reports its casualties', blast?.kills === 1 && blast?.enemiesHit === 2, `kills=${blast?.kills}, hit=${blast?.enemiesHit}`)
+  check('the shockwave shoves what it does not kill', grazed.velocity.length() > 0, `speed=${grazed.velocity.length().toFixed(0)}`)
+  check('a spent round stops steering the AI', bfg.avoidance.length === 0 && bfg.roundsInFlight === 0)
+
+  // The falloff curve itself, independent of any particular geometry.
+  check('the blast is lethal at the centre', blastFraction(0) === 1)
+  check('and nothing at all at the edge', blastFraction(BLAST_RADIUS) === 0)
+  check(
+    'with a small lethal core rather than a uniform sphere',
+    blastFraction(BLAST_RADIUS / 2) < 0.4,
+    `half-radius fraction ${blastFraction(BLAST_RADIUS / 2).toFixed(2)}`,
+  )
+
+  bfg.dispose()
+  for (const ship of ships) ship.dispose()
+}
+
+function testBfgHurtsThePilot(): void {
+  section('The BFG does not care who fired it')
+
+  const forward = new THREE.Vector3(0, 0, -1)
+
+  const owner = new Ship(SHIPS.drone, 'player')
+  owner.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  owner.warpTimer = 0
+
+  // Close enough that the blast sphere reaches back over the pilot.
+  const victim = new Ship(SHIPS.hornet, 'enemy')
+  const victimAt = new THREE.Vector3(0, 0, -190)
+  victim.spawn(victimAt, new THREE.Vector3(0, 0, -4000))
+  victim.warpTimer = 0
+
+  const bfg = createBfg()
+  const ships = [owner, victim]
+  let blast: Extract<BfgEvent, { kind: 'detonate' }> | undefined
+
+  for (let i = 0; i < Math.ceil((SPOOL_TIME + ROUND_LIFETIME + 1) / STEP) && !blast; i++) {
+    owner.position.set(0, 0, 0)
+    owner.velocity.set(0, 0, 0)
+    victim.position.copy(victimAt)
+    victim.velocity.set(0, 0, 0)
+    blast = bfg
+      .update(STEP, {
+        owner,
+        forward,
+        hold: true,
+        targets: ships,
+        hazards: [],
+        minefield: null,
+        arenaLimit: ARENA_HARD_LIMIT,
+      })
+      .find((e) => e.kind === 'detonate') as typeof blast
+  }
+
+  const selfDamage = owner.spec.maxHull - owner.hull
+  const enemyDamage = victim.spec.maxHull - victim.hull
+
+  check('a point-blank shot catches the pilot', selfDamage > 0, `took ${selfDamage.toFixed(0)}`)
+  check('the blast reports the self-hit', blast?.selfHit === true)
+  check(
+    'the pilot takes a discounted share, not the full blast',
+    Math.abs(selfDamage / Math.max(1, enemyDamage) - SELF_DAMAGE) < 0.25,
+    `self ${selfDamage.toFixed(0)} vs enemy ${enemyDamage.toFixed(0)}`,
+  )
+  check('a Wasp would not survive its own round at this range', selfDamage > SHIPS.wasp.maxHull * 0.5, `${selfDamage.toFixed(0)} damage`)
+
+  bfg.dispose()
+  owner.dispose()
+  victim.dispose()
+}
+
+function testBfgAmmoAndChaining(): void {
+  section('Two rounds a run, and the shockwave sets off mines')
+
+  const forward = new THREE.Vector3(0, 0, -1)
+  const owner = new Ship(SHIPS.hornet, 'player')
+  owner.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  owner.warpTimer = 0
+
+  // A single mine sitting where the round will cook off at the end of its life.
+  // A tight arena so the single mine lands inside the round's reach.
+  const field = buildMinefield({
+    count: 1,
+    arenaRadius: 800,
+    hazards: [],
+    spawn: new THREE.Vector3(0, 0, 4000),
+  })
+  const mine = field.mines[0]
+  const bfg = createBfg()
+
+  let launches = 0
+  let chained = 0
+  const budget = Math.ceil(((SPOOL_TIME + 1) * (BFG_CHARGES + 2) + ROUND_LIFETIME * 2) / STEP)
+  for (let i = 0; i < budget; i++) {
+    owner.position.set(0, 0, 0)
+    owner.velocity.set(0, 0, 0)
+    // Aim each round straight at the mine so the chain has something to catch.
+    forward.copy(mine.position).normalize()
+    for (const event of bfg.update(STEP, {
+      owner,
+      forward,
+      hold: true,
+      targets: [owner],
+      hazards: [],
+      minefield: field,
+      arenaLimit: ARENA_HARD_LIMIT,
+    })) {
+      if (event.kind === 'launch') launches++
+      if (event.kind === 'detonate') chained += event.minesChained
+    }
+  }
+
+  check(`the trigger only ever yields ${BFG_CHARGES} rounds`, launches === BFG_CHARGES, `launched ${launches}`)
+  check('charges bottom out at zero', bfg.charges === 0)
+  check('the shockwave chain-detonates mines', chained > 0, `chained ${chained}`)
+  check('a chained mine is actually dead', !mine.live)
+
+  bfg.reset()
+  check('a new run re-arms the weapon', bfg.charges === BFG_CHARGES && bfg.roundsInFlight === 0)
+
+  bfg.dispose()
+  owner.dispose()
+  field.dispose()
+}
+
+function testSpoolingSilencesTheGuns(): void {
+  section('Spooling the BFG costs you the guns')
+
+  const input = stubInput()
+  const game = createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input,
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  game.start('hornet')
+
+  // Both triggers down. The main gun should stay cold for the whole charge.
+  input.write.fire = true
+  input.write.secondary = true
+  input.write.throttleUp = true
+
+  const spoolFrames = Math.floor((SPOOL_TIME / STEP) * 0.8)
+  for (let i = 0; i < spoolFrames; i++) game.update(STEP)
+
+  const charging = game.snapshot()
+  check('the guns do not fire while the BFG spools', charging?.shotsFired === 0, `shots=${charging?.shotsFired}`)
+  check('the spool is visibly filling', (charging?.bfgSpool ?? 0) > 0.5, `spool=${charging?.bfgSpool?.toFixed(2)}`)
+  check('both rounds are still aboard', charging?.bfgCharges === BFG_CHARGES)
+
+  for (let i = 0; i < Math.ceil(0.6 / STEP); i++) game.update(STEP)
+  const fired = game.snapshot()
+  check('the round launches at full charge', fired?.bfgCharges === BFG_CHARGES - 1, `charges=${fired?.bfgCharges}`)
+
+  // Trigger up: the guns come straight back.
+  input.write.secondary = false
+  for (let i = 0; i < Math.ceil(1.2 / STEP); i++) game.update(STEP)
+  const shooting = game.snapshot()
+  check('releasing it hands the guns back', (shooting?.shotsFired ?? 0) > 0, `shots=${shooting?.shotsFired}`)
+
+  game.dispose()
+}
+
 /* -------------------------------------------------------------------------- */
 
 console.log('NEON ORBIT — headless simulation checks')
@@ -1168,6 +1439,10 @@ testSolarSear()
 testBoltPoolDoesNotLeak()
 testMines()
 testPickups()
+testBfg()
+testBfgHurtsThePilot()
+testBfgAmmoAndChaining()
+testSpoolingSilencesTheGuns()
 testARunCanBeWon()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)

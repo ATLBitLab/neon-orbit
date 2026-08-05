@@ -636,6 +636,43 @@ body {
   background: var(--amber);
   box-shadow: 0 0 14px var(--amber);
   animation: crit-pulse 0.55s steps(2, end) infinite;
+
+/* BFG: the fill is the spool, the pips are the ammo. */
+.gauge.bfg i {
+  background: var(--lime);
+  box-shadow: 0 0 12px var(--lime);
+}
+
+.gauge.bfg.spooling i {
+  animation: bfg-spool 0.35s steps(2, end) infinite;
+}
+
+.gauge.bfg.spent {
+  opacity: 0.35;
+}
+
+@keyframes bfg-spool {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.bfg-pips {
+  display: flex;
+  gap: 5px;
+  margin-top: 4px;
+}
+
+.bfg-pips i {
+  width: 22px;
+  height: 4px;
+  background: var(--lime);
+  box-shadow: 0 0 8px var(--lime);
+}
+
+.bfg-pips i.dead {
+  background: rgba(255, 255, 255, 0.14);
+  box-shadow: none;
 }
 
 .readout-row {

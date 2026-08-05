@@ -27,6 +27,8 @@ export interface InputState {
   throttleDown: boolean
   fire: boolean
   dash: boolean
+  /** BFG trigger — held to spool, released to abort. */
+  secondary: boolean
 }
 
 export interface Input {
@@ -53,6 +55,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
   let stickX = 0 // yaw deflection
   let stickY = 0 // pitch deflection
   let mouseFiring = false
+  let mouseCharging = false
   let locked = false
   let invertPitch = false
 
@@ -64,6 +67,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
     throttleDown: false,
     fire: false,
     dash: false,
+    secondary: false,
   }
 
   /* ---- Keyboard --------------------------------------------------------- */
@@ -97,10 +101,18 @@ export function createInput(canvas: HTMLCanvasElement): Input {
 
   function onMouseDown(e: MouseEvent) {
     if (e.button === 0) mouseFiring = true
+    if (e.button === 2) mouseCharging = true
   }
 
   function onMouseUp(e: MouseEvent) {
     if (e.button === 0) mouseFiring = false
+    if (e.button === 2) mouseCharging = false
+  }
+
+  // Right-drag is the BFG trigger, so the context menu has to stay shut. Only
+  // over the canvas — the rest of the page keeps its normal behaviour.
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault()
   }
 
   function onPointerLockChange() {
@@ -108,6 +120,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
     if (locked && !nowLocked) {
       locked = false
       mouseFiring = false
+      mouseCharging = false
       stickX = 0
       stickY = 0
       for (const h of lockLostHandlers) h()
@@ -121,6 +134,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
   window.addEventListener('mousemove', onMouseMove)
   window.addEventListener('mousedown', onMouseDown)
   window.addEventListener('mouseup', onMouseUp)
+  canvas.addEventListener('contextmenu', onContextMenu)
   window.addEventListener('blur', () => held.clear())
   document.addEventListener('pointerlockchange', onPointerLockChange)
 
@@ -146,6 +160,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
     state.throttleDown = held.has('KeyS')
     state.fire = mouseFiring || held.has('Space')
     state.dash = held.has('ShiftLeft') || held.has('ShiftRight')
+    state.secondary = mouseCharging || held.has('KeyF')
   }
 
   return {
@@ -178,6 +193,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
     reset() {
       held.clear()
       mouseFiring = false
+      mouseCharging = false
       stickX = 0
       stickY = 0
       update(0)
@@ -188,6 +204,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mousedown', onMouseDown)
       window.removeEventListener('mouseup', onMouseUp)
+      canvas.removeEventListener('contextmenu', onContextMenu)
       document.removeEventListener('pointerlockchange', onPointerLockChange)
     },
   }
@@ -204,6 +221,9 @@ const TRACKED = new Set([
   'Space',
   'ShiftLeft',
   'ShiftRight',
+  // The BFG trigger, for pilots who would rather not hold a mouse button down
+  // for a second and a half.
+  'KeyF',
   'ArrowUp',
   'ArrowDown',
   'ArrowLeft',

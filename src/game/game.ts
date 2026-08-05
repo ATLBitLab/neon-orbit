@@ -17,6 +17,7 @@ import type { Input } from '../core/input'
 import type { RunResult } from '../core/scores'
 import { otherShips, SHIPS, type ShipId } from '../ships/specs'
 import {
+  ARENA_HARD_LIMIT,
   ARENA_RADIUS,
   PLAYER_SPAWN,
   PLAYER_SPAWN_LOOK,
@@ -34,6 +35,7 @@ import {
   type PickupKind,
 } from '../world/pickups'
 import { EnemyPilot } from './ai'
+import { createBfg, BLAST_RADIUS, SPOOL_THROTTLE_CAP, type Bfg } from './bfg'
 import { createBolts, type Bolts } from './bolts'
 import { createChaseCamera, type ChaseCamera } from './chase'
 import { createFx, type Fx } from './fx'
@@ -63,6 +65,11 @@ const RETICLE_RANGE = 900
 
 /** Mine detonation colour — matches the hull, not the shooter's accent. */
 const MINE_FLASH = new THREE.Color(0xff3324)
+/** BFG green. Deliberately nobody's hull colour, so a round is never mistaken
+ *  for a ship at range. */
+const BFG_FLASH = new THREE.Color(0x9dff3b)
+/** Seconds between spool ratchet ticks at the start of the charge. */
+const CHARGE_TICK = 0.17
 
 /** Collection flashes, matching each pod's own glow. */
 const PICKUP_FLASH = Object.fromEntries(
@@ -112,6 +119,9 @@ export interface RunSnapshot {
   enemiesAirborne: number
   enemiesQueued: number
   elapsed: number
+  /** BFG rounds left, and how far along the current spool is. */
+  bfgCharges: number
+  bfgSpool: number
   /** How hard the star is cooking the player, 0..1. Exposed for the same
    *  reason as the bearing below: so the burn is inspectable from the console
    *  rather than only visible as a hull bar going down. */
@@ -156,7 +166,8 @@ export function createGame(deps: GameDeps): Game {
 
   const bolts: Bolts = createBolts()
   const fx: Fx = createFx()
-  scene.add(bolts.mesh, fx.group)
+  const bfg: Bfg = createBfg(BFG_FLASH.getHex())
+  scene.add(bolts.mesh, fx.group, bfg.group)
 
   const chase: ChaseCamera = createChaseCamera(camera)
 
@@ -189,6 +200,16 @@ export function createGame(deps: GameDeps): Game {
   let lockedTarget: Ship | null = null
   /** Set on the frame the run resolves, so the loop stops before reporting. */
   let ending = false
+  /** BFG rounds launched this run, counted as shots for the accuracy stat. */
+  let bfgShots = 0
+  let chargeTimer = 0
+  /**
+   * True while a blast is applying damage. A detonation that catches three
+   * hostiles calls `onDamaged` three times, and counting each as a hit would
+   * report accuracy above 100% off a single trigger pull. Blast damage still
+   * scores; it just resolves to exactly one hit for one shot, below.
+   */
+  let resolvingBlast = false
 
   const playerControls: Controls = {
     pitch: 0,
@@ -269,8 +290,8 @@ export function createGame(deps: GameDeps): Game {
 
     ship.onDamaged = (_self, amount, from) => {
       if (from !== 'player') return
-      playerHits++
       score += Math.round(amount)
+      if (!resolvingBlast) playerHits++
     }
 
     ship.onDeath = (self) => {
@@ -321,6 +342,15 @@ export function createGame(deps: GameDeps): Game {
     c.roll = s.roll
     c.fire = s.fire
     c.dash = s.dash
+
+    // Spooling the BFG costs you everything else. Cold guns, no dash and a
+    // throttle ceiling is what turns "press the big button" into a decision
+    // about where you are willing to be for the next second and a half.
+    if (bfg.spooling) {
+      c.fire = false
+      c.dash = false
+      c.throttle = Math.min(c.throttle, SPOOL_THROTTLE_CAP)
+    }
     return c
   }
 
@@ -412,6 +442,80 @@ export function createGame(deps: GameDeps): Game {
   }
 
   /* ------------------------------------------------------------------------ */
+  /* BFG                                                                      */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Runs the secondary weapon and turns its events into noise, light and score.
+   * Kept here rather than inside the weapon so `bfg.ts` stays pure maths and
+   * runs headless.
+   */
+  function resolveBfg(dt: number): void {
+    if (!player) return
+
+    player.forward(_forward)
+    // Damage lands inside this call, so the accuracy guard wraps it rather than
+    // the individual `takeDamage` calls it fans out to.
+    resolvingBlast = true
+    const events = bfg.update(dt, {
+      owner: player,
+      forward: _forward,
+      hold: input.state.secondary,
+      targets: boltTargets,
+      hazards: environment.hazards,
+      minefield: environment.minefield,
+      arenaLimit: ARENA_HARD_LIMIT,
+    })
+    resolvingBlast = false
+
+    for (const event of events) {
+      switch (event.kind) {
+        case 'spool': {
+          // The ratchet tightens as the charge fills, so the sound alone tells
+          // you how long you have left to hold this heading.
+          chargeTimer -= dt
+          if (chargeTimer <= 0) {
+            audio.charge(event.progress)
+            chargeTimer = CHARGE_TICK * (1 - event.progress * 0.6)
+          }
+          break
+        }
+
+        case 'abort': {
+          chargeTimer = 0
+          break
+        }
+
+        case 'launch': {
+          bfgShots++
+          chargeTimer = 0
+          audio.siege()
+          fx.spark(event.position, BFG_FLASH, 30)
+          chase.shake(0.5)
+          hud.callout('BFG AWAY', '#9dff3b', 0.9)
+          break
+        }
+
+        case 'detonate': {
+          fx.blast(event.position, BFG_FLASH, BLAST_RADIUS)
+          audio.detonation()
+
+          const distance = event.position.distanceTo(player.position)
+          chase.shake(distance < BLAST_RADIUS * 2 ? 3.4 : 1.1)
+
+          if (event.minesChained > 0) rebuildAvoidList()
+          if (event.enemiesHit > 0) playerHits++
+
+          if (event.selfHit) hud.callout('CAUGHT THE BLAST', '#ff3b4e', 1.4)
+          else if (event.kills > 1) hud.feed(`MULTIKILL  ×${event.kills}`)
+          else if (event.enemiesHit === 0) hud.feed('BFG  ·  NOTHING IN THE SPHERE')
+          break
+        }
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
   /* Targeting                                                                */
   /* ------------------------------------------------------------------------ */
 
@@ -495,6 +599,7 @@ export function createGame(deps: GameDeps): Game {
     }
     bolts.clear()
     fx.clear()
+    bfg.clear()
     boltTargets = []
     contactBuffer.length = 0
   }
@@ -505,7 +610,10 @@ export function createGame(deps: GameDeps): Game {
     ending = false
 
     const shipId = player?.spec.id ?? 'hornet'
-    const shotsFired = player?.shotsFired ?? 0
+    // A BFG launch is one shot for accuracy purposes, and a blast that catches
+    // anything at all is one hit. Leaving it out entirely would let a pilot
+    // farm the stat by opening every fight with a round they never aimed.
+    const shotsFired = (player?.shotsFired ?? 0) + bfgShots
 
     if (won) {
       // Reward finishing intact and finishing fast, in that order.
@@ -563,8 +671,12 @@ export function createGame(deps: GameDeps): Game {
        consumed before the next pilot's turn. */
     squadron.length = 0
     for (const pilot of pilots) squadron.push(pilot.ship)
+    // A live round is a moving hazard the size of its own blast, so hostiles
+    // scatter out of its path. Concatenated only while one is in flight —
+    // the rest of the time the AI reads the same array it always has.
+    const avoidNow = bfg.avoidance.length > 0 ? avoidList.concat(bfg.avoidance) : avoidList
     for (const pilot of pilots) {
-      const controls = pilot.think(player, squadron, avoidList, dt)
+      const controls = pilot.think(player, squadron, avoidNow, dt)
       pilot.ship.step(controls, dt, ctx)
     }
 
@@ -574,12 +686,18 @@ export function createGame(deps: GameDeps): Game {
       if (hit.target) audio.hit()
     }
 
+    /* BFG. After everyone has moved, so a round detonates against final
+       positions, and before mines so a chained field is already gone by the
+       time contact is tested. */
+    resolveBfg(dt)
+
     /* Mines. Checked after everyone has moved, so contact is resolved against
        final positions rather than a stale frame. */
     resolveMines()
     resolvePickups()
 
     /* Presentation */
+    bfg.syncVisual(dt)
     player.syncVisual()
     for (const pilot of pilots) pilot.ship.syncVisual()
     fx.update(dt, camera)
@@ -654,6 +772,8 @@ export function createGame(deps: GameDeps): Game {
             expiring: player.shieldTimer <= TIMED_WARN_AT,
           }
         : null,
+      bfgCharges: bfg.charges,
+      bfgSpool: bfg.spool,
       target: targetReadout(),
     })
     hud.updateContacts(contactBuffer, camera)
@@ -775,6 +895,10 @@ export function createGame(deps: GameDeps): Game {
       environment.minefield.reset()
       environment.pickups.reset()
       rebuildAvoidList()
+      bfg.reset()
+      bfgShots = 0
+      chargeTimer = 0
+      resolvingBlast = false
 
       hud.setShip(spec)
       hud.show()
@@ -847,6 +971,8 @@ export function createGame(deps: GameDeps): Game {
         solarExposure: player.solarExposure,
         overdrive: player.overdriveTimer,
         shield: player.shieldTimer,
+        bfgCharges: bfg.charges,
+        bfgSpool: bfg.spool,
         target: bearing,
         pickups: nearestPods,
       }
@@ -873,9 +999,10 @@ export function createGame(deps: GameDeps): Game {
 
     dispose() {
       clearArena()
-      scene.remove(bolts.mesh, fx.group)
+      scene.remove(bolts.mesh, fx.group, bfg.group)
       bolts.dispose()
       fx.dispose()
+      bfg.dispose()
     },
   }
 }

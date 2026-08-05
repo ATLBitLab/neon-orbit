@@ -12,6 +12,7 @@
 
 import * as THREE from 'three'
 import type { ShipSpec } from '../ships/specs'
+import { BFG_CHARGES } from './bfg'
 
 const MAX_CONTACTS = 8
 /** Fraction of the half-viewport where edge arrows sit. */
@@ -70,6 +71,10 @@ export interface HudFrame {
    */
   overdrive: HudBuff | null
   shield: HudBuff | null
+  /** BFG rounds left this run. */
+  bfgCharges: number
+  /** BFG spool progress, 0..1. */
+  bfgSpool: number
   target: HudTarget | null
 }
 
@@ -175,6 +180,14 @@ export function createHud(parent: HTMLElement): Hud {
   const odUi = buffBlock('OVERDRIVE', 'overdrive')
   const shUi = buffBlock('SHIELD', 'shield')
 
+  // The BFG readout is two numbers a pilot needs at a glance and never has time
+  // to read: how far along the spool is, and whether there is a second shot.
+  const bfgLabel = el('div', 'hud-label', 'BFG  ·  HOLD F')
+  const bfgGauge = el('div', 'gauge bfg')
+  const bfgFill = el('i')
+  bfgGauge.append(bfgFill)
+  const bfgPips = el('div', 'bfg-pips')
+  for (let i = 0; i < BFG_CHARGES; i++) bfgPips.append(el('i'))
   tl.append(
     el('div', 'hud-label', 'AIRFRAME'),
     shipName,
@@ -185,6 +198,9 @@ export function createHud(parent: HTMLElement): Hud {
     quirkGauge,
     odUi.block,
     shUi.block,
+    bfgLabel,
+    bfgGauge,
+    bfgPips,
   )
 
   const tr = el('div', 'hud-corner hud-tr')
@@ -318,6 +334,8 @@ export function createHud(parent: HTMLElement): Hud {
   const view = new THREE.Vector3()
 
   let lastPipCount = -1
+  /** BFG pips are only repainted when a round is spent. */
+  let lastBfgCharges = -1
 
   return {
     root,
@@ -340,6 +358,7 @@ export function createHud(parent: HTMLElement): Hud {
             ? 'NANITE REPAIR'
             : 'PHASE DASH'
       lastPipCount = -1
+      lastBfgCharges = -1
     },
 
     update(frame) {
@@ -351,6 +370,18 @@ export function createHud(parent: HTMLElement): Hud {
 
       quirkFill.style.width = `${frame.quirkValue * 100}%`
       quirkGauge.classList.toggle('hot', frame.quirkAlarming)
+
+      bfgFill.style.width = `${frame.bfgSpool * 100}%`
+      bfgGauge.classList.toggle('spooling', frame.bfgSpool > 0)
+      bfgGauge.classList.toggle('spent', frame.bfgCharges === 0)
+      if (frame.bfgCharges !== lastBfgCharges) {
+        const children = bfgPips.children
+        for (let i = 0; i < children.length; i++) {
+          children[i].classList.toggle('dead', i >= frame.bfgCharges)
+        }
+        bfgLabel.textContent = frame.bfgCharges > 0 ? 'BFG  ·  HOLD F' : 'BFG  ·  EXPENDED'
+        lastBfgCharges = frame.bfgCharges
+      }
 
       scoreValue.textContent = frame.score.toLocaleString()
       multValue.textContent = `×${frame.multiplier.toFixed(2)}`
