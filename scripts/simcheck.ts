@@ -21,7 +21,17 @@ import type { Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { mulberry32 } from '../src/core/rng'
 import { SHIPS } from '../src/ships/specs'
-import { ARENA_HARD_LIMIT, ARENA_RADIUS, type Environment, type Hazard } from '../src/world/environment'
+import {
+  ARENA_HARD_LIMIT,
+  ARENA_RADIUS,
+  SEAR_OUTER,
+  SUN_DIRECTION,
+  SUN_POSITION,
+  SUN_RADIUS,
+  solarExposure,
+  type Environment,
+  type Hazard,
+} from '../src/world/environment'
 import { buildMinefield, MINE_DAMAGE } from '../src/world/mines'
 
 const STEP = 1 / 60
@@ -327,6 +337,137 @@ function testQuirks(): void {
   wasp.dispose()
   drone.dispose()
   hornet.dispose()
+}
+
+function testSolarSear(): void {
+  section('The star burns hulls that fly into it')
+
+  const bolts = createBolts()
+  const audio = silentAudio()
+  const ctx: ShipContext = { hazards: [], audio, bolts }
+
+  /* ---- Geometry: the zone has to be reachable, and the star must not ----- */
+
+  // If the burn only began outside the hard limit the feature would be dead
+  // code, and if the star's body were reachable a pilot could park inside it.
+  const sunward = SUN_DIRECTION.clone().multiplyScalar(ARENA_RADIUS)
+  check(
+    'the burn zone is reachable inside the patrol boundary',
+    solarExposure(sunward) > 0,
+    `exposure at the sunward patrol line = ${solarExposure(sunward).toFixed(2)}`,
+  )
+  check(
+    'the arena centre is completely clear of it',
+    solarExposure(new THREE.Vector3(0, 0, 0)) === 0,
+  )
+  const closestApproach = SUN_POSITION.length() - ARENA_HARD_LIMIT
+  check(
+    'the star itself can never be touched',
+    closestApproach > SUN_RADIUS,
+    `closest approach ${closestApproach.toFixed(0)} vs body radius ${SUN_RADIUS}`,
+  )
+
+  /* ---- A hull parked in the light cooks ---------------------------------- */
+
+  const burning = new Ship(SHIPS.hornet, 'player')
+  const deep = SUN_DIRECTION.clone().multiplyScalar(ARENA_RADIUS)
+  burning.spawn(deep, new THREE.Vector3(0, 0, 0))
+  burning.warpTimer = 0
+
+  const startHull = burning.hull
+  let deathAt = -1
+  burning.onDeath = () => {
+    deathAt = frames
+  }
+
+  // Pinned, because the point is the burn rate and not the flight model.
+  let frames = 0
+  for (; frames < 60 * 30 && deathAt < 0; frames++) {
+    burning.position.copy(deep)
+    burning.velocity.set(0, 0, 0)
+    burning.step(controls(), STEP, ctx)
+  }
+
+  check('exposure is reported to the HUD', burning.solarExposure > 0, `exposure=${burning.solarExposure.toFixed(2)}`)
+  check('a hull left in the light takes damage', burning.hull < startHull || deathAt > 0)
+  check('and eventually burns up', deathAt > 0, `survived ${(frames * STEP).toFixed(1)}s`)
+  // Long enough to read the warning and turn, short enough to be a real threat.
+  const timeToDeath = deathAt * STEP
+  check(
+    `death takes between 2s and 12s (took ${timeToDeath.toFixed(1)}s)`,
+    timeToDeath > 2 && timeToDeath < 12,
+  )
+
+  /* ---- Damage is not credited as player marksmanship --------------------- */
+
+  const hostile = new Ship(SHIPS.wasp, 'enemy')
+  hostile.spawn(deep, new THREE.Vector3(0, 0, 0))
+  hostile.warpTimer = 0
+
+  let creditedToPlayer = 0
+  hostile.onDamaged = (_self, _amount, from) => {
+    if (from === 'player') creditedToPlayer++
+  }
+  for (let i = 0; i < 60 * 4 && hostile.alive; i++) {
+    hostile.position.copy(deep)
+    hostile.velocity.set(0, 0, 0)
+    hostile.step(controls(), STEP, ctx)
+  }
+  check('an enemy in the light burns too', hostile.hull < hostile.spec.maxHull || !hostile.alive)
+  check(
+    'sear damage is never credited to the player',
+    creditedToPlayer === 0,
+    `${creditedToPlayer} tick(s) would have inflated accuracy`,
+  )
+
+  /* ---- Safe ground stays safe -------------------------------------------- */
+
+  const shaded = new Ship(SHIPS.hornet, 'player')
+  // The anti-sunward patrol line: as far out as a pilot can legally fly, but
+  // pointed away from the star.
+  const away = SUN_DIRECTION.clone().multiplyScalar(-ARENA_RADIUS)
+  shaded.spawn(away, new THREE.Vector3(0, 0, 0))
+  shaded.warpTimer = 0
+  for (let i = 0; i < 60 * 10; i++) {
+    shaded.position.copy(away)
+    shaded.velocity.set(0, 0, 0)
+    shaded.step(controls(), STEP, ctx)
+  }
+  check('the far side of the arena is untouched', shaded.hull === shaded.spec.maxHull, `hull=${shaded.hull}`)
+  check('and reports zero exposure', shaded.solarExposure === 0)
+
+  /* ---- Materialising ships are not cooked before they can steer ---------- */
+
+  const arriving = new Ship(SHIPS.wasp, 'enemy')
+  arriving.spawn(deep, new THREE.Vector3(0, 0, 0))
+  for (let i = 0; i < 30; i++) {
+    arriving.position.copy(deep)
+    arriving.velocity.set(0, 0, 0)
+    arriving.step(controls(), STEP, ctx)
+  }
+  check('a warping-in ship is not burned mid-materialise', arriving.hull === arriving.spec.maxHull, `hull=${arriving.hull}`)
+
+  /* ---- The exposure ramp is monotonic ------------------------------------ */
+
+  let monotonic = true
+  let previous = 1
+  for (let d = 0; d <= 20; d++) {
+    // Walk outward from the star along its own axis, sampling exposure.
+    const at = SUN_POSITION.clone().addScaledVector(
+      SUN_DIRECTION,
+      -(SEAR_OUTER * (d / 20)),
+    )
+    const e = solarExposure(at)
+    if (e > previous + 1e-6) monotonic = false
+    previous = e
+  }
+  check('exposure falls off monotonically with distance', monotonic)
+
+  bolts.dispose()
+  burning.dispose()
+  hostile.dispose()
+  shaded.dispose()
+  arriving.dispose()
 }
 
 function testBoltPoolDoesNotLeak(): void {
@@ -663,6 +804,7 @@ testPlayerBoltsKillEnemies()
 testFriendlyFireIsOff()
 testBoundaryTurnsShipsAround()
 testQuirks()
+testSolarSear()
 testBoltPoolDoesNotLeak()
 testMines()
 testARunCanBeWon()

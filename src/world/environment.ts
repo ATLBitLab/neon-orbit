@@ -32,6 +32,37 @@ export const PLAYER_SPAWN_LOOK = new THREE.Vector3(0, 0, -200)
 /** How wide a berth an AI gives a station. */
 const STATION_AVOID_RANGE = 520
 
+/**
+ * The star sits at a finite distance rather than infinitely far away, so that
+ * "closer to the sun" is a real position in the arena and not just a lighting
+ * direction. Placed so its surface clears the hard limit by 400 units: the
+ * sunward wall of the arena is the closest a pilot can ever get, and the hull
+ * cooks well before then.
+ */
+export const SUN_DISTANCE = 5600
+export const SUN_RADIUS = 900
+export const SUN_POSITION = SUN_DIRECTION.clone().multiplyScalar(SUN_DISTANCE)
+
+/** Hull starts taking radiant damage inside this distance from the star. */
+export const SEAR_OUTER = 3900
+/** At or inside this distance the burn runs at its full rate. */
+export const SEAR_INNER = 2400
+
+/**
+ * How hard the star is cooking a hull at `position`, 0..1.
+ *
+ * Distance to a point rather than a projection along `SUN_DIRECTION`: the burn
+ * zone is then a cap around the sunward axis, so flying *at* the visible star
+ * is what hurts. Skimming the boundary anywhere else is safe, which keeps the
+ * whole rest of the arena usable.
+ */
+export function solarExposure(position: THREE.Vector3): number {
+  const dist = position.distanceTo(SUN_POSITION)
+  if (dist >= SEAR_OUTER) return 0
+  if (dist <= SEAR_INNER) return 1
+  return (SEAR_OUTER - dist) / (SEAR_OUTER - SEAR_INNER)
+}
+
 const PLANET_RADIUS = 6000
 const PLANET_CENTER = new THREE.Vector3(0, -10500, -2600)
 
@@ -174,7 +205,7 @@ export function buildEnvironment(): Environment {
   const group = new THREE.Group()
   const rng = makeRng(WORLD_SEED)
 
-  const sky: Sky = buildSky(rng)
+  const sky: Sky = buildSky(rng, { position: SUN_POSITION, radius: SUN_RADIUS })
   const planet: Planet = buildPlanet(rng, {
     radius: PLANET_RADIUS,
     center: PLANET_CENTER,

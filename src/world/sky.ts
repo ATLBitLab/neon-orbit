@@ -1,9 +1,13 @@
 /**
- * The backdrop: nebula gradient, two star layers, one distant moon.
+ * The backdrop: nebula gradient, two star layers, one distant moon, one sun.
  *
  * Drawn with `depthTest: false` and a very negative render order, so the
  * backdrop is unconditionally behind everything without needing a far plane
  * large enough to contain it geometrically.
+ *
+ * The sun is the exception: it is a real object at a real distance, because
+ * `solarExposure` measures range to it and a pilot has to be able to see what
+ * is cooking them. So it depth-tests normally and can be eclipsed by a station.
  */
 
 import * as THREE from 'three'
@@ -48,10 +52,47 @@ const NEBULA_FRAG = /* glsl */ `
   }
 `
 
+/** Filled halo around the sun's body. */
+const CORONA_VERT = /* glsl */ `
+  varying vec3 vNormalWorld;
+  varying vec3 vToCamera;
+  void main() {
+    vec4 world = modelMatrix * vec4(position, 1.0);
+    vNormalWorld = normalize(mat3(modelMatrix) * normal);
+    vToCamera = normalize(cameraPosition - world.xyz);
+    gl_Position = projectionMatrix * viewMatrix * world;
+  }
+`
+
+const CORONA_FRAG = /* glsl */ `
+  uniform vec3 uInner;
+  uniform vec3 uOuter;
+  uniform float uPulse;
+
+  varying vec3 vNormalWorld;
+  varying vec3 vToCamera;
+
+  void main() {
+    // Rendered BackSide, so the visible normal points away from the camera.
+    // Negating it gives 1 through the middle of the disc and 0 at the limb —
+    // a filled glow rather than the rim ring a FrontSide fresnel would give.
+    float depth = max(0.0, dot(-vNormalWorld, vToCamera));
+    float core = pow(depth, 3.4);
+    float halo = pow(depth, 0.9) * 0.28;
+    float a = clamp((core + halo) * uPulse, 0.0, 1.0);
+    gl_FragColor = vec4(mix(uOuter, uInner, core) * a, a);
+  }
+`
+
 export interface Sky {
   group: THREE.Group
   update(dt: number): void
   dispose(): void
+}
+
+export interface SunOptions {
+  position: THREE.Vector3
+  radius: number
 }
 
 function buildNebula(): { mesh: THREE.Mesh; geometry: THREE.BufferGeometry; material: THREE.ShaderMaterial } {
@@ -154,15 +195,74 @@ function buildMoon(): { mesh: THREE.Mesh; geometry: THREE.BufferGeometry; materi
   return { mesh, geometry, material }
 }
 
-export function buildSky(rng: Rng): Sky {
+/**
+ * The star: a hard body inside a soft corona.
+ *
+ * Both are unlit — a sun that took lighting from the scene's own directional
+ * light would be shaded dark on the side facing the arena, which is exactly
+ * backwards. The corona is additive and does not write depth, so the body
+ * draws cleanly through it.
+ */
+function buildSun(opts: SunOptions): {
+  group: THREE.Group
+  update(dt: number): void
+  dispose(): void
+} {
+  const group = new THREE.Group()
+  group.position.copy(opts.position)
+
+  const bodyGeometry = new THREE.IcosahedronGeometry(opts.radius, 4)
+  const bodyMaterial = new THREE.MeshBasicMaterial({ color: 0xfff6e2, fog: false })
+  const body = new THREE.Mesh(bodyGeometry, bodyMaterial)
+
+  const coronaGeometry = new THREE.IcosahedronGeometry(opts.radius * 3.1, 3)
+  const coronaMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      uInner: { value: new THREE.Color(1.0, 0.93, 0.72) },
+      uOuter: { value: new THREE.Color(1.0, 0.42, 0.16) },
+      uPulse: { value: 1 },
+    },
+    vertexShader: CORONA_VERT,
+    fragmentShader: CORONA_FRAG,
+    side: THREE.BackSide,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  })
+  const corona = new THREE.Mesh(coronaGeometry, coronaMaterial)
+  // Draw after opaque geometry so the additive pass composites over the arena.
+  corona.renderOrder = 10
+
+  group.add(body, corona)
+
+  let t = 0
+  return {
+    group,
+    update(dt: number) {
+      // A slow breath, so the star reads as burning rather than as a decal.
+      t += dt
+      coronaMaterial.uniforms.uPulse.value = 0.92 + Math.sin(t * 0.55) * 0.08
+      body.rotation.y += dt * 0.02
+    },
+    dispose() {
+      bodyGeometry.dispose()
+      bodyMaterial.dispose()
+      coronaGeometry.dispose()
+      coronaMaterial.dispose()
+    },
+  }
+}
+
+export function buildSky(rng: Rng, sunOptions: SunOptions): Sky {
   const group = new THREE.Group()
 
   const nebula = buildNebula()
   const dim = buildStarLayer(rng, 3200, 1.4, 40000, [0xbfd8ff, 0xffffff, 0xffe6c4, 0xd8c4ff])
   const bright = buildStarLayer(rng, 240, 3.4, 40000, [0xffffff, 0x9fe6ff, 0xffd9a8, 0xff9fd0])
   const moon = buildMoon()
+  const sun = buildSun(sunOptions)
 
-  group.add(nebula.mesh, dim.points, bright.points, moon.mesh)
+  group.add(nebula.mesh, dim.points, bright.points, moon.mesh, sun.group)
 
   let t = 0
   return {
@@ -172,6 +272,7 @@ export function buildSky(rng: Rng): Sky {
       t += dt
       dim.points.rotation.y = t * 0.0012
       bright.points.rotation.y = t * 0.0012
+      sun.update(dt)
     },
     dispose() {
       nebula.geometry.dispose()
@@ -182,6 +283,7 @@ export function buildSky(rng: Rng): Sky {
       bright.material.dispose()
       moon.geometry.dispose()
       moon.material.dispose()
+      sun.dispose()
     },
   }
 }
