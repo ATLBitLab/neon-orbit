@@ -35,6 +35,12 @@ export interface Audio {
   pickup(big: boolean): void
   overheat(): void
   alarm(): void
+  /** BFG spool ratchet. `progress` 0..1 walks the pitch up. */
+  charge(progress: number): void
+  /** BFG launch. */
+  siege(): void
+  /** BFG detonation. The loudest thing in the game, and it should be. */
+  detonation(): void
   uiSelect(): void
   uiLaunch(): void
   fanfare(win: boolean): void
@@ -200,6 +206,31 @@ export function createAudio(): Audio {
     alarm() {
       tone('square', 880, 880, 0.09, 0.075)
       tone('square', 660, 660, 0.09, 0.075, 0.13)
+    },
+
+    // A ratchet rather than a held whine: every other voice in here is a
+    // transient with its stop already scheduled, and a sustained tone would be
+    // the only thing in the mix that has to be turned off by hand — exactly the
+    // bug that got the engine note deleted. Ticking also carries information a
+    // drone does not, since the interval tightens as the charge fills.
+    charge(progress) {
+      const base = 220 + progress * 620
+      tone('square', base, base * 1.35, 0.05, 0.05)
+      tone('sine', base * 0.5, base * 0.62, 0.07, 0.035)
+    },
+
+    siege() {
+      tone('sawtooth', 820, 90, 0.42, 0.16)
+      tone('sine', 260, 44, 0.5, 0.14, 0.02)
+      noise(0.34, 0.2, 'lowpass', 3200, 300)
+    },
+
+    detonation() {
+      noise(1.9, 0.6, 'lowpass', 2600, 60)
+      tone('sine', 92, 18, 1.7, 0.4)
+      tone('sawtooth', 240, 38, 0.7, 0.14)
+      tone('triangle', 60, 22, 2.1, 0.22, 0.06)
+      music?.duck()
     },
 
     uiSelect() {

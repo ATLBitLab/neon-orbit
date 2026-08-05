@@ -36,6 +36,14 @@ import {
   type ShipId,
   type ShipSpec,
 } from '../src/ships/specs'
+import {
+  blastFraction,
+  BFG_CHARGES,
+  BLAST_DAMAGE,
+  BLAST_RADIUS,
+  SELF_DAMAGE,
+  SPOOL_TIME,
+} from '../src/game/bfg'
 import { ARENA_HARD_LIMIT, SEAR_INNER, SUN_DIRECTION, SUN_DISTANCE } from '../src/world/environment'
 import { MINE_DAMAGE } from '../src/world/mines'
 import {
@@ -93,6 +101,9 @@ function silentAudio(): Audio {
     pickup() {},
     overheat() {},
     alarm() {},
+    charge() {},
+    siege() {},
+    detonation() {},
     uiSelect() {},
     uiLaunch() {},
     fanfare() {},
@@ -388,6 +399,29 @@ for (const attacker of SHIP_ORDER) {
   console.log(`  ${pad(SHIPS[attacker].name, 8)}${cells.join('')}`)
 }
 
+section('BFG')
+console.log(`  ${pad('', 14)}${padLeft('damage', 9)}${padLeft('vs Wasp', 10)}${padLeft('vs Hornet', 12)}${padLeft('vs Drone', 11)}`)
+for (const [label, distance] of [
+  ['centre', 0],
+  ['quarter radius', BLAST_RADIUS * 0.25],
+  ['half radius', BLAST_RADIUS * 0.5],
+  ['three quarters', BLAST_RADIUS * 0.75],
+] as [string, number][]) {
+  const damage = BLAST_DAMAGE * blastFraction(distance)
+  const share = (id: ShipId): string => {
+    const pct = Math.min(100, (damage / SHIPS[id].maxHull) * 100)
+    return pct >= 100 ? 'KILL' : `${pct.toFixed(0)}%`
+  }
+  console.log(
+    `  ${pad(label, 14)}${padLeft(damage.toFixed(0), 9)}${padLeft(share('wasp'), 10)}` +
+      `${padLeft(share('hornet'), 12)}${padLeft(share('drone'), 11)}`,
+  )
+}
+const selfBlast = BLAST_DAMAGE * SELF_DAMAGE
+console.log(
+  `  ${BFG_CHARGES} rounds a run · ${SPOOL_TIME}s spool · point-blank self-damage ${selfBlast.toFixed(0)}`,
+)
+
 section('Hangar cards')
 for (const id of SHIP_ORDER) {
   const b = SHIPS[id].bars
@@ -489,6 +523,30 @@ for (const [matchup, t] of ttk) {
     `${t.toFixed(2)}s`,
   )
 }
+
+/**
+ * The BFG is a moment, not a build. Two rounds spread over even a short
+ * engagement have to come out below the *weakest* gun in the fleet, or the
+ * right way to play becomes opening with both and mopping up — and every
+ * balance number above stops describing the game.
+ */
+const ENGAGEMENT = 30
+const bfgDpsOverAFight = (BFG_CHARGES * BLAST_DAMAGE) / ENGAGEMENT
+check(
+  'the BFG cannot replace the guns',
+  bfgDpsOverAFight < Math.min(...SHIP_ORDER.map(best)),
+  `${bfgDpsOverAFight.toFixed(1)} DPS across a ${ENGAGEMENT}s fight vs ${Math.min(...SHIP_ORDER.map(best)).toFixed(1)} from the weakest gun`,
+)
+
+/**
+ * And it has to be able to kill you. A blast the pilot can safely stand inside
+ * is a free button, and a free button gets pressed on cooldown.
+ */
+check(
+  'a point-blank BFG kills the pilot who fired it',
+  selfBlast > SHIPS.wasp.maxHull,
+  `${selfBlast.toFixed(0)} self-damage vs a ${SHIPS.wasp.maxHull} hull`,
+)
 
 /** A hazard that one-shots an airframe stops being a hazard and becomes a wall. */
 for (const id of SHIP_ORDER) {
