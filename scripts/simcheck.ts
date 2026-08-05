@@ -51,6 +51,7 @@ function silentAudio(): Audio & { laserCount: number } {
       return true
     },
     setEngine() {},
+    setMusic() {},
     laser() {
       stub.laserCount++
     },

@@ -1,12 +1,19 @@
 /**
- * Procedural sound. No audio files ship with the game.
+ * Procedural sound effects, plus the bus the streamed music rides on.
  *
- * Every effect is a short oscillator or noise burst built on demand, which
- * keeps the deploy a couple of hundred kilobytes and sidesteps asset licensing
- * entirely. The engine hum is the only persistent voice; it is created lazily
- * on the first user gesture, because browsers suspend an AudioContext that is
- * constructed before one.
+ * Every effect is a short oscillator or noise burst built on demand, so the
+ * whole effects layer costs no download at all. The engine hum is the only
+ * persistent voice; it is created lazily on the first user gesture, because
+ * browsers suspend an AudioContext that is constructed before one.
+ *
+ * Music is the one thing here that is not synthesised — see `music.ts`. It is
+ * routed through this module's master gain rather than played independently,
+ * so the M key mutes it for free and effects can duck it.
  */
+
+import { createMusic, type Music, type MusicTrack } from './music'
+
+export type { MusicTrack }
 
 const MASTER_GAIN = 0.5
 
@@ -17,6 +24,8 @@ export interface Audio {
   toggleMute(): boolean
   /** Engine note follows normalised speed 0..1. */
   setEngine(intensity: number): void
+  /** Crossfade the background track, or pass null to fade to silence. */
+  setMusic(track: MusicTrack | null): void
   laser(accent: 'player' | 'enemy'): void
   hit(): void
   hullHit(): void
@@ -39,7 +48,10 @@ export function createAudio(): Audio {
   let engineGain: GainNode | null = null
   let engineFilter: BiquadFilterNode | null = null
   let noiseBuffer: AudioBuffer | null = null
+  let music: Music | null = null
   let muted = false
+  /** Held until the AudioContext exists, which needs a user gesture. */
+  let wantedTrack: MusicTrack | null = null
 
   function ensure(): AudioContext | null {
     if (ctx) return ctx
@@ -79,6 +91,9 @@ export function createAudio(): Audio {
     engineGain.connect(master)
     engineOsc.start()
     engineSub.start()
+
+    music = createMusic(ctx, master)
+    if (wantedTrack) music.play(wantedTrack)
 
     return ctx
   }
@@ -141,7 +156,16 @@ export function createAudio(): Audio {
 
     resume() {
       const c = ensure()
-      if (c && c.state === 'suspended') void c.resume()
+      if (!c) return
+      // The gesture that unlocks the context is also what releases any track
+      // whose autoplay was refused before it.
+      if (c.state === 'suspended') void c.resume().then(() => music?.flush())
+      else music?.flush()
+    },
+
+    setMusic(track) {
+      wantedTrack = track
+      music?.play(track)
     },
 
     toggleMute() {
@@ -182,6 +206,9 @@ export function createAudio(): Audio {
       noise(d, big ? 0.5 : 0.32, 'lowpass', big ? 2200 : 1500, 90)
       tone('sine', big ? 110 : 150, 26, d * 0.9, big ? 0.34 : 0.2)
       tone('sawtooth', big ? 300 : 420, 60, d * 0.4, 0.09)
+      // Only the big ones duck the music. Ducking on every kill in a busy
+      // fight would leave the track permanently pumping.
+      if (big) music?.duck()
     },
 
     warp() {
@@ -220,6 +247,8 @@ export function createAudio(): Audio {
     },
 
     dispose() {
+      music?.dispose()
+      music = null
       engineOsc?.stop()
       engineSub?.stop()
       void ctx?.close()

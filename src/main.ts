@@ -114,6 +114,7 @@ function boot() {
     hud.setLockPrompt(false)
     input.releasePointerLock()
     audio.setEngine(0)
+    audio.setMusic('hangar')
     hangar.open(pendingResult?.ship ?? lastShip() ?? 'hornet')
   }
 
@@ -123,6 +124,7 @@ function boot() {
     debrief.hide()
     rememberShip(id)
     screen = 'flight'
+    audio.setMusic('combat')
     game.start(id)
     input.requestPointerLock()
   }
@@ -148,6 +150,9 @@ function boot() {
     const isRecord = recordRun(result)
     screen = 'debrief'
     hud.setLockPrompt(false)
+    // These are full-length tracks rather than stings, so they loop like any
+    // other screen music. Nobody reads a debrief for a minute and a quarter.
+    audio.setMusic(result.won ? 'victory' : 'defeat')
     debrief.show(result, isRecord, Math.max(previous, result.score))
   }
 
