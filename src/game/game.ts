@@ -16,7 +16,14 @@ import type { Audio } from '../core/audio'
 import type { Input } from '../core/input'
 import type { RunResult } from '../core/scores'
 import { otherShips, SHIPS, type ShipId } from '../ships/specs'
-import { ARENA_RADIUS, type Environment } from '../world/environment'
+import {
+  ARENA_RADIUS,
+  PLAYER_SPAWN,
+  PLAYER_SPAWN_LOOK,
+  type Environment,
+  type Hazard,
+} from '../world/environment'
+import { MINE_DAMAGE } from '../world/mines'
 import { EnemyPilot } from './ai'
 import { createBolts, type Bolts } from './bolts'
 import { createChaseCamera, type ChaseCamera } from './chase'
@@ -44,6 +51,9 @@ const CRITICAL_HULL = 0.25
  * aim reference at normal engagement ranges.
  */
 const RETICLE_RANGE = 900
+
+/** Mine detonation colour — matches the hull, not the shooter's accent. */
+const MINE_FLASH = new THREE.Color(0xff3324)
 
 const _spawnDir = new THREE.Vector3()
 const _spawnPos = new THREE.Vector3()
@@ -152,6 +162,11 @@ export function createGame(deps: GameDeps): Game {
   const contactBuffer: HudContact[] = []
   /** Enemy-only view of the roster, reused each frame for AI separation. */
   const squadron: Ship[] = []
+  /**
+   * What the AI steers around: solid stations plus every live mine. Rebuilt only
+   * when a mine detonates, not per frame.
+   */
+  let avoidList: Hazard[] = []
   /** Every ship, rebuilt only when the roster changes. */
   let boltTargets: Ship[] = []
 
@@ -194,6 +209,9 @@ export function createGame(deps: GameDeps): Game {
           break
         }
       }
+      // Also clear of mines: a hostile that materialises inside one would eat
+      // 45 damage the instant its warp-in immunity expired.
+      if (clear && environment.minefield.findContact(out, 140)) clear = false
       if (clear) return out
     }
     return out
@@ -262,6 +280,43 @@ export function createGame(deps: GameDeps): Game {
     c.fire = s.fire
     c.dash = s.dash
     return c
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Mines                                                                    */
+  /* ------------------------------------------------------------------------ */
+
+  function rebuildAvoidList(): void {
+    avoidList = environment.hazards.concat(environment.minefield.avoidance)
+  }
+
+  /**
+   * Mines hurt whoever touches them, player and AI alike. Enemies steering into
+   * one is a legitimate way to lose a hostile — it still counts as a kill, since
+   * the pressure that forced the mistake was yours.
+   */
+  function resolveMines(): void {
+    const field = environment.minefield
+
+    for (const target of boltTargets) {
+      if (!target.alive || target.warpTimer > 0) continue
+      const mine = field.findContact(target.position, target.radius)
+      if (!mine) continue
+
+      field.detonate(mine)
+      rebuildAvoidList()
+
+      fx.explode(mine.position, MINE_FLASH, 1.6)
+      audio.explosion(true)
+
+      if (player) {
+        const distance = mine.position.distanceTo(player.position)
+        chase.shake(distance < 600 ? 2.6 : 0.4)
+      }
+      if (target === player) hud.callout('MINE', '#ff3b4e', 1.2)
+
+      target.takeDamage(MINE_DAMAGE, target === player ? 'enemy' : 'player')
+    }
   }
 
   /* ------------------------------------------------------------------------ */
@@ -418,7 +473,7 @@ export function createGame(deps: GameDeps): Game {
     squadron.length = 0
     for (const pilot of pilots) squadron.push(pilot.ship)
     for (const pilot of pilots) {
-      const controls = pilot.think(player, squadron, environment.hazards, dt)
+      const controls = pilot.think(player, squadron, avoidList, dt)
       pilot.ship.step(controls, dt, ctx)
     }
 
@@ -427,6 +482,10 @@ export function createGame(deps: GameDeps): Game {
       fx.spark(hit.point, hit.color, hit.target ? 16 : 8)
       if (hit.target) audio.hit()
     }
+
+    /* Mines. Checked after everyone has moved, so contact is resolved against
+       final positions rather than a stale frame. */
+    resolveMines()
 
     /* Presentation */
     player.syncVisual()
@@ -531,7 +590,7 @@ export function createGame(deps: GameDeps): Game {
 
       const spec = SHIPS[shipId]
       player = new Ship(spec, 'player')
-      player.spawn(new THREE.Vector3(0, 120, 1400), new THREE.Vector3(0, 0, -200))
+      player.spawn(PLAYER_SPAWN, PLAYER_SPAWN_LOOK)
       player.onDamaged = (_self, amount) => {
         hud.flashDamage()
         audio.hullHit()
@@ -562,6 +621,9 @@ export function createGame(deps: GameDeps): Game {
       ending = false
       best = deps.bestScoreFor(shipId)
       playerControls.throttle = 0.6
+
+      environment.minefield.reset()
+      rebuildAvoidList()
 
       hud.setShip(spec)
       hud.show()
