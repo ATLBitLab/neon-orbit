@@ -16,7 +16,7 @@ import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
-import { createGame } from '../src/game/game'
+import { createGame, DEATH_SEQUENCE } from '../src/game/game'
 import type { Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { mulberry32 } from '../src/core/rng'
@@ -32,7 +32,7 @@ import {
   type Environment,
   type Hazard,
 } from '../src/world/environment'
-import { buildMinefield, MINE_DAMAGE } from '../src/world/mines'
+import { buildMinefield, MINE_DAMAGE, type Mine, type Minefield } from '../src/world/mines'
 import {
   buildPickups,
   OVERDRIVE_DURATION,
@@ -734,6 +734,136 @@ function clampTo(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v
 }
 
+/**
+ * A minefield that is one mine the size of the arena: anything past its warp-in
+ * immunity is touching it, wherever it flies.
+ *
+ * A real field cannot be used here — placement deliberately keeps 620 units
+ * clear of the player spawn — and steering a scripted pilot onto a mine would
+ * make the test depend on the autopilot. This kills the player at a known
+ * moment (the frame warp-in immunity expires) and nothing else.
+ */
+function armedArena(): Minefield {
+  const mine: Mine = { position: new THREE.Vector3(), live: true }
+  return {
+    group: new THREE.Group(),
+    mines: [mine],
+    avoidance: [],
+    findContact: () => (mine.live ? mine : null),
+    detonate: (m) => {
+      m.live = false
+    },
+    reset: () => {
+      mine.live = true
+    },
+    update() {},
+    dispose() {},
+  }
+}
+
+/**
+ * The death animation, which is the whole reason `finish` is no longer called on
+ * the frame the player dies.
+ *
+ * What is being asserted is the *handoff*, not the particles: the run resolves
+ * immediately and privately, the wreck then holds the screen for the full
+ * sequence, and only then does the debrief get the result. The failure this
+ * guards against is the original behaviour — a fireball spawned and wiped by
+ * `clearArena` in the same frame, so the player saw one frame of it at most.
+ */
+function testDeathPlaysBeforeTheDebrief(): void {
+  section('A fatal hit plays out before the debrief')
+
+  const originalHull = SHIPS.wasp.maxHull
+  // A mine is 45 damage flat, so a 40-hull Wasp does not survive touching one.
+  SHIPS.wasp.maxHull = 40
+
+  const input = stubInput()
+  let result: RunResult | null = null
+
+  const game = createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: { ...stubEnvironment(), minefield: armedArena() },
+    input,
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: (r) => {
+      result = r
+    },
+  })
+
+  game.start('wasp')
+
+  let deathFrame = -1
+  let resultFrame = -1
+  let dyingFrames = 0
+  let pausedMidDeath = false
+
+  const budget = Math.ceil(20 / STEP)
+  let frames = 0
+  for (; frames < budget && resultFrame < 0; frames++) {
+    game.update(STEP)
+
+    if (deathFrame < 0 && (game.snapshot()?.playerHull ?? 1) <= 0) deathFrame = frames
+    if (game.dying) {
+      dyingFrames++
+      // Escape mid-explosion must not strand the player in a paused fireball
+      // with a debrief queued behind it.
+      game.pause()
+      if (game.paused) pausedMidDeath = true
+    }
+    if (result && resultFrame < 0) resultFrame = frames
+  }
+
+  SHIPS.wasp.maxHull = originalHull
+
+  const run = result as RunResult | null
+  const hold = (resultFrame - deathFrame) * STEP
+
+  check('the player died', deathFrame > 0, `hull never reached zero in ${(frames * STEP).toFixed(1)}s`)
+  check('the run resolved', run !== null, `no result after ${(frames * STEP).toFixed(1)}s`)
+  check('a fatal hit is recorded as a loss', run?.won === false, `won=${run?.won}`)
+  check(
+    'the debrief does not land on the frame of death',
+    resultFrame > deathFrame,
+    `death=${deathFrame}, result=${resultFrame}`,
+  )
+  check(
+    'the wreck holds the screen for the whole sequence',
+    hold >= DEATH_SEQUENCE - STEP && hold <= DEATH_SEQUENCE + 2 * STEP,
+    `held ${hold.toFixed(2)}s, expected ${DEATH_SEQUENCE}s`,
+  )
+  check(
+    'the sequence is long enough to read and short enough to sit through',
+    DEATH_SEQUENCE >= 1.5 && DEATH_SEQUENCE <= 4,
+    `${DEATH_SEQUENCE}s`,
+  )
+  check(
+    'the game reports itself dying for the duration',
+    dyingFrames === resultFrame - deathFrame,
+    `${dyingFrames} frames dying, ${resultFrame - deathFrame} frames between death and debrief`,
+  )
+  check('the death animation cannot be paused', !pausedMidDeath)
+  // The clock stops when the player does. Counting the animation as flight time
+  // would inflate every recorded loss by the length of its own explosion.
+  check(
+    'the recorded time is time flown, not time spent exploding',
+    (run?.time ?? 0) <= (deathFrame + 2) * STEP,
+    `recorded ${run?.time.toFixed(2)}s, died at ${(deathFrame * STEP).toFixed(2)}s`,
+  )
+  check('the player spec was restored', SHIPS.wasp.maxHull === originalHull)
+
+  if (run) {
+    console.log(
+      `       died at ${(deathFrame * STEP).toFixed(2)}s · wreck held ${hold.toFixed(2)}s · debrief at ${(resultFrame * STEP).toFixed(2)}s`,
+    )
+  }
+
+  game.dispose()
+}
+
 function testMines(): void {
   section('Mines detonate on contact and stay detonated')
 
@@ -1169,6 +1299,7 @@ testBoltPoolDoesNotLeak()
 testMines()
 testPickups()
 testARunCanBeWon()
+testDeathPlaysBeforeTheDebrief()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

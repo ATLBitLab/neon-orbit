@@ -69,6 +69,51 @@ const PICKUP_FLASH = Object.fromEntries(
   PICKUP_KINDS.map((k) => [k, new THREE.Color(PICKUP_COLOR[k])]),
 ) as Record<PickupKind, THREE.Color>
 
+/* -------------------------------------------------------------------------- */
+/* Death animation                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How long the wreck stays on screen before the debrief takes over.
+ *
+ * The whole point of the split below is that a hull which vanishes the instant
+ * it dies reads as a dropped frame rather than a kill. So the ship survives its
+ * own death for `WRECK_TUMBLE` seconds — dead, unsteerable, tumbling and
+ * venting — and only then goes up. Watching a recognisable silhouette come
+ * apart is the thing; the fireball on its own is just a particle burst.
+ *
+ * Exported so `simcheck` asserts the real timing rather than a copy of it.
+ */
+export const DEATH_SEQUENCE = 2.4
+/** Seconds the hull stays intact after taking the fatal hit. */
+const WRECK_TUMBLE = 0.55
+/** How fast the wreck sheds speed, per second. */
+const WRECK_DRAG = 0.7
+/** Body-frame tumble of the wreck, radians per second. */
+const WRECK_PITCH = 2.4
+const WRECK_YAW = 1.1
+const WRECK_ROLL = 3.6
+/** What the hull emissive cooks toward while the wreck burns. */
+const WRECK_HOT = new THREE.Color(0xfff0d0)
+/** Sparks shed by the tumbling wreck, per second. */
+const WRECK_SPARK_RATE = 26
+
+/**
+ * The detonation timeline, in seconds since the fatal hit.
+ *
+ * `spread` jitters the blast off the wreck's centre, because bursts stacked on
+ * one point read as a single brighter burst rather than a hull coming apart.
+ * The big one at `WRECK_TUMBLE` is the moment the ship itself goes; the two
+ * after it are cook-offs in the debris.
+ */
+const DEATH_BLASTS: { at: number; scale: number; spread: number; shake: number; big: boolean }[] = [
+  { at: 0, scale: 0.55, spread: 10, shake: 1, big: false },
+  { at: 0.26, scale: 0.7, spread: 14, shake: 1.1, big: false },
+  { at: WRECK_TUMBLE, scale: 2.3, spread: 0, shake: 3.2, big: true },
+  { at: 0.95, scale: 0.9, spread: 42, shake: 0.8, big: false },
+  { at: 1.4, scale: 0.7, spread: 58, shake: 0.5, big: false },
+]
+
 const _spawnDir = new THREE.Vector3()
 const _spawnPos = new THREE.Vector3()
 const _forward = new THREE.Vector3()
@@ -77,12 +122,21 @@ const _reticle = new THREE.Vector3()
 const _inverseQuat = new THREE.Quaternion()
 const _lead = new THREE.Vector3()
 const _leadNdc = new THREE.Vector3()
+const _blast = new THREE.Vector3()
+const _spin = new THREE.Euler(0, 0, 0, 'YXZ')
+const _spinQuat = new THREE.Quaternion()
 
 export type RunEnd = (result: RunResult) => void
 
 export interface Game {
   readonly active: boolean
   readonly paused: boolean
+  /**
+   * True while the death animation is playing — the run has resolved, but the
+   * wreck is still on screen and the debrief has not come up. Nothing may pause
+   * or interrupt the game here, or the explosion freezes mid-blast.
+   */
+  readonly dying: boolean
   start(shipId: ShipId): void
   update(dt: number): void
   pause(): void
@@ -187,8 +241,16 @@ export function createGame(deps: GameDeps): Game {
   let shieldWarned = false
   /** The hostile the player is holding. Damage only becomes kills with a lock. */
   let lockedTarget: Ship | null = null
-  /** Set on the frame the run resolves, so the loop stops before reporting. */
-  let ending = false
+
+  /* Death animation state. See `DEATH_SEQUENCE`. */
+  let dying = false
+  let deathTimer = 0
+  /** Index of the next entry in `DEATH_BLASTS` still to fire. */
+  let nextBlast = 0
+  /** The scoreline, sealed the moment the player died. */
+  let pendingResult: RunResult | null = null
+  /** Hull emissive at the moment of death, cooked toward `WRECK_HOT` from there. */
+  const wreckEmissive = new THREE.Color()
 
   const playerControls: Controls = {
     pitch: 0,
@@ -499,12 +561,14 @@ export function createGame(deps: GameDeps): Game {
     contactBuffer.length = 0
   }
 
-  function finish(won: boolean): void {
-    if (!active) return
-    active = false
-    ending = false
-
-    const shipId = player?.spec.id ?? 'hornet'
+  /**
+   * The scoreline at the instant the run resolves.
+   *
+   * Sealed here rather than read at `finish`, because a loss keeps the arena
+   * running for `DEATH_SEQUENCE` seconds afterwards — long enough for a hostile
+   * to fly into the star and post a bounty to a pilot who is already dead.
+   */
+  function sealResult(won: boolean): RunResult {
     const shotsFired = player?.shotsFired ?? 0
 
     if (won) {
@@ -512,26 +576,177 @@ export function createGame(deps: GameDeps): Game {
       const hullBonus = Math.round((player?.hullFraction ?? 0) * 1200)
       const timeBonus = Math.max(0, Math.round(4000 - elapsed * 25))
       score += hullBonus + timeBonus
-      hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
-    } else {
-      hud.callout('HULL BREACH', '#ff3b4e', 3)
     }
 
-    audio.fanfare(won)
-    input.releasePointerLock()
-    hud.hide()
-
-    const result: RunResult = {
-      ship: shipId,
+    return {
+      ship: player?.spec.id ?? 'hornet',
       score,
       kills,
       time: elapsed,
       won,
       accuracy: shotsFired > 0 ? Math.min(1, playerHits / shotsFired) : 0,
     }
+  }
+
+  function finish(result: RunResult): void {
+    if (!active) return
+    active = false
+    dying = false
+    pendingResult = null
+
+    audio.fanfare(result.won)
+    input.releasePointerLock()
+    hud.hide()
 
     clearArena()
     deps.onEnd(result)
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Death animation                                                          */
+  /* ------------------------------------------------------------------------ */
+
+  /** Contact markers for whatever is still airborne. */
+  function refreshContacts(): void {
+    contactBuffer.length = 0
+    for (const pilot of pilots) {
+      const enemy = pilot.ship
+      if (!enemy.alive) continue
+      contactBuffer.push({
+        position: enemy.position,
+        hullFraction: enemy.hullFraction,
+        accent: enemy.spec.accent,
+      })
+    }
+  }
+
+  /**
+   * Take the run out of the player's hands and hand it to the wreck.
+   *
+   * The result is banked immediately; everything after this is presentation.
+   */
+  function beginDeathSequence(): void {
+    if (!player || dying) return
+
+    dying = true
+    deathTimer = 0
+    nextBlast = 0
+    pendingResult = sealResult(false)
+
+    hud.callout('HULL BREACH', '#ff3b4e', 3)
+
+    // Freeze the instruments on the moment of death: a lock pip or a live target
+    // readout floating over your own wreck is a lie. The reticle keeps its last
+    // projection rather than snapping to centre.
+    hud.update({
+      hullFraction: 0,
+      quirkValue: player.quirkValue,
+      quirkAlarming: false,
+      score,
+      multiplier,
+      best,
+      enemiesTotal: PER_ENEMY_TYPE * 2,
+      enemiesRemaining: queue.length + pilots.length,
+      speed: player.velocity.length(),
+      throttle: 0,
+      locked: false,
+      critical: true,
+      reticleNdcX: _reticle.x,
+      reticleNdcY: _reticle.y,
+      boundaryOvershoot: 0,
+      solarExposure: 0,
+      overdrive: null,
+      shield: null,
+      target: null,
+    })
+
+    // `syncVisual` hid the hull the frame it died. Put it back — it has a
+    // tumble to perform first — and cut the engines.
+    player.visual.group.visible = true
+    player.visual.thrusterMat.opacity = 0
+    wreckEmissive.copy(player.visual.hullMat.emissive)
+  }
+
+  /**
+   * One frame of the death animation.
+   *
+   * The squadron keeps flying and the bolts keep travelling: freezing the arena
+   * the instant the player dies reads as the game crashing rather than as a
+   * kill. None of it can touch the player — `takeDamage` and `step` both bail on
+   * a dead hull, and bolts skip anything untargetable — so this is safe to run
+   * with a corpse in the roster.
+   */
+  function stepDeathSequence(dt: number): void {
+    if (!player) return
+    deathTimer += dt
+
+    /* The wreck */
+    const g = player.visual.group
+    if (deathTimer < WRECK_TUMBLE) {
+      // Coast on the last velocity, so the camera has something to trail rather
+      // than a hull that stopped dead in space. Airspeed bleeds with it, which
+      // is what walks the camera's speed FOV back down as the wreck slows.
+      const drag = Math.exp(-WRECK_DRAG * dt)
+      player.velocity.multiplyScalar(drag)
+      player.speed *= drag
+      player.position.addScaledVector(player.velocity, dt)
+
+      // Tumble the *visual* only. The chase camera sits in the ship's own frame,
+      // so spinning `player.quaternion` would spin the shot instead of the hull
+      // and make the last two seconds of the run unwatchable.
+      _spin.set(WRECK_PITCH * dt, WRECK_YAW * dt, WRECK_ROLL * dt)
+      _spinQuat.setFromEuler(_spin)
+      g.quaternion.multiply(_spinQuat).normalize()
+      g.position.copy(player.position)
+
+      player.visual.hullMat.emissive
+        .copy(wreckEmissive)
+        .lerp(WRECK_HOT, deathTimer / WRECK_TUMBLE)
+
+      if (Math.random() < WRECK_SPARK_RATE * dt) fx.spark(g.position, player.accent, 6)
+    } else if (g.visible) {
+      // The ship itself is gone. Debris and cook-offs carry the rest.
+      g.visible = false
+    }
+
+    /* Detonations */
+    while (nextBlast < DEATH_BLASTS.length && deathTimer >= DEATH_BLASTS[nextBlast].at) {
+      const blast = DEATH_BLASTS[nextBlast++]
+      _blast.copy(player.position)
+      if (blast.spread > 0) {
+        _blast.x += (Math.random() * 2 - 1) * blast.spread
+        _blast.y += (Math.random() * 2 - 1) * blast.spread
+        _blast.z += (Math.random() * 2 - 1) * blast.spread
+      }
+      fx.explode(_blast, player.accent, blast.scale)
+      audio.explosion(blast.big)
+      chase.shake(blast.shake)
+    }
+
+    /* The fight carries on around it */
+    squadron.length = 0
+    for (const pilot of pilots) squadron.push(pilot.ship)
+    for (const pilot of pilots) {
+      const controls = pilot.think(player, squadron, avoidList, dt)
+      pilot.ship.step(controls, dt, ctx)
+    }
+    for (const hit of bolts.update(dt, boltTargets, environment.hazards)) {
+      fx.spark(hit.point, hit.color, hit.target ? 16 : 8)
+    }
+
+    /* Presentation */
+    for (const pilot of pilots) pilot.ship.syncVisual()
+    fx.update(dt, camera)
+    chase.update(player, dt)
+    refreshContacts()
+    hud.updateContacts(contactBuffer, camera)
+    hud.tick(dt)
+
+    retireDead()
+
+    // Falls back rather than waiting for a result that will never arrive: this
+    // is the only exit from the sequence, so it must not be able to not happen.
+    if (deathTimer >= DEATH_SEQUENCE) finish(pendingResult ?? sealResult(false))
   }
 
   /* ------------------------------------------------------------------------ */
@@ -540,6 +755,11 @@ export function createGame(deps: GameDeps): Game {
 
   function update(dt: number): void {
     environment.update(dt, camera)
+
+    if (dying) {
+      stepDeathSequence(dt)
+      return
+    }
 
     if (!active || paused || !player) {
       fx.update(dt, camera)
@@ -586,16 +806,7 @@ export function createGame(deps: GameDeps): Game {
     chase.update(player, dt)
 
     /* HUD */
-    contactBuffer.length = 0
-    for (const pilot of pilots) {
-      const enemy = pilot.ship
-      if (!enemy.alive) continue
-      contactBuffer.push({
-        position: enemy.position,
-        hullFraction: enemy.hullFraction,
-        accent: enemy.spec.accent,
-      })
-    }
+    refreshContacts()
 
     acquireTarget()
 
@@ -701,18 +912,13 @@ export function createGame(deps: GameDeps): Game {
 
     retireDead()
 
-    /* Resolution */
-    if (!ending) {
-      if (!player.alive) {
-        ending = true
-        fx.explode(player.position, player.accent, 2)
-        audio.explosion(true)
-        chase.shake(3)
-        finish(false)
-      } else if (queue.length === 0 && pilots.length === 0) {
-        ending = true
-        finish(true)
-      }
+    /* Resolution. A loss hands off to the death animation and reports when it
+       is done; a win reports immediately. */
+    if (!player.alive) {
+      beginDeathSequence()
+    } else if (queue.length === 0 && pilots.length === 0) {
+      hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
+      finish(sealResult(true))
     }
   }
 
@@ -722,6 +928,9 @@ export function createGame(deps: GameDeps): Game {
     },
     get paused() {
       return paused
+    },
+    get dying() {
+      return dying
     },
 
     start(shipId) {
@@ -768,7 +977,10 @@ export function createGame(deps: GameDeps): Game {
       overdriveWarned = false
       shieldWarned = false
       lockedTarget = null
-      ending = false
+      dying = false
+      deathTimer = 0
+      nextBlast = 0
+      pendingResult = null
       best = deps.bestScoreFor(shipId)
       playerControls.throttle = 0.6
 
@@ -788,7 +1000,9 @@ export function createGame(deps: GameDeps): Game {
     update,
 
     pause() {
-      if (!active) return
+      // Never mid-death: the run has already resolved, and freezing here strands
+      // the player in a paused explosion with a debrief queued behind it.
+      if (!active || dying) return
       paused = true
       input.reset()
       input.releasePointerLock()
@@ -865,7 +1079,8 @@ export function createGame(deps: GameDeps): Game {
     abandon() {
       active = false
       paused = false
-      ending = false
+      dying = false
+      pendingResult = null
       input.releasePointerLock()
       hud.hide()
       clearArena()

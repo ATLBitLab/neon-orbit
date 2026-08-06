@@ -152,6 +152,16 @@ velocity is zero — which means any additive counter-force has a depth where th
 the ship hangs motionless against the wall. Raising the force only relocates the stall. See the
 comment in `Ship.integrate`.
 
+**A loss resolves before it finishes.** Taking the fatal hit does not report the run — it seals
+the scoreline and hands the next `DEATH_SEQUENCE` seconds to the wreck, which coasts and tumbles
+for a beat before it goes up, then cooks off in the debris while the squadron flies on around it.
+The debrief comes up after. Two consequences worth knowing: the result is banked at the moment of
+death, so a hostile burning up in the star during the animation cannot post a bounty to a pilot
+who is already dead; and the game refuses to pause while `game.dying`, because a paused explosion
+with a debrief queued behind it is a dead end. The tumble is applied to the ship's *visual* only —
+the chase camera sits in the ship's own frame, so spinning the hull's transform would spin the
+shot instead. All of it is in `beginDeathSequence` / `stepDeathSequence` in `src/game/game.ts`.
+
 ## Checks
 
 ```bash
@@ -168,8 +178,9 @@ silently freezes the loop and makes every behavioural observation meaningless. I
 combat contract (hits land, kills register, friendly fire is off), the hull quirks, the
 boundary, the power-up pods (placement, collection, respawn, that a boosted bolt still does
 exactly its spec damage, that a Shield refuses damage without crediting the shooter, and that
-both timed buffs stack, expire and do not survive a respawn) and that clearing the roster reports
-a win.
+both timed buffs stack, expire and do not survive a respawn), that clearing the roster reports
+a win, and that a fatal hit plays its death animation out in full before the debrief takes the
+screen.
 
 `scripts/balance.ts` is the same idea pointed at fairness instead of correctness. It flies pinned
 duels — every airframe against every other, every bolt on target — and prints alpha strike,
