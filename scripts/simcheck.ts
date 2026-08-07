@@ -17,7 +17,7 @@ import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
 import { createGame, DEATH_SEQUENCE } from '../src/game/game'
-import type { Hud } from '../src/game/hud'
+import { DAMAGE_BAR_FADE, type Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { mulberry32 } from '../src/core/rng'
 import { SHIPS } from '../src/ships/specs'
@@ -168,6 +168,118 @@ function testPlayerBoltsKillEnemies(): void {
     `kill time is in the expected band (~${expected.toFixed(2)}s)`,
     deathFrame * STEP < expected + 0.5,
     `took ${(deathFrame * STEP).toFixed(2)}s`,
+  )
+
+  bolts.dispose()
+  player.dispose()
+  enemy.dispose()
+}
+
+/**
+ * The clock behind the hostile hull bars.
+ *
+ * The bars themselves are DOM and cannot be asserted here, so what is checked
+ * is the thing that decides when one is on screen and how bright: `sinceHit`.
+ * The fade *curve* is presentation and lives in the HUD; its *window* is what
+ * the simulation has to keep honest, and every clause of the intended
+ * behaviour — appears on a hit, fades out over the window, back to full on
+ * every fresh hit — is a claim about this one number.
+ */
+function testDamageClockDrivesEnemyBars(): void {
+  section('Hostile hull bars light on damage and fade on a real clock')
+
+  const bolts = createBolts()
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+
+  const player = new Ship(SHIPS.hornet, 'player')
+  player.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+
+  // A Hornet on the receiving end: six volleys of hull, so it survives every
+  // hit this check lands, and a dash quirk rather than the Drone's repair, so
+  // nothing quietly refills the hull between assertions.
+  const enemy = new Ship(SHIPS.hornet, 'enemy')
+  enemy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -2000))
+
+  settle([player, enemy], ctx)
+
+  const hold = new THREE.Vector3(0, 0, -400)
+
+  /**
+   * Pin both hulls and hold the trigger for up to `seconds`, stopping on the
+   * frame the enemy loses hull. Returns whether a hit landed — so it is both
+   * "shoot until something connects" and "shoot and confirm nothing did".
+   */
+  function fireUntilHit(seconds: number): boolean {
+    const frames = Math.ceil(seconds / STEP)
+    for (let i = 0; i < frames; i++) {
+      player.position.set(0, 0, 0)
+      player.velocity.set(0, 0, 0)
+      enemy.position.copy(hold)
+      enemy.velocity.set(0, 0, 0)
+
+      const before = enemy.hull
+      player.step(controls({ fire: true }), STEP, ctx)
+      enemy.step(controls(), STEP, ctx)
+      bolts.update(STEP, [player, enemy], [])
+      if (enemy.hull < before) return true
+    }
+    return false
+  }
+
+  function coast(seconds: number): void {
+    const frames = Math.ceil(seconds / STEP)
+    for (let i = 0; i < frames; i++) enemy.step(controls(), STEP, ctx)
+  }
+
+  check(
+    'an untouched hostile carries no bar',
+    enemy.sinceHit > DAMAGE_BAR_FADE,
+    `sinceHit=${enemy.sinceHit.toFixed(2)}s`,
+  )
+
+  check('the first burst connects', fireUntilHit(10), `hull=${enemy.hull}/${SHIPS.hornet.maxHull}`)
+  check('a hit lights the bar at full brightness', enemy.sinceHit === 0, `sinceHit=${enemy.sinceHit}`)
+
+  coast(DAMAGE_BAR_FADE / 2)
+  check(
+    'the bar is still up halfway through the fade',
+    enemy.sinceHit < DAMAGE_BAR_FADE,
+    `sinceHit=${enemy.sinceHit.toFixed(2)}s of ${DAMAGE_BAR_FADE}s`,
+  )
+
+  coast(DAMAGE_BAR_FADE / 2 + 0.05)
+  check(
+    'the bar is gone once the window closes',
+    enemy.sinceHit >= DAMAGE_BAR_FADE,
+    `sinceHit=${enemy.sinceHit.toFixed(2)}s of ${DAMAGE_BAR_FADE}s`,
+  )
+
+  /* A hit that never reached the hull must not light a bar. `takeDamage`
+     already refuses to touch the clock behind a shield for the Drone's sake;
+     this is the same refusal seen from the HUD's side. */
+  const shieldedFrom = enemy.hull
+  enemy.shieldTimer = 3
+  const shieldedHit = fireUntilHit(1.5)
+  enemy.shieldTimer = 0
+  check('a shielded hostile takes no hull damage', !shieldedHit && enemy.hull === shieldedFrom)
+  check(
+    'a refused hit does not light a bar',
+    enemy.sinceHit >= DAMAGE_BAR_FADE,
+    `sinceHit=${enemy.sinceHit.toFixed(2)}s`,
+  )
+
+  check('a second burst connects', fireUntilHit(10), `hull=${enemy.hull}/${SHIPS.hornet.maxHull}`)
+  check('every fresh hit returns the bar to full brightness', enemy.sinceHit === 0, `sinceHit=${enemy.sinceHit}`)
+
+  /* The Drone rebuilds its own hull once its repair clock runs out, and that
+     clock is this clock. If the window ever grew past the delay, a Drone's bar
+     would sit on screen draining while the hull behind it was already filling
+     back up — the one state where the bar would be actively lying. */
+  const repair = SHIPS.drone.quirk
+  check(
+    'the bar fades before nanite repair can start refilling behind it',
+    repair.kind === 'regen' && repair.delay > DAMAGE_BAR_FADE,
+    `repair at ${repair.kind === 'regen' ? `${repair.delay}s` : 'n/a'}, bar gone at ${DAMAGE_BAR_FADE}s`,
   )
 
   bolts.dispose()
@@ -1291,6 +1403,7 @@ function testPickups(): void {
 
 console.log('NEON ORBIT — headless simulation checks')
 testPlayerBoltsKillEnemies()
+testDamageClockDrivesEnemyBars()
 testFriendlyFireIsOff()
 testBoundaryTurnsShipsAround()
 testQuirks()

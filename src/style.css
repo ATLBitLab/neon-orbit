@@ -764,6 +764,39 @@ body {
   color: rgba(255, 45, 149, 0.85);
 }
 
+/* Hull bar under an on-screen contact bracket.
+   Sized against the 26px bracket it hangs off, not against the corner gauges:
+   six of these are on screen at once during a brawl, and at the corner gauge's
+   9px they stop being a marker and start being a second HUD. It rides inside
+   the contact slot, so the slot's distance scale applies and the bar shrinks
+   with the hull it belongs to.
+   `.gauge i`'s width smoothing is dropped on purpose. The width here is
+   rewritten from live state every frame, so there is nothing for it to smooth
+   — and because slots are handed to whichever hostiles are alive this frame, a
+   slot inheriting a different ship would otherwise animate a 0.14s slide
+   between two unrelated hulls. */
+.gauge.contact-hull {
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 34px;
+  height: 5px;
+  margin: 5px 0 0 -17px;
+  /* The corner gauges get their contrast from the panel they sit in. This one
+     floats over the arena, and the arena is not reliably dark: the planet's
+     highlands run to near-white and its lowlands are the same green as a
+     healthy hull. So the bar brings its own backing and its own dark outline,
+     and the empty track is opaque enough to show where the bar ends — at the
+     corner gauges' 7% white it vanishes the moment a hostile crosses daylight. */
+  background: rgba(3, 6, 15, 0.62);
+  border-color: rgba(0, 0, 0, 0.45);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.gauge.contact-hull i {
+  transition: none;
+}
+
 /* Damage flash + low-hull vignette */
 #flash {
   position: absolute;
