@@ -250,10 +250,33 @@ function testHullBarFadeCurve(): void {
   // hostile nobody has shot at yet draws.
   check('a hostile nobody has hit draws nothing', barBrightness(99) === 0)
 
+  /* Both phases have to last long enough to be the thing they are named after,
+   * and that is a claim about seconds, not about the fraction.
+   *
+   * The check these replace asserted `0 < HOLD < 1` under the name "the hold
+   * leaves real fading time behind it" — which is a guarantee its condition
+   * never made. At HOLD 0.99 the bar sits at full for 4.95s and then vanishes
+   * in 0.05s: not a fade, and a fade is what was asked for. All green. Assert
+   * the durations and the bound falls out for free, since a HOLD outside 0..1
+   * or a negative FADE drives one of these below zero.
+   *
+   * The floors are "enough frames to read as a ramp rather than a blink" at
+   * 60fps — 60 frames of fade, 30 of hold. They are deliberately far below the
+   * shipped 3.25s and 1.75s: this is a guard against a nonsense tuning value,
+   * not a second opinion on the tuning. */
+  const MIN_FADE_SECONDS = 1
+  const MIN_HOLD_SECONDS = 0.5
+  const fadeSeconds = (1 - DAMAGE_BAR_HOLD) * DAMAGE_BAR_FADE
+  const holdSeconds = DAMAGE_BAR_HOLD * DAMAGE_BAR_FADE
   check(
-    'the hold leaves real fading time behind it',
-    DAMAGE_BAR_HOLD > 0 && DAMAGE_BAR_HOLD < 1 && DAMAGE_BAR_FADE > 0,
-    `hold ${DAMAGE_BAR_HOLD} of ${DAMAGE_BAR_FADE}s`,
+    `the fade lasts long enough to read as a fade (>= ${MIN_FADE_SECONDS}s)`,
+    fadeSeconds >= MIN_FADE_SECONDS,
+    `${fadeSeconds.toFixed(2)}s of fading in a ${DAMAGE_BAR_FADE}s window`,
+  )
+  check(
+    `the hold lasts long enough to read as a flash (>= ${MIN_HOLD_SECONDS}s)`,
+    holdSeconds >= MIN_HOLD_SECONDS,
+    `${holdSeconds.toFixed(2)}s at full in a ${DAMAGE_BAR_FADE}s window`,
   )
 }
 
