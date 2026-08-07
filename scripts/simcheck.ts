@@ -192,10 +192,31 @@ function testHullBarFadeCurve(): void {
   const hold = DAMAGE_BAR_FADE * DAMAGE_BAR_HOLD
 
   check('a fresh hit draws at full brightness', barBrightness(0) === 1, `${barBrightness(0)}`)
+
+  /* The hold, pinned from both ends.
+   *
+   * Load-bearing, and worth knowing why before tidying it: these two are the
+   * only things in the repo that know `DAMAGE_BAR_HOLD` does anything at all.
+   * Delete the hold and ship a plain linear fade and it is caught here or
+   * nowhere — review found exactly that mutant, and at the time a single
+   * endpoint probe was all that stood against it. So the plateau is sampled
+   * across its whole length rather than poked at its end, and a second check
+   * confirms it actually ends. An endpoint-only probe is one edit away from
+   * looking redundant to someone who does not know what it is for. */
+  const plateau: string[] = []
+  let flat = true
+  for (let i = 0; i <= 10; i++) {
+    const b = barBrightness((hold * i) / 10)
+    plateau.push(b.toFixed(2))
+    if (b !== 1) flat = false
+  }
+  check(`full brightness holds flat for the first ${hold.toFixed(2)}s`, flat, plateau.join(' '))
+
+  const justAfter = hold + (DAMAGE_BAR_FADE - hold) / 20
   check(
-    'it is still at full brightness at the end of the hold',
-    barBrightness(hold) === 1,
-    `${hold.toFixed(2)}s → ${barBrightness(hold)}`,
+    'and the hold ends — the bar is already dimming just past it',
+    barBrightness(justAfter) < 1,
+    `${justAfter.toFixed(2)}s → ${barBrightness(justAfter).toFixed(3)}`,
   )
 
   /* Strictly falling from the end of the hold to the end of the window. A curve
