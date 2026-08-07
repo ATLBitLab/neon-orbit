@@ -13,6 +13,7 @@
  */
 
 import * as THREE from 'three'
+import { unseededRng, type Rng } from '../core/rng'
 import { ARENA_RADIUS, SEAR_OUTER, SUN_POSITION, type Hazard } from '../world/environment'
 import type { ShipId } from '../ships/specs'
 import type { Controls } from './ship'
@@ -97,9 +98,9 @@ const _forward = new THREE.Vector3()
 const _inverse = new THREE.Quaternion()
 const _push = new THREE.Vector3()
 
-function randomUnit(out: THREE.Vector3): THREE.Vector3 {
-  const u = Math.random() * 2 - 1
-  const theta = Math.random() * Math.PI * 2
+function randomUnit(rng: Rng, out: THREE.Vector3): THREE.Vector3 {
+  const u = rng.range(-1, 1)
+  const theta = rng.range(0, Math.PI * 2)
   const r = Math.sqrt(Math.max(0, 1 - u * u))
   return out.set(r * Math.cos(theta), u, r * Math.sin(theta))
 }
@@ -137,18 +138,27 @@ export class EnemyPilot {
     spread: 0,
   }
 
-  constructor(ship: Ship) {
+  /**
+   * This pilot's own stream. Per-pilot rather than shared so that a squadron
+   * still flies the same way when one of its members is added, removed or
+   * killed at a different moment — with one shared stream, losing a wingman
+   * would re-roll every surviving pilot's wander for the rest of the run.
+   */
+  private readonly rng: Rng
+
+  constructor(ship: Ship, rng: Rng = unseededRng()) {
     this.ship = ship
+    this.rng = rng
     this.profile = PROFILES[ship.spec.id]
-    randomUnit(this.flank)
+    randomUnit(this.rng, this.flank)
     this.controls.spread = this.profile.spread
     this.resetJink()
   }
 
   private resetJink(): void {
     const [lo, hi] = this.profile.jinkInterval
-    this.jinkTimer = lo + Math.random() * (hi - lo)
-    randomUnit(this.jinkOffset).multiplyScalar(this.profile.jink)
+    this.jinkTimer = this.rng.range(lo, hi)
+    randomUnit(this.rng, this.jinkOffset).multiplyScalar(this.profile.jink)
   }
 
   private enter(state: AiState, duration: number): void {
@@ -185,7 +195,7 @@ export class EnemyPilot {
     ) {
       this.enter('evade', 1.9)
       this.evadeCooldown = 6.5
-      randomUnit(this.flank)
+      randomUnit(this.rng, this.flank)
     }
 
     switch (this.state) {
@@ -194,9 +204,9 @@ export class EnemyPilot {
         break
       case 'attack':
         if (dist < p.breakDistance) {
-          this.enter('break', 1.1 + Math.random() * 1.1)
-          this.wantsDash = Math.random() < p.dashChance
-          randomUnit(this.flank)
+          this.enter('break', this.rng.range(1.1, 2.2))
+          this.wantsDash = this.rng() < p.dashChance
+          randomUnit(this.rng, this.flank)
         } else if (dist > p.engageRange * 1.6) {
           this.enter('approach', 0)
         }

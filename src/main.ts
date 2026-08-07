@@ -13,7 +13,7 @@ import { createAudio } from './core/audio'
 import { createInput } from './core/input'
 import { bestFor, lastShip, recordRun, rememberShip, type RunResult } from './core/scores'
 import { createStage } from './core/stage'
-import { createGame } from './game/game'
+import { createGame, STEP } from './game/game'
 import { createHud } from './game/hud'
 import type { ShipId } from './ships/specs'
 import { createHangar } from './ui/hangar'
@@ -22,9 +22,17 @@ import { buildEnvironment } from './world/environment'
 
 type Screen = 'hangar' | 'flight' | 'paused' | 'debrief'
 
-/** Longest frame the simulation will accept, so a tab-switch cannot teleport
- *  ships through each other. */
-const MAX_STEP = 1 / 20
+/**
+ * Longest frame the simulation will accept, so a tab-switch cannot teleport
+ * ships through each other.
+ *
+ * With a fixed step this also bounds catch-up work: at most `MAX_FRAME / STEP`
+ * ticks run for any one frame. Without the clamp, a frame that arrives late
+ * enough queues more simulation than the next frame has time to run, which
+ * makes the next frame later still — the loop never catches up and the game
+ * grinds to a halt instead of simply dropping the lost time.
+ */
+const MAX_FRAME = 1 / 5
 
 function boot() {
   const canvas = document.getElementById('scene') as HTMLCanvasElement | null
@@ -215,16 +223,29 @@ function boot() {
 
   const clock = new THREE.Clock()
   let splashCleared = false
+  /** Simulation time owed to the fixed step, carried between frames. */
+  let accumulator = 0
 
   function frame() {
-    const dt = Math.min(clock.getDelta(), MAX_STEP)
+    const frameDt = Math.min(clock.getDelta(), MAX_FRAME)
 
     if (screen === 'hangar') {
-      environment.update(dt, stage.camera)
-      hangar.update(dt)
+      // The hangar has no simulation to keep honest — it is a turntable and a
+      // set of cards — so it runs straight off the frame.
+      environment.update(frameDt, stage.camera)
+      hangar.update(frameDt)
     } else {
-      input.update(dt)
-      game.update(dt)
+      accumulator += frameDt
+      while (accumulator >= STEP) {
+        // Sampled per tick, not per frame: the virtual stick self-centres over
+        // time, so decaying it once per frame would make it recentre faster on
+        // a faster display.
+        input.update(STEP)
+        game.step()
+        accumulator -= STEP
+      }
+      // Whatever is left over is how far past the last tick this frame sits.
+      game.render(accumulator / STEP, frameDt)
     }
 
     stage.render()

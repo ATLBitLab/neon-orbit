@@ -14,6 +14,7 @@
 
 import * as THREE from 'three'
 import type { Audio } from '../core/audio'
+import { unseededRng, type Rng } from '../core/rng'
 import { buildShip, disposeShipVisual, type ShipVisual } from '../ships/meshes'
 import type { ShipSpec } from '../ships/specs'
 import {
@@ -87,6 +88,20 @@ export class Ship implements BoltTarget {
   readonly quaternion = new THREE.Quaternion()
   readonly velocity = new THREE.Vector3()
 
+  /**
+   * The transform as it was at the start of the current simulation step.
+   *
+   * The sim advances in fixed 1/60 ticks while the display refreshes at
+   * whatever rate it likes, so a render almost never lands on a tick boundary.
+   * `syncVisual` blends these toward the live transform to place the hull where
+   * it was *between* the two ticks either side of the frame. Without it a
+   * 144 Hz display would show the same pose two frames running and a 30 Hz one
+   * would skip a pose entirely — both read as judder on a ship crossing the
+   * screen at several hundred units a second.
+   */
+  readonly prevPosition = new THREE.Vector3()
+  readonly prevQuaternion = new THREE.Quaternion()
+
   hull: number
   /** Current airspeed along the nose. */
   speed = 0
@@ -146,9 +161,17 @@ export class Ship implements BoltTarget {
   private readonly baseEmissive: THREE.Color
   private readonly flashEmissive = new THREE.Color(0xff5566)
 
-  constructor(spec: ShipSpec, team: Team) {
+  /**
+   * Gun spread draws from here rather than `Math.random`, so a run replays.
+   * Defaults to an unseeded stream for bare ships built by a test or a harness;
+   * `createGame` always passes a substream of the run seed.
+   */
+  private readonly rng: Rng
+
+  constructor(spec: ShipSpec, team: Team, rng: Rng = unseededRng()) {
     this.spec = spec
     this.team = team
+    this.rng = rng
     this.hull = spec.maxHull
     this.visual = buildShip(spec)
     this.accent = new THREE.Color(spec.accent)
@@ -235,6 +258,11 @@ export class Ship implements BoltTarget {
     this.searTimer = 0
     this.overdriveTimer = 0
     this.shieldTimer = 0
+    // Collapse the interpolation window onto the spawn pose. Leaving the
+    // previous transform behind would drag the hull in from wherever it last
+    // died over the first tick of its new life.
+    this.prevPosition.copy(this.position)
+    this.prevQuaternion.copy(this.quaternion)
     this.syncVisual()
   }
 
@@ -284,6 +312,11 @@ export class Ship implements BoltTarget {
 
   step(controls: Controls, dt: number, ctx: ShipContext): void {
     if (!this.alive) return
+
+    // Taken before anything moves: this is the pose the next render interpolates
+    // away from.
+    this.prevPosition.copy(this.position)
+    this.prevQuaternion.copy(this.quaternion)
 
     if (this.warpTimer > 0) this.warpTimer = Math.max(0, this.warpTimer - dt)
     this.sinceHit += dt
@@ -503,9 +536,9 @@ export class Ship implements BoltTarget {
       // Random small-angle deflection: nudge the direction by a random vector
       // and renormalise. Accurate enough for the small angles AI aim uses.
       _jitter.set(
-        (Math.random() * 2 - 1) * spreadRadians,
-        (Math.random() * 2 - 1) * spreadRadians,
-        (Math.random() * 2 - 1) * spreadRadians,
+        this.rng.spread(spreadRadians),
+        this.rng.spread(spreadRadians),
+        this.rng.spread(spreadRadians),
       )
       direction.add(_jitter).normalize()
     }
@@ -598,10 +631,28 @@ export class Ship implements BoltTarget {
   /* Presentation                                                             */
   /* ------------------------------------------------------------------------ */
 
-  syncVisual(): void {
+  /**
+   * Push simulation state onto the meshes.
+   *
+   * `alpha` is how far the frame being drawn sits between the previous
+   * simulation tick and the current one, 0..1. Only the transform is
+   * interpolated; everything else here is either a threshold (visible, phasing,
+   * shielded) or already a smooth function of a timer, and blending those would
+   * buy nothing for the arithmetic.
+   *
+   * Nothing in here may write simulation state. This is the whole render half
+   * of the boundary — `step` decides where the ship is, `syncVisual` decides
+   * what that looks like, and a headless run calls only the former.
+   */
+  syncVisual(alpha = 1): void {
     const g = this.visual.group
-    g.position.copy(this.position)
-    g.quaternion.copy(this.quaternion)
+    if (alpha >= 1) {
+      g.position.copy(this.position)
+      g.quaternion.copy(this.quaternion)
+    } else {
+      g.position.lerpVectors(this.prevPosition, this.position, alpha)
+      g.quaternion.copy(this.prevQuaternion).slerp(this.quaternion, alpha)
+    }
     g.visible = this.alive
 
     // Materialise: scale up and over-drive the trim as the hull phases in.

@@ -16,10 +16,9 @@ import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
-import { createGame, DEATH_SEQUENCE } from '../src/game/game'
+import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
-import { mulberry32 } from '../src/core/rng'
 import { SHIPS } from '../src/ships/specs'
 import {
   ARENA_HARD_LIMIT,
@@ -803,6 +802,7 @@ function stubEnvironment(): Environment {
       update() {},
       dispose() {},
     },
+    step() {},
     update() {},
     dispose() {},
   }
@@ -836,12 +836,16 @@ function stubEnvironment(): Environment {
  * the moment an unrelated change added two `THREE` objects to the scene, because
  * `MathUtils.generateUUID` draws from `Math.random`, so constructing any
  * geometry or material shifts the stream and the whole run diverges.
+ *
+ * That is also why the seed now goes in through `start` rather than by swapping
+ * the global `Math.random` out from under the process, which is what this used
+ * to do. The run's own draws come from its seed and share a stream with nothing
+ * else, so building a mesh can no longer move the fight.
  */
+const WIN_SEED = 0x5120fa11
+
 function testARunCanBeWon(): void {
   section('A cleared roster reports a win')
-
-  const realRandom = Math.random
-  Math.random = mulberry32(0x5120fa11)
 
   const originalHulls = {
     wasp: SHIPS.wasp.maxHull,
@@ -879,7 +883,7 @@ function testARunCanBeWon(): void {
     },
   })
 
-  game.start('hornet')
+  game.start('hornet', WIN_SEED)
 
   const budget = Math.ceil(240 / STEP)
   let frames = 0
@@ -909,7 +913,7 @@ function testARunCanBeWon(): void {
       input.write.throttleDown = false
     }
 
-    game.update(STEP)
+    game.step()
   }
 
   SHIPS.wasp.maxHull = originalHulls.wasp
@@ -920,7 +924,6 @@ function testARunCanBeWon(): void {
   SHIPS.hornet.damage = originalGuns.damage
   SHIPS.wasp.radius = originalRadii.wasp
   SHIPS.drone.radius = originalRadii.drone
-  Math.random = realRandom
 
   const run = result as RunResult | null
   check('the run resolved', run !== null, `gave up after ${(frames * STEP).toFixed(0)}s`)
@@ -1019,7 +1022,7 @@ function testDeathPlaysBeforeTheDebrief(): void {
   const budget = Math.ceil(20 / STEP)
   let frames = 0
   for (; frames < budget && resultFrame < 0; frames++) {
-    game.update(STEP)
+    game.step()
 
     if (deathFrame < 0 && (game.snapshot()?.playerHull ?? 1) <= 0) deathFrame = frames
     if (game.dying) {
@@ -1283,10 +1286,20 @@ function testPickups(): void {
   eye.position.set(0, 0, 800)
   eye.updateMatrixWorld()
 
+  // `step` runs the respawn clock and `update` runs the billboarding — both are
+  // driven here so this still covers the render path it always did, while
+  // asserting against the half that actually decides whether a pad is there.
+  function tick(seconds: number): void {
+    for (let i = 0; i < Math.round(seconds / STEP); i++) {
+      field.step(STEP)
+      field.update(STEP, eye)
+    }
+  }
+
   const half = repairPad.respawnIn / 2
-  for (let i = 0; i < Math.round(half / STEP); i++) field.update(STEP, eye)
+  tick(half)
   check('it stays gone while the clock runs', !repairPad.live, `${repairPad.respawnIn.toFixed(1)}s left`)
-  for (let i = 0; i < Math.round((half + 1) / STEP); i++) field.update(STEP, eye)
+  tick(half + 1)
   check('it re-arms once the clock expires', repairPad.live)
   check('a re-armed pad registers contact again', field.findContact(repairPad.position, 40) === repairPad)
 
@@ -1502,6 +1515,160 @@ function testPickups(): void {
   mines.dispose()
 }
 
+/**
+ * The determinism contract: a run is a function of its seed and its inputs, and
+ * of nothing else.
+ *
+ * This is the check the netcode work rests on. Server authority, host-peer play
+ * and replay-verified scores all reduce to the same claim — that the same seed
+ * fed the same inputs produces the same fight — and that claim is cheap to
+ * believe and easy to break. Any new `Math.random()` on a path that decides an
+ * outcome breaks it, and this is what catches that.
+ *
+ * The two runs are played by the same closed-loop autopilot rather than a fixed
+ * input tape, deliberately: an autopilot steers from what it sees, so the
+ * smallest divergence in a hostile's position changes the next input and the two
+ * runs peel apart fast. A fixed tape would let a small drift stay small and pass.
+ *
+ * Note what is *not* controlled here — each run builds its own scene, meshes and
+ * materials, and every one of those draws from the global `Math.random` through
+ * `THREE.MathUtils.generateUUID`. That used to be enough to move a run. It is
+ * exactly what the run seed being its own stream now makes irrelevant, so
+ * leaving it uncontrolled is part of the test.
+ */
+function testASeededRunReproduces(): void {
+  section('A seeded run reproduces from its seed')
+
+  /** The parts of a run a divergence would surface in. */
+  function fingerprint(run: RunSnapshot | null): string {
+    if (!run) return 'none'
+    const t = run.target
+    return [
+      run.score,
+      run.kills,
+      run.shotsFired,
+      run.playerHull,
+      run.playerSpeed,
+      run.enemiesAirborne,
+      run.enemiesQueued,
+      run.solarExposure,
+      // Bearing to the locked hostile — the most sensitive number available
+      // here, since it moves with every AI wander decision.
+      t ? `${t.yaw},${t.pitch},${t.range},${t.hull}` : 'nolock',
+    ].join(' ')
+  }
+
+  function playOut(seed: number, ticks: number): string {
+    const input = stubInput()
+    const game = createGame({
+      scene: new THREE.Scene(),
+      camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+      environment: stubEnvironment(),
+      input,
+      audio: silentAudio(),
+      hud: stubHud(),
+      bestScoreFor: () => 0,
+      onEnd: () => {},
+    })
+
+    game.start('hornet', seed)
+
+    const marks: string[] = []
+    for (let i = 0; i < ticks; i++) {
+      const target = game.snapshot()?.target ?? null
+      if (target) {
+        input.write.pitch = clampTo(target.pitch * 3, -1, 1)
+        input.write.yaw = clampTo(target.yaw * 3, -1, 1)
+        input.write.fire = Math.abs(target.pitch) < 0.35 && Math.abs(target.yaw) < 0.35
+        input.write.throttleUp = target.range > 260
+        input.write.throttleDown = target.range < 170
+      } else {
+        input.write.pitch = 0
+        input.write.yaw = 0
+        input.write.fire = false
+        input.write.throttleUp = true
+        input.write.throttleDown = false
+      }
+      game.step()
+      // Sampled along the way, not just at the end: two runs that diverge and
+      // then happen to land on the same score would slip past a single check.
+      if (i % 90 === 0) marks.push(fingerprint(game.snapshot()))
+    }
+    marks.push(fingerprint(game.snapshot()))
+    return marks.join(' | ')
+  }
+
+  const TICKS = Math.ceil(20 / STEP)
+  const first = playOut(0x51ede7, TICKS)
+  const again = playOut(0x51ede7, TICKS)
+  const other = playOut(0x51ede8, TICKS)
+
+  check('the same seed replays identically', first === again, firstDifference(first, again))
+  check('a different seed is a different fight', first !== other)
+  // A run that never engaged would compare equal for trivial reasons.
+  check('the replayed run was a real fight', first.includes('nolock') === false || first !== 'none')
+}
+
+/** Where two fingerprints part company, for a failure message worth reading. */
+function firstDifference(a: string, b: string): string {
+  const left = a.split(' | ')
+  const right = b.split(' | ')
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    if (left[i] !== right[i]) return `diverged at mark ${i}: "${left[i]}" vs "${right[i]}"`
+  }
+  return 'identical'
+}
+
+/**
+ * The fixed step is what makes the above possible, so it gets its own check:
+ * the simulation must not be able to see how fast the display is running.
+ *
+ * `Game.step` takes no delta at all, which is the enforcement — there is no
+ * argument for a caller to vary. This asserts the consequence: N ticks advance
+ * the same distance no matter how the caller groups them into frames. Before
+ * this change the equivalent test was impossible to write, because `update(dt)`
+ * accepted whatever the frame handed it and a 30 Hz browser genuinely flew a
+ * different ship from a 144 Hz one.
+ */
+function testTheSimulationIgnoresFrameRate(): void {
+  section('Simulation advances independently of frame pacing')
+
+  function flyFor(ticks: number, batches: number[]): { x: number; y: number; z: number } {
+    const bolts = createBolts()
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+    const ship = new Ship(SHIPS.wasp, 'player')
+    ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 200, -1000))
+    ship.warpTimer = 0
+
+    // `batches` stands in for frames of differing length: the same total number
+    // of ticks, dealt out in uneven groups the way a stuttering display would.
+    let done = 0
+    let b = 0
+    while (done < ticks) {
+      const size = Math.min(batches[b++ % batches.length], ticks - done)
+      for (let i = 0; i < size; i++) {
+        ship.step(controls({ pitch: 0.4, yaw: -0.2, throttle: 1 }), STEP, ctx)
+      }
+      done += size
+    }
+
+    const out = { x: ship.position.x, y: ship.position.y, z: ship.position.z }
+    bolts.dispose()
+    ship.dispose()
+    return out
+  }
+
+  const steady = flyFor(600, [1])
+  const stuttering = flyFor(600, [3, 1, 7, 2, 5])
+
+  check(
+    'the same tick count lands in the same place however frames are grouped',
+    steady.x === stuttering.x && steady.y === stuttering.y && steady.z === stuttering.z,
+    `${JSON.stringify(steady)} vs ${JSON.stringify(stuttering)}`,
+  )
+  check('the ship actually went somewhere', Math.abs(steady.z) > 100, `z=${steady.z}`)
+}
+
 /* -------------------------------------------------------------------------- */
 
 console.log('NEON ORBIT — headless simulation checks')
@@ -1517,6 +1684,8 @@ testMines()
 testPickups()
 testARunCanBeWon()
 testDeathPlaysBeforeTheDebrief()
+testASeededRunReproduces()
+testTheSimulationIgnoresFrameRate()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

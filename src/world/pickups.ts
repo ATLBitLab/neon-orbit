@@ -95,9 +95,11 @@ export const TIMED_WARN_AT = 5
  * A hazard should be tight — grazing a mine you thought you cleared is a bad
  * beat. A reward should be forgiving: you are collecting it at up to 470 u/s,
  * through a chase camera, usually while someone is shooting at you. This also
- * settles the tunnelling question. The loop clamps a frame to `MAX_STEP`
- * (1/20s), so the fastest airframe covers 23.5 units in the worst frame the
- * simulation will accept, against a reach of this plus the hull radius.
+ * settles the tunnelling question, and the fixed step settles it by a wider
+ * margin than the old variable frame did: a tick is always 1/60s, so the
+ * fastest airframe covers 7.8 units per tick against a reach of this plus the
+ * hull radius. A slow frame now runs more ticks rather than one longer one, so
+ * the distance covered between contact tests no longer depends on the display.
  */
 export const PICKUP_RADIUS = 34
 
@@ -130,7 +132,17 @@ export interface Pickups {
   collect(pod: Pickup): void
   /** Re-arm everything. Called at the start of every run. */
   reset(): void
-  /** The camera is needed because pods billboard — see the note at the top. */
+  /**
+   * Advance respawn clocks. This is the only thing about a pod that decides an
+   * outcome — whether it is there when you fly through it — so it runs on the
+   * simulation's fixed tick and not on the frame.
+   */
+  step(dt: number): void
+  /**
+   * Breathing haloes and billboarding. Presentation only; skipping it changes
+   * nothing about where a pod is or whether it is live. The camera is needed
+   * because pods billboard — see the note at the top.
+   */
   update(dt: number, camera: THREE.Camera): void
   dispose(): void
 }
@@ -547,8 +559,7 @@ export function buildPickups(opts: PickupsOptions): Pickups {
       writeInstances()
     },
 
-    update(dt, camera) {
-      clock += dt
+    step(dt) {
       for (const pod of pods) {
         if (pod.live) continue
         pod.respawnIn -= dt
@@ -557,6 +568,10 @@ export function buildPickups(opts: PickupsOptions): Pickups {
           pod.live = true
         }
       }
+    },
+
+    update(dt, camera) {
+      clock += dt
       // Each kind breathes at its own rate, so a cluster of mixed pods never
       // pulses in unison and reads as one installation.
       meshes.repair.haloMat.opacity = 0.07 + (Math.sin(clock * 2.4) * 0.5 + 0.5) * 0.08

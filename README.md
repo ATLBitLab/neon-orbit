@@ -142,6 +142,30 @@ move ships — it produces the same `Controls` struct the player produces and ha
 `Ship.step`. An enemy Wasp is fast because a Wasp is fast, so it cannot cheat, and a balance
 change lands on both sides at once.
 
+**The simulation runs on a fixed step; rendering runs on the frame.** `Game.step()` advances
+exactly 1/60s and takes no delta — there is deliberately no argument for a caller to vary.
+`Game.render(alpha, frameDt)` draws whatever `step` left behind, where `alpha` is how far the
+frame sits between the last two ticks, and `Ship.syncVisual(alpha)` interpolates the hull
+between them so a display faster than 60 Hz still looks smooth. The loop in `src/main.ts`
+accumulates real time and runs as many ticks as it owes.
+
+The split is what makes the flight model honest: with a variable delta the same stick input
+covered different ground on a 30 Hz laptop and a 144 Hz desktop, so a hull's turn rate — the
+lever the whole three-airframe design rests on — was not really one number. Keep the two halves
+separate. Nothing in `step` may read the camera or write a mesh transform; nothing in `render`
+may write simulation state.
+
+**Gameplay randomness comes from the run seed, never `Math.random()`.** `Game.start` takes an
+optional seed and reports it back through `snapshot().seed`. Everything that decides an outcome
+— squadron order, arrival points, AI wander and break timing, gun spread — draws from a
+substream of it (`subRng` in `src/core/rng.ts`), so a run is a function of its seed and its
+inputs and nothing else. Cosmetic scatter — particles, camera shake, wreck sparks — is exempt
+and still uses `Math.random()` directly.
+
+Two viewers of one run may see different sparks; they may not see different hulls. `simcheck`
+asserts this by playing the same seed twice and comparing, so a stray `Math.random()` on a path
+that decides something fails the build rather than surfacing later as a desync.
+
 **Everything is procedural.** No textures, no models, no audio files. Hulls and stations are
 coarse primitives merged into non-indexed geometry so recomputed normals stay hard-faceted;
 `src/core/geo.ts` is the single source of the *-Z is forward* convention. The planet is one

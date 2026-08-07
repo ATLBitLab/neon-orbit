@@ -14,6 +14,7 @@
 import * as THREE from 'three'
 import type { Audio } from '../core/audio'
 import type { Input } from '../core/input'
+import { STREAM, subRng, type Rng } from '../core/rng'
 import type { RunResult } from '../core/scores'
 import { otherShips, SHIPS, type ShipId } from '../ships/specs'
 import {
@@ -41,6 +42,22 @@ import type { Hud, HudContact, HudTarget } from './hud'
 import { Ship, type Controls, type ShipContext } from './ship'
 
 /** Hulls of each non-chosen type that make up the squadron. */
+/**
+ * Seconds of simulation per tick.
+ *
+ * Fixed, and owned here rather than taken from the frame, because the flight
+ * model integrates per step: with a variable delta the same stick input covers
+ * different ground on a 30 Hz laptop and a 144 Hz desktop, and a hull's turn
+ * rate — the balance lever the whole three-airframe design rests on — stops
+ * being one number. It is also the precondition for a run replaying: a replay
+ * can reproduce a list of inputs, but it can never reproduce a list of frame
+ * times.
+ *
+ * 60 Hz matches the rate the flight model was tuned at and the rate
+ * `scripts/simcheck.ts` has always asserted against.
+ */
+export const STEP = 1 / 60
+
 const PER_ENEMY_TYPE = 3
 /** How many enemies are airborne at once. */
 const MAX_ACTIVE = 3
@@ -137,8 +154,26 @@ export interface Game {
    * or interrupt the game here, or the explosion freezes mid-blast.
    */
   readonly dying: boolean
-  start(shipId: ShipId): void
-  update(dt: number): void
+  /**
+   * Begin a run. `seed` fixes every gameplay draw the run makes — squadron
+   * order, arrival points, AI wander, gun spread — so the same seed replayed
+   * against the same inputs produces the same fight. Omitted, a fresh one is
+   * rolled and reported back through `snapshot().seed`.
+   */
+  start(shipId: ShipId, seed?: number): void
+  /**
+   * Advance the simulation by exactly one fixed tick. Deliberately takes no
+   * argument: a caller that could pass its own `dt` could also pass a large one
+   * and cover more ground per frame, which is the cheapest cheat there is and
+   * the reason the loop owns the step size rather than the frame.
+   */
+  step(): void
+  /**
+   * Draw the current simulation state. `alpha` is how far the frame sits
+   * between the last two ticks, 0..1. Writes no simulation state, so a headless
+   * run never calls it.
+   */
+  render(alpha: number, frameDt: number): void
   pause(): void
   resume(): void
   /**
@@ -158,6 +193,12 @@ export interface Game {
 }
 
 export interface RunSnapshot {
+  /**
+   * The seed this run's gameplay randomness came from. Reported so a run worth
+   * keeping can be replayed: feed it back to `start` with the same inputs and
+   * the same fight happens.
+   */
+  seed: number
   score: number
   kills: number
   shotsFired: number
@@ -220,6 +261,21 @@ export function createGame(deps: GameDeps): Game {
   let pilots: EnemyPilot[] = []
   let queue: ShipId[] = []
   let spawnTimer = 0
+
+  /**
+   * The seed this run's gameplay randomness is derived from, and the counter
+   * that hands each pilot its own substream.
+   *
+   * Kept here rather than passed around because everything that draws is
+   * created inside this closure. A caller that wants a reproducible run — a
+   * replay, a server, a host peer — supplies the seed to `start` and gets the
+   * same fight from the same inputs. `pilotsSpawned` only ever increases within
+   * a run, so a pilot's stream is a function of its arrival order and nothing
+   * else.
+   */
+  let runSeed = 0
+  let pilotsSpawned = 0
+  let spawnRng: Rng = subRng(0, STREAM.spawn)
 
   let active = false
   let paused = false
@@ -285,7 +341,7 @@ export function createGame(deps: GameDeps): Game {
   function shuffled<T>(items: T[]): T[] {
     const out = items.slice()
     for (let i = out.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1))
+      const j = spawnRng.int(0, i)
       ;[out[i], out[j]] = [out[j], out[i]]
     }
     return out
@@ -295,12 +351,12 @@ export function createGame(deps: GameDeps): Game {
     if (!player) return out.set(0, 0, 0)
 
     for (let attempt = 0; attempt < 12; attempt++) {
-      const u = Math.random() * 2 - 1
-      const theta = Math.random() * Math.PI * 2
+      const u = spawnRng.range(-1, 1)
+      const theta = spawnRng.range(0, Math.PI * 2)
       const r = Math.sqrt(Math.max(0, 1 - u * u))
       _spawnDir.set(r * Math.cos(theta), u, r * Math.sin(theta))
 
-      out.copy(player.position).addScaledVector(_spawnDir, 900 + Math.random() * 420)
+      out.copy(player.position).addScaledVector(_spawnDir, spawnRng.range(900, 1320))
 
       // Keep arrivals inside the arena and out of the middle of a station.
       const dist = out.length()
@@ -325,7 +381,8 @@ export function createGame(deps: GameDeps): Game {
     const id = queue.shift()
     if (!id || !player) return
 
-    const ship = new Ship(SHIPS[id], 'enemy')
+    const index = pilotsSpawned++
+    const ship = new Ship(SHIPS[id], 'enemy', subRng(runSeed, STREAM.guns + index))
     pickSpawnPoint(_spawnPos)
     ship.spawn(_spawnPos, player.position)
 
@@ -347,7 +404,7 @@ export function createGame(deps: GameDeps): Game {
     }
 
     scene.add(ship.visual.group)
-    pilots.push(new EnemyPilot(ship))
+    pilots.push(new EnemyPilot(ship, subRng(runSeed, STREAM.pilot + index)))
     refreshTargets()
 
     fx.warpIn(ship.position, ship.accent)
@@ -680,6 +737,12 @@ export function createGame(deps: GameDeps): Game {
    * kill. None of it can touch the player — `takeDamage` and `step` both bail on
    * a dead hull, and bolts skip anything untargetable — so this is safe to run
    * with a corpse in the roster.
+   *
+   * Runs on the fixed tick because it gates the debrief, and it is the one place
+   * in the simulation half that calls `Math.random()` — for spark timing and
+   * blast scatter. That is allowed here and nowhere else: `beginDeathSequence`
+   * has already sealed the scoreline, so nothing this function rolls can change
+   * what the run reports. It is a cutscene wearing a simulation's clothes.
    */
   function stepDeathSequence(dt: number): void {
     if (!player) return
@@ -739,14 +802,6 @@ export function createGame(deps: GameDeps): Game {
       fx.spark(hit.point, hit.color, hit.target ? 16 : 8)
     }
 
-    /* Presentation */
-    for (const pilot of pilots) pilot.ship.syncVisual()
-    fx.update(dt, camera)
-    chase.update(player, dt)
-    refreshContacts()
-    hud.updateContacts(contactBuffer, camera)
-    hud.tick(dt)
-
     retireDead()
 
     // Falls back rather than waiting for a result that will never arrive: this
@@ -758,43 +813,54 @@ export function createGame(deps: GameDeps): Game {
   /* Frame                                                                    */
   /* ------------------------------------------------------------------------ */
 
-  function update(dt: number): void {
-    environment.update(dt, camera)
+  /* ------------------------------------------------------------------------ */
+  /* Simulation                                                               */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * One fixed tick of the fight.
+   *
+   * Everything in here decides an outcome. Nothing in here reads the camera or
+   * writes a mesh transform, which is what lets the same code run without a
+   * renderer — and, later, somewhere that is not the player's browser.
+   *
+   * Audio and HUD callouts do fire from here, and belong here: they are driven
+   * by simulation timers, so hanging them off the frame rate would make a
+   * critical-hull alarm beat faster on a better monitor.
+   */
+  function step(): void {
+    environment.step(STEP)
 
     if (dying) {
-      stepDeathSequence(dt)
+      stepDeathSequence(STEP)
       return
     }
 
-    if (!active || paused || !player) {
-      fx.update(dt, camera)
-      hud.tick(dt)
-      return
-    }
+    if (!active || paused || !player) return
 
-    elapsed += dt
+    elapsed += STEP
 
     /* Spawning */
-    if (spawnTimer > 0) spawnTimer -= dt
+    if (spawnTimer > 0) spawnTimer -= STEP
     while (pilots.length < MAX_ACTIVE && queue.length > 0 && spawnTimer <= 0) {
       spawnEnemy()
       spawnTimer = SPAWN_INTERVAL
     }
 
     /* Player */
-    player.step(readPlayerControls(dt), dt, ctx)
+    player.step(readPlayerControls(STEP), STEP, ctx)
 
     /* Enemies. Each pilot thinks and immediately steps, so `controls.aim` is
        consumed before the next pilot's turn. */
     squadron.length = 0
     for (const pilot of pilots) squadron.push(pilot.ship)
     for (const pilot of pilots) {
-      const controls = pilot.think(player, squadron, avoidList, dt)
-      pilot.ship.step(controls, dt, ctx)
+      const controls = pilot.think(player, squadron, avoidList, STEP)
+      pilot.ship.step(controls, STEP, ctx)
     }
 
     /* Projectiles */
-    for (const hit of bolts.update(dt, boltTargets, environment.hazards)) {
+    for (const hit of bolts.update(STEP, boltTargets, environment.hazards)) {
       fx.spark(hit.point, hit.color, hit.target ? 16 : 8)
       if (hit.target) audio.hit()
     }
@@ -804,16 +870,110 @@ export function createGame(deps: GameDeps): Game {
     resolveMines()
     resolvePickups()
 
-    /* Presentation */
-    player.syncVisual()
-    for (const pilot of pilots) pilot.ship.syncVisual()
-    fx.update(dt, camera)
-    chase.update(player, dt)
-
-    /* HUD */
-    refreshContacts()
-
+    /* Target lock. Simulation rather than display: the lock decides which hull
+       the lead solution is computed against, and `onTarget` gates the reticle
+       the player shoots on. */
     acquireTarget()
+
+    const critical = player.hullFraction <= CRITICAL_HULL
+    if (critical) {
+      alarmTimer -= STEP
+      if (alarmTimer <= 0) {
+        audio.alarm()
+        alarmTimer = 1.4
+      }
+    }
+
+    /* Solar proximity. The alarm tightens as the hull heats, so the interval
+       itself tells you whether you are getting out or getting worse. */
+    const exposure = player.solarExposure
+    if (exposure > 0) {
+      if (!wasSearing) hud.callout('SOLAR PROXIMITY', '#ffb020', 1.2)
+      searAlarmTimer -= STEP
+      if (searAlarmTimer <= 0) {
+        audio.alarm()
+        searAlarmTimer = 1.3 - exposure * 0.95
+      }
+    } else {
+      searAlarmTimer = 0
+    }
+    wasSearing = exposure > 0
+
+    /* Timed buffs running out. One chirp on each crossing and nothing after —
+       an alarm every frame of the last five seconds would train the player to
+       ignore the alarm that means a low hull.
+       No callout to go with it: the banner appearing, the gauge turning amber
+       and starting to flash, and this chirp are already three signals, and a
+       fourth saying the same words landed on top of the banner it was
+       announcing. The banner arriving *is* the announcement. */
+    if (player.overdriven && player.overdriveTimer <= TIMED_WARN_AT && !overdriveWarned) {
+      overdriveWarned = true
+      audio.alarm()
+    }
+    if (player.shielded && player.shieldTimer <= TIMED_WARN_AT && !shieldWarned) {
+      shieldWarned = true
+      audio.alarm()
+    }
+
+    retireDead()
+
+    /* Resolution. A loss hands off to the death animation and reports when it
+       is done; a win reports immediately. */
+    if (!player.alive) {
+      beginDeathSequence()
+    } else if (queue.length === 0 && pilots.length === 0) {
+      hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
+      finish(sealResult(true))
+    }
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Presentation                                                             */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Draw the state `step` left behind, at the frame's own rate.
+   *
+   * `frameDt` drives everything whose only job is to look smooth — particles,
+   * camera follow, world spin — so those stay fluid on a display faster than
+   * the tick rate instead of being pinned to 60.
+   */
+  function render(alpha: number, frameDt: number): void {
+    environment.update(frameDt, camera)
+
+    /* The death cutscene. The wreck drives its own transform inside
+       `stepDeathSequence`, so the player is deliberately not synced here —
+       interpolating would fight the tumble — and the instruments stay frozen
+       where `beginDeathSequence` left them. */
+    if (dying) {
+      if (player) {
+        for (const pilot of pilots) pilot.ship.syncVisual(alpha)
+        fx.update(frameDt, camera)
+        chase.update(player, frameDt)
+        refreshContacts()
+        hud.updateContacts(contactBuffer, camera)
+      }
+      hud.tick(frameDt)
+      return
+    }
+
+    /* Nothing is advancing, so nothing is worth re-posing: a varying alpha
+       against a frozen simulation would swing every hull back and forth between
+       the last two ticks. Leaving the meshes where the final frame drew them is
+       both correct and cheaper. */
+    if (!active || paused || !player) {
+      fx.update(frameDt, camera)
+      hud.tick(frameDt)
+      return
+    }
+
+    player.syncVisual(alpha)
+    for (const pilot of pilots) pilot.ship.syncVisual(alpha)
+
+    fx.update(frameDt, camera)
+    chase.update(player, frameDt)
+
+    refreshContacts()
 
     const remaining = queue.length + contactBuffer.length
     const critical = player.hullFraction <= CRITICAL_HULL
@@ -873,58 +1033,8 @@ export function createGame(deps: GameDeps): Game {
       target: targetReadout(),
     })
     hud.updateContacts(contactBuffer, camera)
-    hud.tick(dt)
+    hud.tick(frameDt)
     hud.setLockPrompt(!input.pointerLocked)
-
-    if (critical) {
-      alarmTimer -= dt
-      if (alarmTimer <= 0) {
-        audio.alarm()
-        alarmTimer = 1.4
-      }
-    }
-
-    /* Solar proximity. The alarm tightens as the hull heats, so the interval
-       itself tells you whether you are getting out or getting worse. */
-    const exposure = player.solarExposure
-    if (exposure > 0) {
-      if (!wasSearing) hud.callout('SOLAR PROXIMITY', '#ffb020', 1.2)
-      searAlarmTimer -= dt
-      if (searAlarmTimer <= 0) {
-        audio.alarm()
-        searAlarmTimer = 1.3 - exposure * 0.95
-      }
-    } else {
-      searAlarmTimer = 0
-    }
-    wasSearing = exposure > 0
-
-    /* Timed buffs running out. One chirp on each crossing and nothing after —
-       an alarm every frame of the last five seconds would train the player to
-       ignore the alarm that means a low hull.
-       No callout to go with it: the banner appearing, the gauge turning amber
-       and starting to flash, and this chirp are already three signals, and a
-       fourth saying the same words landed on top of the banner it was
-       announcing. The banner arriving *is* the announcement. */
-    if (player.overdriven && player.overdriveTimer <= TIMED_WARN_AT && !overdriveWarned) {
-      overdriveWarned = true
-      audio.alarm()
-    }
-    if (player.shielded && player.shieldTimer <= TIMED_WARN_AT && !shieldWarned) {
-      shieldWarned = true
-      audio.alarm()
-    }
-
-    retireDead()
-
-    /* Resolution. A loss hands off to the death animation and reports when it
-       is done; a win reports immediately. */
-    if (!player.alive) {
-      beginDeathSequence()
-    } else if (queue.length === 0 && pilots.length === 0) {
-      hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
-      finish(sealResult(true))
-    }
   }
 
   return {
@@ -938,11 +1048,17 @@ export function createGame(deps: GameDeps): Game {
       return dying
     },
 
-    start(shipId) {
+    start(shipId, seed = (Math.random() * 0xffffffff) >>> 0) {
       clearArena()
 
+      // Every stream this run draws from hangs off the seed, and must be built
+      // before anything draws — `shuffled` below is the first customer.
+      runSeed = seed >>> 0
+      pilotsSpawned = 0
+      spawnRng = subRng(runSeed, STREAM.spawn)
+
       const spec = SHIPS[shipId]
-      player = new Ship(spec, 'player')
+      player = new Ship(spec, 'player', subRng(runSeed, STREAM.guns))
       player.spawn(PLAYER_SPAWN, PLAYER_SPAWN_LOOK)
       player.onDamaged = (_self, amount) => {
         hud.flashDamage()
@@ -1002,7 +1118,8 @@ export function createGame(deps: GameDeps): Game {
       paused = false
     },
 
-    update,
+    step,
+    render,
 
     pause() {
       // Never mid-death: the run has already resolved, and freezing here strands
@@ -1055,6 +1172,7 @@ export function createGame(deps: GameDeps): Game {
       }
 
       return {
+        seed: runSeed,
         score,
         kills,
         shotsFired: player.shotsFired,
