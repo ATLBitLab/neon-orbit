@@ -17,7 +17,7 @@ import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
 import { createGame, DEATH_SEQUENCE } from '../src/game/game'
-import { DAMAGE_BAR_FADE, type Hud } from '../src/game/hud'
+import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { mulberry32 } from '../src/core/rng'
 import { SHIPS } from '../src/ships/specs'
@@ -176,17 +176,76 @@ function testPlayerBoltsKillEnemies(): void {
 }
 
 /**
- * The clock behind the hostile hull bars.
+ * The shape of the fade.
  *
- * The bars themselves are DOM and cannot be asserted here, so what is checked
- * is the thing that decides when one is on screen and how bright: `sinceHit`.
- * The fade *curve* is presentation and lives in the HUD; its *window* is what
- * the simulation has to keep honest, and every clause of the intended
- * behaviour — appears on a hit, fades out over the window, back to full on
- * every fresh hit — is a claim about this one number.
+ * `barBrightness` is where the feature actually lives, and it is the only part
+ * of the bar that is neither `Ship` nor DOM — plain arithmetic on a number.
+ * These assertions exist because the ones in
+ * `testDamageClockDrivesEnemyBars` do not cover it: every one of those reads
+ * `enemy.sinceHit`, so an inverted curve — dark on the hit, brightening as it
+ * goes stale, never hiding, the opposite of the request in every clause —
+ * passed the entire suite. That mutant fails six of the checks below.
+ */
+function testHullBarFadeCurve(): void {
+  section('The hull bar fade curve')
+
+  const hold = DAMAGE_BAR_FADE * DAMAGE_BAR_HOLD
+
+  check('a fresh hit draws at full brightness', barBrightness(0) === 1, `${barBrightness(0)}`)
+  check(
+    'it is still at full brightness at the end of the hold',
+    barBrightness(hold) === 1,
+    `${hold.toFixed(2)}s → ${barBrightness(hold)}`,
+  )
+
+  /* Strictly falling from the end of the hold to the end of the window. A curve
+     that plateaus anywhere in here, or climbs, is not a fade. */
+  const samples: number[] = []
+  let falling = true
+  let prev = barBrightness(hold)
+  for (let i = 1; i <= 20; i++) {
+    const t = hold + ((DAMAGE_BAR_FADE - hold) * i) / 20
+    const now = barBrightness(t)
+    samples.push(now)
+    if (now >= prev) falling = false
+    prev = now
+  }
+  check(
+    'brightness only ever falls across the rest of the window',
+    falling,
+    samples.map((s) => s.toFixed(2)).join(' '),
+  )
+
+  check(
+    `the bar is out at ${DAMAGE_BAR_FADE}s`,
+    barBrightness(DAMAGE_BAR_FADE) === 0,
+    `${barBrightness(DAMAGE_BAR_FADE)}`,
+  )
+  check(
+    'and stays out past the window',
+    barBrightness(DAMAGE_BAR_FADE + 0.001) === 0 && barBrightness(60) === 0,
+  )
+  // `Ship.sinceHit` initialises and respawns to 99, so this is literally what a
+  // hostile nobody has shot at yet draws.
+  check('a hostile nobody has hit draws nothing', barBrightness(99) === 0)
+
+  check(
+    'the hold leaves real fading time behind it',
+    DAMAGE_BAR_HOLD > 0 && DAMAGE_BAR_HOLD < 1 && DAMAGE_BAR_FADE > 0,
+    `hold ${DAMAGE_BAR_HOLD} of ${DAMAGE_BAR_FADE}s`,
+  )
+}
+
+/**
+ * The clock the fade is drawn against.
+ *
+ * Strictly a set of claims about `Ship.sinceHit` — the field `refreshContacts`
+ * hands the HUD — and named that way. What the bar *does* with the number is
+ * `testHullBarFadeCurve` above; these checks would all still pass if the fade
+ * were drawn upside down.
  */
 function testDamageClockDrivesEnemyBars(): void {
-  section('Hostile hull bars light on damage and fade on a real clock')
+  section('The damage clock the hull bars are drawn against')
 
   const bolts = createBolts()
   const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
@@ -232,24 +291,24 @@ function testDamageClockDrivesEnemyBars(): void {
   }
 
   check(
-    'an untouched hostile carries no bar',
+    'an untouched hull starts its clock past the bar window',
     enemy.sinceHit > DAMAGE_BAR_FADE,
     `sinceHit=${enemy.sinceHit.toFixed(2)}s`,
   )
 
   check('the first burst connects', fireUntilHit(10), `hull=${enemy.hull}/${SHIPS.hornet.maxHull}`)
-  check('a hit lights the bar at full brightness', enemy.sinceHit === 0, `sinceHit=${enemy.sinceHit}`)
+  check('a hit zeroes the clock', enemy.sinceHit === 0, `sinceHit=${enemy.sinceHit}`)
 
   coast(DAMAGE_BAR_FADE / 2)
   check(
-    'the bar is still up halfway through the fade',
+    'the clock is still inside the window halfway through',
     enemy.sinceHit < DAMAGE_BAR_FADE,
     `sinceHit=${enemy.sinceHit.toFixed(2)}s of ${DAMAGE_BAR_FADE}s`,
   )
 
   coast(DAMAGE_BAR_FADE / 2 + 0.05)
   check(
-    'the bar is gone once the window closes',
+    'the clock leaves the window on schedule',
     enemy.sinceHit >= DAMAGE_BAR_FADE,
     `sinceHit=${enemy.sinceHit.toFixed(2)}s of ${DAMAGE_BAR_FADE}s`,
   )
@@ -263,13 +322,13 @@ function testDamageClockDrivesEnemyBars(): void {
   enemy.shieldTimer = 0
   check('a shielded hostile takes no hull damage', !shieldedHit && enemy.hull === shieldedFrom)
   check(
-    'a refused hit does not light a bar',
+    'a refused hit leaves the clock running',
     enemy.sinceHit >= DAMAGE_BAR_FADE,
     `sinceHit=${enemy.sinceHit.toFixed(2)}s`,
   )
 
   check('a second burst connects', fireUntilHit(10), `hull=${enemy.hull}/${SHIPS.hornet.maxHull}`)
-  check('every fresh hit returns the bar to full brightness', enemy.sinceHit === 0, `sinceHit=${enemy.sinceHit}`)
+  check('every fresh hit re-zeroes the clock', enemy.sinceHit === 0, `sinceHit=${enemy.sinceHit}`)
 
   /* The Drone rebuilds its own hull once its repair clock runs out, and that
      clock is this clock. If the window ever grew past the delay, a Drone's bar
@@ -277,7 +336,7 @@ function testDamageClockDrivesEnemyBars(): void {
      back up — the one state where the bar would be actively lying. */
   const repair = SHIPS.drone.quirk
   check(
-    'the bar fades before nanite repair can start refilling behind it',
+    'the window closes before nanite repair starts refilling behind it',
     repair.kind === 'regen' && repair.delay > DAMAGE_BAR_FADE,
     `repair at ${repair.kind === 'regen' ? `${repair.delay}s` : 'n/a'}, bar gone at ${DAMAGE_BAR_FADE}s`,
   )
@@ -1403,6 +1462,7 @@ function testPickups(): void {
 
 console.log('NEON ORBIT — headless simulation checks')
 testPlayerBoltsKillEnemies()
+testHullBarFadeCurve()
 testDamageClockDrivesEnemyBars()
 testFriendlyFireIsOff()
 testBoundaryTurnsShipsAround()

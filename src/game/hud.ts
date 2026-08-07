@@ -20,15 +20,17 @@ const EDGE_INSET = 0.92
 /**
  * Seconds a hostile's hull bar stays up after the hit that lit it.
  *
- * The bar is a record of a hit, not a permanent readout. Six bars floating over
- * a dogfight the whole run is instrument clutter you learn to stop reading, and
- * it would also hand the player a free wallhack on hostiles they have never
- * touched. Fading it means the bars that are up are the fights you are actually
- * in — and the one hostile you want a *standing* readout on is the one you have
- * locked, which the bottom-right panel already draws.
+ * The bar is a record of a hit, not a permanent readout: six of them floating
+ * over the arena for a whole run is instrument clutter you learn to stop
+ * reading, and the bracket they hang off already carries a coarse permanent
+ * hull signal in its own brightness. Fading means the bars that are up are the
+ * fights you are actually in.
  *
- * Exported because `simcheck` asserts the damage clock against the same window
- * the fade is drawn from, rather than against a second copy of the number.
+ * Note what this is *not*. It is not information hiding. `Game.cycleTarget`
+ * walks every live hostile with no damage precondition, and the bottom-right
+ * panel then draws that hull as a number — so the readout is already available
+ * on demand for anything in the arena, touched or not. This is a clutter
+ * budget, and it should be argued for or against on those terms only.
  */
 export const DAMAGE_BAR_FADE = 5
 /**
@@ -39,7 +41,7 @@ export const DAMAGE_BAR_FADE = 5
  * is supposed to say *that one connected* is lost. Holding first makes every
  * hit read as a pop.
  */
-const DAMAGE_BAR_HOLD = 0.35
+export const DAMAGE_BAR_HOLD = 0.35
 
 /**
  * How bright a hull bar is `sinceHit` seconds after its hostile last lost hull.
@@ -48,8 +50,13 @@ const DAMAGE_BAR_HOLD = 0.35
  * a presentation choice, in the same family as `EDGE_INSET` and the bracket
  * scale curve — not a balance number the HUD would have to reach into the
  * simulation for.
+ *
+ * Exported for `simcheck`. Everything else about the bar is DOM and has to be
+ * checked in a browser, but this is arithmetic on a number: it is the one place
+ * the requested *shape* — lit on the hit, held, faded out by `DAMAGE_BAR_FADE`
+ * — can be asserted instead of eyeballed.
  */
-function barBrightness(sinceHit: number): number {
+export function barBrightness(sinceHit: number): number {
   const life = 1 - sinceHit / DAMAGE_BAR_FADE
   if (life <= 0) return 0
   return Math.min(1, life / (1 - DAMAGE_BAR_HOLD))
