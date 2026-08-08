@@ -315,11 +315,21 @@ export function createGame(deps: GameDeps): Game {
   const wreckEmissive = new THREE.Color()
 
   /**
-   * The controls the last tick actually flew on, kept so the HUD reports the
-   * throttle being simulated rather than whatever a device says right now. On a
-   * client those two will differ by a round trip.
+   * A *copy* of the controls the last tick actually flew on, so the HUD reports
+   * the throttle being simulated rather than whatever a device says right now.
+   * On a client those two differ by a round trip.
+   *
+   * Copied rather than referenced, and that is the whole point of it. `Pilot`
+   * returns the same struct every call — sixty allocations a second would be
+   * silly — so retaining the caller's object would make this a live view of the
+   * device, which is exactly the thing it exists not to be. It was a reference
+   * first, and read back as whatever the stick was doing later.
+   *
+   * The general rule, now that `Controls` is becoming a wire format: **`step`
+   * must not retain what it is handed.** A host buffering `inputs[tick]` would
+   * otherwise collect N aliases of one object and replay the last tick N times.
    */
-  let lastControls: Controls = {
+  const lastControls: Controls = {
     pitch: 0,
     yaw: 0,
     roll: 0,
@@ -328,6 +338,19 @@ export function createGame(deps: GameDeps): Game {
     dash: false,
     aim: null,
     spread: 0,
+  }
+
+  function recordControls(c: Controls): void {
+    lastControls.pitch = c.pitch
+    lastControls.yaw = c.yaw
+    lastControls.roll = c.roll
+    lastControls.throttle = c.throttle
+    lastControls.fire = c.fire
+    lastControls.dash = c.dash
+    lastControls.spread = c.spread
+    // `aim` is a vector the producer owns; the HUD never reads it, so the
+    // reference is not copied and not kept.
+    lastControls.aim = null
   }
 
   const contactBuffer: HudContact[] = []
@@ -866,7 +889,7 @@ export function createGame(deps: GameDeps): Game {
     }
 
     /* Player */
-    lastControls = controls
+    recordControls(controls)
     player.step(controls, STEP, ctx)
 
     /* Enemies. Each pilot thinks and immediately steps, so `controls.aim` is

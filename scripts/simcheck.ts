@@ -1691,6 +1691,114 @@ function firstDifference(a: string, b: string): string {
  * `Input`, and no `Pilot` — just a list of structs handed to `step`. If anything
  * in the simulation still reached for a device, the two would part company.
  */
+/**
+ * The simulation defends itself against the controls it is handed.
+ *
+ * `Controls` is becoming a wire format, so the airframe has to be the thing that
+ * bounds deflection rather than trusting every producer to have done it. Both
+ * producers that exist today already clamp — the AI in `ai.ts`, the device in
+ * `input.ts`, where roll is built from two keys and can only be -1, 0 or 1 — so
+ * these assertions describe a bound that changes no run that exists. That is the
+ * point: it is a relocation of an existing guarantee to somewhere a stranger's
+ * browser cannot get underneath it.
+ */
+function testTheAirframeCannotBeAskedToExceedItself(): void {
+  section('Deflection is bounded by the airframe, not by the caller')
+
+  function flownFor(ticks: number, c: Partial<Controls>): THREE.Quaternion {
+    const bolts = createBolts()
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+    const ship = new Ship(SHIPS.wasp, 'player')
+    ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+    ship.warpTimer = 0
+    for (let i = 0; i < ticks; i++) ship.step(controls(c), STEP, ctx)
+    const out = ship.quaternion.clone()
+    bolts.dispose()
+    ship.dispose()
+    return out
+  }
+
+  const TICKS = 30
+  const legal = flownFor(TICKS, { pitch: 1 })
+
+  for (const [name, absurd] of [
+    ['pitch', { pitch: 1000 }],
+    ['yaw', { yaw: 1000 }],
+    ['roll', { roll: 1000 }],
+  ] as const) {
+    const bounded = flownFor(TICKS, absurd)
+    const reference = flownFor(TICKS, { [name]: 1 } as Partial<Controls>)
+    check(
+      `a wildly out-of-range ${name} turns no faster than full deflection`,
+      bounded.angleTo(reference) < 1e-9,
+      `${bounded.angleTo(reference)} rad apart`,
+    )
+  }
+
+  // Guards the three above: if full deflection did nothing, they would all pass
+  // by comparing one stationary hull against another.
+  check(
+    'full deflection actually turns the hull',
+    legal.angleTo(new THREE.Quaternion()) > 0.5,
+    `turned ${legal.angleTo(new THREE.Quaternion())} rad`,
+  )
+
+  // Negative side too — clamping only the upper bound is a classic half-fix.
+  const under = flownFor(TICKS, { pitch: -1000 })
+  const underRef = flownFor(TICKS, { pitch: -1 })
+  check('the lower bound is clamped as well', under.angleTo(underRef) < 1e-9)
+}
+
+/**
+ * `step` must not retain the struct it is handed.
+ *
+ * `Pilot` returns the same object every call rather than allocating sixty times
+ * a second, so anything the game keeps a reference to is a live view of the
+ * device, not a record of the tick. `game.ts` kept exactly that reference, and
+ * the HUD read whatever the stick was doing later instead of what was flown.
+ *
+ * Harmless while `advance` and `step` are paired, and wrong the moment they are
+ * not — which is every use phase B has for this: a host buffering `inputs[tick]`
+ * would collect N aliases of one object and replay the last tick N times.
+ */
+function testStepDoesNotRetainCallerControls(): void {
+  section('The simulation copies the controls it is handed')
+
+  let reported = -1
+  const hud = stubHud()
+  hud.update = (state) => {
+    reported = state.throttle
+  }
+
+  const game = createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input: stubInput(),
+    audio: silentAudio(),
+    hud,
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  game.start('hornet', 0xa11a5)
+
+  // One mutable struct, reused — exactly what `Pilot` hands over.
+  const shared = controls({ throttle: 0.9 })
+  game.step(shared)
+
+  // The producer moves on, as a pilot does every single tick.
+  shared.throttle = 0.1
+  shared.pitch = -1
+
+  game.render(1, STEP)
+  check(
+    'the HUD reports the throttle that was flown, not the one since written',
+    reported === 0.9,
+    `reported ${reported}`,
+  )
+}
+
 function testARunReplaysFromRecordedControls(): void {
   section('A run replays from its recorded controls alone')
 
@@ -2246,6 +2354,8 @@ testARunCanBeWon()
 testDeathPlaysBeforeTheDebrief()
 testASeededRunReproduces()
 testARunReplaysFromRecordedControls()
+testTheAirframeCannotBeAskedToExceedItself()
+testStepDoesNotRetainCallerControls()
 testTheStepClockNeverLosesTime()
 testOneFrameDepictsOneInstant()
 

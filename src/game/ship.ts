@@ -341,9 +341,31 @@ export class Ship implements BoltTarget {
   private applyRotation(controls: Controls, dt: number): void {
     const turn = this.spec.turnRate * dt
     const roll = this.spec.rollRate * dt
+
+    /*
+     * Deflection is clamped here rather than trusted from the producer.
+     *
+     * Every producer today already stays in range — the AI clamps in
+     * `ai.ts`, the device clamps in `input.ts`, and roll there is built from
+     * two keys so it can only be -1, 0 or 1 — so this changes no run that
+     * exists. It is not redundant, it is a relocation: the bound moves from
+     * "every caller is well behaved" to "the airframe cannot be asked to
+     * exceed itself", and `Controls` is now the shape a stranger's browser
+     * will send. Unclamped, a `pitch` of 1000 is a thousand times the turn
+     * rate the whole three-airframe balance rests on.
+     *
+     * Value bounds belong here because they are free and inert. *Rate* bounds
+     * do not: throttle's ramp is a device-side integration the AI legitimately
+     * bypasses, so enforcing it host-side is a real behaviour decision and
+     * lives with the rest of input validation. See `PLANS/NEON_ORBIT_PHASE_B.md`.
+     */
+    const pitch = clamp(controls.pitch, -1, 1)
+    const yaw = clamp(controls.yaw, -1, 1)
+    const bank = clamp(controls.roll, -1, 1)
+
     // Right-multiplying rotates in the body frame, which is what a stick does.
     // Signs: +Y yaws the nose left and +Z rolls left, so both are negated.
-    _euler.set(controls.pitch * turn, -controls.yaw * turn, -controls.roll * roll, 'YXZ')
+    _euler.set(pitch * turn, -yaw * turn, -bank * roll, 'YXZ')
     _dq.setFromEuler(_euler)
     this.quaternion.multiply(_dq).normalize()
   }
@@ -703,4 +725,8 @@ export class Ship implements BoltTarget {
   dispose(): void {
     disposeShipVisual(this.visual)
   }
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v
 }
