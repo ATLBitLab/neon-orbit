@@ -17,6 +17,7 @@ import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
+import { createPilot } from '../src/game/controls'
 import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
@@ -888,6 +889,7 @@ function testARunCanBeWon(): void {
   SHIPS.drone.radius = 350
 
   const input = stubInput()
+  const pilot = createPilot()
   let result: RunResult | null = null
 
   const game = createGame({
@@ -933,7 +935,7 @@ function testARunCanBeWon(): void {
       input.write.throttleDown = false
     }
 
-    game.step()
+    game.step(pilot.advance(input.state, STEP))
   }
 
   SHIPS.wasp.maxHull = originalHulls.wasp
@@ -1017,6 +1019,7 @@ function testDeathPlaysBeforeTheDebrief(): void {
   SHIPS.wasp.maxHull = 40
 
   const input = stubInput()
+  const pilot = createPilot()
   let result: RunResult | null = null
 
   const game = createGame({
@@ -1042,7 +1045,7 @@ function testDeathPlaysBeforeTheDebrief(): void {
   const budget = Math.ceil(20 / STEP)
   let frames = 0
   for (; frames < budget && resultFrame < 0; frames++) {
-    game.step()
+    game.step(pilot.advance(input.state, STEP))
 
     if (deathFrame < 0 && (game.snapshot()?.playerHull ?? 1) <= 0) deathFrame = frames
     if (game.dying) {
@@ -1587,6 +1590,7 @@ function testASeededRunReproduces(): void {
 
   function playOut(ship: ShipId, seed: number, ticks: number): Played {
     const input = stubInput()
+    const pilot = createPilot()
     const game = createGame({
       scene: new THREE.Scene(),
       camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
@@ -1616,7 +1620,7 @@ function testASeededRunReproduces(): void {
         input.write.throttleUp = true
         input.write.throttleDown = false
       }
-      game.step()
+      game.step(pilot.advance(input.state, STEP))
       // Sampled along the way, not just at the end: two runs that diverge and
       // then happen to land on the same score would slip past a single check.
       if (i % 90 === 0) marks.push(fingerprint(game.snapshot()))
@@ -1672,6 +1676,287 @@ function firstDifference(a: string, b: string): string {
     if (left[i] !== right[i]) return `diverged at mark ${i}: "${left[i]}" vs "${right[i]}"`
   }
   return 'identical'
+}
+
+/**
+ * A run is a function of its seed and its control stream, and of nothing else.
+ *
+ * Phase A established that a run replays from its seed given the same *device*
+ * state. This is the stronger claim the netcode actually rests on: that the
+ * simulation can be driven by controls alone, with no input device anywhere in
+ * the loop. A host replaying a client's inputs, a server validating a submitted
+ * run, and a client predicting ahead of a snapshot are all this same operation.
+ *
+ * The recording run flies an autopilot; the replay run has no autopilot, no
+ * `Input`, and no `Pilot` — just a list of structs handed to `step`. If anything
+ * in the simulation still reached for a device, the two would part company.
+ */
+/**
+ * The simulation defends itself against the controls it is handed.
+ *
+ * `Controls` is becoming a wire format, so the airframe has to be the thing that
+ * bounds deflection rather than trusting every producer to have done it. Both
+ * producers that exist today already clamp — the AI in `ai.ts`, the device in
+ * `input.ts`, where roll is built from two keys and can only be -1, 0 or 1 — so
+ * these assertions describe a bound that changes no run that exists. That is the
+ * point: it is a relocation of an existing guarantee to somewhere a stranger's
+ * browser cannot get underneath it.
+ */
+function testTheAirframeCannotBeAskedToExceedItself(): void {
+  section('Deflection is bounded by the airframe, not by the caller')
+
+  function flownFor(ticks: number, c: Partial<Controls>): THREE.Quaternion {
+    const bolts = createBolts()
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+    const ship = new Ship(SHIPS.wasp, 'player')
+    ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+    ship.warpTimer = 0
+    for (let i = 0; i < ticks; i++) ship.step(controls(c), STEP, ctx)
+    const out = ship.quaternion.clone()
+    bolts.dispose()
+    ship.dispose()
+    return out
+  }
+
+  const TICKS = 30
+  const legal = flownFor(TICKS, { pitch: 1 })
+
+  for (const [name, absurd] of [
+    ['pitch', { pitch: 1000 }],
+    ['yaw', { yaw: 1000 }],
+    ['roll', { roll: 1000 }],
+  ] as const) {
+    const bounded = flownFor(TICKS, absurd)
+    const reference = flownFor(TICKS, { [name]: 1 } as Partial<Controls>)
+    check(
+      `a wildly out-of-range ${name} turns no faster than full deflection`,
+      bounded.angleTo(reference) < 1e-9,
+      `${bounded.angleTo(reference)} rad apart`,
+    )
+  }
+
+  // Guards the three above: if full deflection did nothing, they would all pass
+  // by comparing one stationary hull against another.
+  check(
+    'full deflection actually turns the hull',
+    legal.angleTo(new THREE.Quaternion()) > 0.5,
+    `turned ${legal.angleTo(new THREE.Quaternion())} rad`,
+  )
+
+  // Negative side too — clamping only the upper bound is a classic half-fix.
+  const under = flownFor(TICKS, { pitch: -1000 })
+  const underRef = flownFor(TICKS, { pitch: -1 })
+  check('the lower bound is clamped as well', under.angleTo(underRef) < 1e-9)
+
+  /*
+   * A value that is not a number is worse than one that is out of range, and
+   * the ordinary clamp does not stop it: `Math.max`/`Math.min` propagate `NaN`.
+   * It reaches the quaternion, the quaternion reaches the position, and nothing
+   * later puts it back — so this flies poisoned ticks and then *honest* ones,
+   * and asserts the hull recovered. Asserting only during the bad ticks would
+   * miss the part that matters, which is that there is no way home.
+   *
+   * `undefined` is in the list because a missing field is the accidental route
+   * to the same place: no malice needed, just a truncated packet.
+   */
+  function survives(label: string, c: Partial<Controls>): void {
+    const bolts = createBolts()
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+    const ship = new Ship(SHIPS.wasp, 'player')
+    ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+    ship.warpTimer = 0
+
+    for (let i = 0; i < 5; i++) ship.step(controls(c), STEP, ctx)
+    // Honest input again. A hull that cannot recover is out of the match.
+    for (let i = 0; i < 5; i++) ship.step(controls({ throttle: 0.6 }), STEP, ctx)
+
+    const finite =
+      Number.isFinite(ship.position.x) &&
+      Number.isFinite(ship.position.y) &&
+      Number.isFinite(ship.position.z) &&
+      Number.isFinite(ship.quaternion.w) &&
+      Number.isFinite(ship.speed)
+    check(
+      `a hull survives ${label} and flies again`,
+      finite,
+      `pos=(${ship.position.x},${ship.position.y},${ship.position.z}) quat.w=${ship.quaternion.w} speed=${ship.speed}`,
+    )
+    bolts.dispose()
+    ship.dispose()
+  }
+
+  survives('a NaN pitch', { pitch: NaN })
+  survives('a NaN yaw', { yaw: NaN })
+  survives('a NaN roll', { roll: NaN })
+  survives('a NaN throttle', { throttle: NaN })
+  survives('a missing pitch', { pitch: undefined as unknown as number })
+  survives('a missing throttle', { throttle: undefined as unknown as number })
+
+  /*
+   * Infinity is a different problem from NaN and must still *clamp*, not be
+   * zeroed. This assertion exists to catch one specific tidy-up: rewriting the
+   * guard in `Ship`'s `clamp` as `Number.isFinite(v) ? … : 0`, which is the
+   * obvious spelling and is wrong. It rejects infinities too, so it would take
+   * an input the plain clamp already bounded correctly and silently neutralise
+   * it — a regression hiding inside the hardening fix for a different one.
+   *
+   * That exact rewrite was proposed and this check is what caught it. If it is
+   * ever the only failure in the suite, the guard has been "simplified".
+   */
+  const infinite = flownFor(TICKS, { pitch: Infinity })
+  check('an infinite deflection clamps to full rather than to neutral', infinite.angleTo(legal) < 1e-9)
+}
+
+/**
+ * `step` must not retain the struct it is handed.
+ *
+ * `Pilot` returns the same object every call rather than allocating sixty times
+ * a second, so anything the game keeps a reference to is a live view of the
+ * device, not a record of the tick. `game.ts` kept exactly that reference, and
+ * the HUD read whatever the stick was doing later instead of what was flown.
+ *
+ * Harmless while `advance` and `step` are paired, and wrong the moment they are
+ * not — which is every use phase B has for this: a host buffering `inputs[tick]`
+ * would collect N aliases of one object and replay the last tick N times.
+ */
+function testStepDoesNotRetainCallerControls(): void {
+  section('The simulation copies the controls it is handed')
+
+  let reported = -1
+  const hud = stubHud()
+  hud.update = (state) => {
+    reported = state.throttle
+  }
+
+  const game = createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input: stubInput(),
+    audio: silentAudio(),
+    hud,
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  game.start('hornet', 0xa11a5)
+
+  // One mutable struct, reused — exactly what `Pilot` hands over.
+  const shared = controls({ throttle: 0.9 })
+  game.step(shared)
+
+  // The producer moves on, as a pilot does every single tick.
+  shared.throttle = 0.1
+  shared.pitch = -1
+
+  game.render(1, STEP)
+  check(
+    'the HUD reports the throttle that was flown, not the one since written',
+    reported === 0.9,
+    `reported ${reported}`,
+  )
+}
+
+function testARunReplaysFromRecordedControls(): void {
+  section('A run replays from its recorded controls alone')
+
+  const SEED = 0xc0ffee
+  const TICKS = Math.ceil(10 / STEP)
+
+  function fingerprint(run: RunSnapshot | null): string {
+    if (!run) return 'none'
+    const t = run.target
+    return [
+      run.score,
+      run.kills,
+      run.shotsFired,
+      run.playerHull,
+      run.playerSpeed,
+      run.enemiesAirborne,
+      t ? `${t.yaw},${t.pitch},${t.range}` : 'nolock',
+    ].join(' ')
+  }
+
+  /**
+   * The game still takes an `Input` for pointer-lock prompts and pause
+   * handling, and which one it gets is load-bearing for this check.
+   *
+   * The recording run is handed the *same* device the autopilot is driving, as
+   * `main.ts` does. The replay run is handed a dead one. So if any part of the
+   * simulation still reached past its controls to the device, the two runs would
+   * see different sticks and diverge. Give both a fresh stub and that hole
+   * closes invisibly — both read zeros, both agree, and the check passes while
+   * proving nothing. That is how the first version of this was written.
+   */
+  function newGame(device: Input) {
+    return createGame({
+      scene: new THREE.Scene(),
+      camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+      environment: stubEnvironment(),
+      input: device,
+      audio: silentAudio(),
+      hud: stubHud(),
+      bestScoreFor: () => 0,
+      onEnd: () => {},
+    })
+  }
+
+  /* ---- Record: a real device, a real pilot, an autopilot at the stick ---- */
+
+  const input = stubInput()
+  const pilot = createPilot()
+  const recorded: Controls[] = []
+  const recording = newGame(input)
+  recording.start('hornet', SEED)
+
+  for (let i = 0; i < TICKS; i++) {
+    const target = recording.snapshot()?.target ?? null
+    if (target) {
+      input.write.pitch = clampTo(target.pitch * 3, -1, 1)
+      input.write.yaw = clampTo(target.yaw * 3, -1, 1)
+      input.write.fire = Math.abs(target.pitch) < 0.35 && Math.abs(target.yaw) < 0.35
+      input.write.throttleUp = target.range > 260
+      input.write.throttleDown = target.range < 170
+    } else {
+      input.write.pitch = 0
+      input.write.yaw = 0
+      input.write.fire = false
+      input.write.throttleUp = true
+      input.write.throttleDown = false
+    }
+    const c = pilot.advance(input.state, STEP)
+    // Copied, not referenced: `Pilot` reuses one struct across ticks, so
+    // storing it directly would record the same object sixty times a second.
+    recorded.push({ ...c })
+    recording.step(c)
+  }
+
+  const live = fingerprint(recording.snapshot())
+
+  /* ---- Replay: no device, no pilot, no autopilot ------------------------- */
+
+  // A dead device: nothing ever writes to it.
+  const replay = newGame(stubInput())
+  replay.start('hornet', SEED)
+  for (const c of recorded) replay.step(c)
+
+  const replayed = fingerprint(replay.snapshot())
+
+  check('the recorded stream is the whole run', recorded.length === TICKS, `${recorded.length} ticks`)
+  check('the recorded run was a real fight', live.includes('nolock') === false, live)
+  check('replaying the controls reproduces the run', live === replayed, `${live}  vs  ${replayed}`)
+
+  /* A different stream against the same seed must diverge, or the comparison
+     above would hold for a simulation that ignored its controls entirely. */
+  const idle = newGame(stubInput())
+  idle.start('hornet', SEED)
+  const neutral: Controls = { ...recorded[0], pitch: 0, yaw: 0, roll: 0, fire: false, dash: false }
+  for (let i = 0; i < TICKS; i++) idle.step(neutral)
+  check(
+    'a different control stream is a different run',
+    fingerprint(idle.snapshot()) !== live,
+    'idle stream produced the same run as the autopilot',
+  )
 }
 
 /**
@@ -1970,6 +2255,7 @@ function testOneFrameDepictsOneInstant(): void {
   const scene = new THREE.Scene()
   const camera = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
   const input = stubInput()
+  const pilot = createPilot()
   const hud = recordingHud()
   const game = createGame({
     scene,
@@ -1987,7 +2273,7 @@ function testOneFrameDepictsOneInstant(): void {
   input.write.pitch = 0.5
   input.write.yaw = -0.3
   input.write.fire = true
-  for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step()
+  for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step(pilot.advance(input.state, STEP))
 
   const flight = midpointCheck(
     scene,
@@ -2042,6 +2328,7 @@ function testOneFrameDepictsOneInstant(): void {
   const dyingScene = new THREE.Scene()
   const dyingCamera = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
   const dyingInput = stubInput()
+  const dyingPilot = createPilot()
   const dyingGame = createGame({
     scene: dyingScene,
     camera: dyingCamera,
@@ -2057,7 +2344,7 @@ function testOneFrameDepictsOneInstant(): void {
   dyingInput.write.throttleUp = true
   let reachedDying = false
   for (let i = 0; i < Math.ceil(30 / STEP) && !reachedDying; i++) {
-    dyingGame.step()
+    dyingGame.step(dyingPilot.advance(dyingInput.state, STEP))
     reachedDying = dyingGame.dying
   }
 
@@ -2066,7 +2353,7 @@ function testOneFrameDepictsOneInstant(): void {
     // One more tick so the wreck has drift to interpolate across, and so this
     // lands inside `WRECK_TUMBLE` while the hull is still on screen and the
     // camera is still locked to it.
-    dyingGame.step()
+    dyingGame.step(dyingPilot.advance(dyingInput.state, STEP))
     const cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
     /* As above, this is the detector rather than a sanity check: a wreck pinned
        to the raw tick pose never moves between 0 and 1, so the midpoint below
@@ -2124,6 +2411,9 @@ testPickups()
 testARunCanBeWon()
 testDeathPlaysBeforeTheDebrief()
 testASeededRunReproduces()
+testARunReplaysFromRecordedControls()
+testTheAirframeCannotBeAskedToExceedItself()
+testStepDoesNotRetainCallerControls()
 testTheStepClockNeverLosesTime()
 testOneFrameDepictsOneInstant()
 

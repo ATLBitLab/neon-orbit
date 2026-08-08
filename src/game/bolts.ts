@@ -102,6 +102,34 @@ export function createBolts(): Bolts {
 
   const mesh = new THREE.InstancedMesh(geometry, material, MAX_BOLTS)
   mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+
+  /*
+   * Culling off, deliberately — three.js defaults this to `true`.
+   *
+   * The bounding sphere of an `InstancedMesh` is computed **lazily and exactly
+   * once**: `Frustum.intersectsObject` and `WebGLRenderer` both guard with
+   * `if (object.boundingSphere === null) object.computeBoundingSphere()`, and
+   * nothing invalidates it when instance matrices change. Writing four hundred
+   * new matrices every frame does not mark it stale.
+   *
+   * So with culling on, the sphere is whatever the pool looked like on the
+   * first frame the renderer happened to ask — which in a match is an idle one,
+   * before anyone has fired. Inactive slots are parked at the origin with
+   * `makeScale(0, 0, 0)`, so that snapshot is a **degenerate point at the world
+   * origin, radius zero, frozen for the session**. Measured: twelve bolts in
+   * flight at z = -1500 and the sphere still reads centre (0,0,0) r=0 until
+   * something calls `computeBoundingSphere` by hand.
+   *
+   * `ARENA_RADIUS` is 3400 — a radius, so 6800 across — and the origin is out
+   * of frustum most of the time. The failure is not "bounds too loose to be
+   * useful"; it is every bolt on screen vanishing while the pool is culled
+   * against a point nobody is looking at. Measured: an r=0 sphere at the origin
+   * fails `Frustum.intersectsSphere` from any camera not pointed at it.
+   *
+   * That makes the obvious fix — recompute the bounds each frame — a real
+   * option rather than a mistake, at the cost of walking the pool per frame.
+   * It is simply not worth it here for a mesh that is nearly always on screen.
+   */
   mesh.frustumCulled = false
   mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_BOLTS * 3), 3)
   mesh.instanceColor.setUsage(THREE.DynamicDrawUsage)

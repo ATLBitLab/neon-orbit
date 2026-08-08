@@ -37,6 +37,7 @@ import {
 import { EnemyPilot } from './ai'
 import { createBolts, type Bolts } from './bolts'
 import { createChaseCamera, type ChaseCamera } from './chase'
+import { LAUNCH_THROTTLE } from './controls'
 import { createFx, type Fx } from './fx'
 import type { Hud, HudContact, HudTarget } from './hud'
 import { Ship, type Controls, type ShipContext } from './ship'
@@ -66,8 +67,6 @@ const SPAWN_INTERVAL = 1.9
 /** Seconds of grace before the first enemy arrives. */
 const OPENING_CALM = 2.6
 
-const THROTTLE_UP_RATE = 0.85
-const THROTTLE_DOWN_RATE = 1.15
 /** Hull fraction below which the HUD goes red and the alarm sounds. */
 const CRITICAL_HULL = 0.25
 
@@ -162,12 +161,19 @@ export interface Game {
    */
   start(shipId: ShipId, seed?: number): void
   /**
-   * Advance the simulation by exactly one fixed tick. Deliberately takes no
-   * argument: a caller that could pass its own `dt` could also pass a large one
-   * and cover more ground per frame, which is the cheapest cheat there is and
-   * the reason the loop owns the step size rather than the frame.
+   * Advance the simulation by exactly one fixed tick, flying the local ship on
+   * `controls`.
+   *
+   * Deliberately takes no `dt`: a caller that could pass its own could pass a
+   * large one and cover more ground per frame, which is the cheapest cheat there
+   * is, and is why the loop owns the step size rather than the frame.
+   *
+   * It does take intent, and that is the point. The simulation is handed what a
+   * pilot wants rather than reaching for a keyboard, so the same tick runs
+   * identically against a device, a recorded stream, or a packet from another
+   * browser. Everything phase B needs hangs off that one substitution.
    */
-  step(): void
+  step(controls: Controls): void
   /**
    * Draw the current simulation state. `alpha` is how far the frame sits
    * between the last two ticks, 0..1. Writes no simulation state, so a headless
@@ -308,15 +314,43 @@ export function createGame(deps: GameDeps): Game {
   /** Hull emissive at the moment of death, cooked toward `WRECK_HOT` from there. */
   const wreckEmissive = new THREE.Color()
 
-  const playerControls: Controls = {
+  /**
+   * A *copy* of the controls the last tick actually flew on, so the HUD reports
+   * the throttle being simulated rather than whatever a device says right now.
+   * On a client those two differ by a round trip.
+   *
+   * Copied rather than referenced, and that is the whole point of it. `Pilot`
+   * returns the same struct every call — sixty allocations a second would be
+   * silly — so retaining the caller's object would make this a live view of the
+   * device, which is exactly the thing it exists not to be. It was a reference
+   * first, and read back as whatever the stick was doing later.
+   *
+   * The general rule, now that `Controls` is becoming a wire format: **`step`
+   * must not retain what it is handed.** A host buffering `inputs[tick]` would
+   * otherwise collect N aliases of one object and replay the last tick N times.
+   */
+  const lastControls: Controls = {
     pitch: 0,
     yaw: 0,
     roll: 0,
-    throttle: 0.6,
+    throttle: LAUNCH_THROTTLE,
     fire: false,
     dash: false,
     aim: null,
     spread: 0,
+  }
+
+  function recordControls(c: Controls): void {
+    lastControls.pitch = c.pitch
+    lastControls.yaw = c.yaw
+    lastControls.roll = c.roll
+    lastControls.throttle = c.throttle
+    lastControls.fire = c.fire
+    lastControls.dash = c.dash
+    lastControls.spread = c.spread
+    // `aim` is a vector the producer owns; the HUD never reads it, so the
+    // reference is not copied and not kept.
+    lastControls.aim = null
   }
 
   const contactBuffer: HudContact[] = []
@@ -422,25 +456,6 @@ export function createGame(deps: GameDeps): Game {
       removed = true
     }
     if (removed) refreshTargets()
-  }
-
-  /* ------------------------------------------------------------------------ */
-  /* Player input                                                             */
-  /* ------------------------------------------------------------------------ */
-
-  function readPlayerControls(dt: number): Controls {
-    const s = input.state
-    const c = playerControls
-
-    if (s.throttleUp) c.throttle = Math.min(1, c.throttle + THROTTLE_UP_RATE * dt)
-    if (s.throttleDown) c.throttle = Math.max(0, c.throttle - THROTTLE_DOWN_RATE * dt)
-
-    c.pitch = s.pitch
-    c.yaw = s.yaw
-    c.roll = s.roll
-    c.fire = s.fire
-    c.dash = s.dash
-    return c
   }
 
   /* ------------------------------------------------------------------------ */
@@ -854,7 +869,7 @@ export function createGame(deps: GameDeps): Game {
    * by simulation timers, so hanging them off the frame rate would make a
    * critical-hull alarm beat faster on a better monitor.
    */
-  function step(): void {
+  function step(controls: Controls): void {
     environment.step(STEP)
 
     if (dying) {
@@ -874,7 +889,8 @@ export function createGame(deps: GameDeps): Game {
     }
 
     /* Player */
-    player.step(readPlayerControls(STEP), STEP, ctx)
+    recordControls(controls)
+    player.step(controls, STEP, ctx)
 
     /* Enemies. Each pilot thinks and immediately steps, so `controls.aim` is
        consumed before the next pilot's turn. */
@@ -1048,7 +1064,7 @@ export function createGame(deps: GameDeps): Game {
       enemiesTotal: PER_ENEMY_TYPE * 2,
       enemiesRemaining: remaining,
       speed: player.velocity.length(),
-      throttle: playerControls.throttle,
+      throttle: lastControls.throttle,
       locked: onTarget(),
       critical,
       reticleNdcX: _reticle.x,
@@ -1144,7 +1160,6 @@ export function createGame(deps: GameDeps): Game {
       nextBlast = 0
       pendingResult = null
       best = deps.bestScoreFor(shipId)
-      playerControls.throttle = 0.6
 
       environment.minefield.reset()
       environment.pickups.reset()

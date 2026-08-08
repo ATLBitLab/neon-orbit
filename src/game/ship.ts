@@ -341,15 +341,41 @@ export class Ship implements BoltTarget {
   private applyRotation(controls: Controls, dt: number): void {
     const turn = this.spec.turnRate * dt
     const roll = this.spec.rollRate * dt
+
+    /*
+     * Deflection is clamped here rather than trusted from the producer.
+     *
+     * Every producer today already stays in range — the AI clamps in
+     * `ai.ts`, the device clamps in `input.ts`, and roll there is built from
+     * two keys so it can only be -1, 0 or 1 — so this changes no run that
+     * exists. It is not redundant, it is a relocation: the bound moves from
+     * "every caller is well behaved" to "the airframe cannot be asked to
+     * exceed itself", and `Controls` is now the shape a stranger's browser
+     * will send. Unclamped, a `pitch` of 1000 is a thousand times the turn
+     * rate the whole three-airframe balance rests on.
+     *
+     * Value bounds belong here because they are free and inert. *Rate* bounds
+     * do not: throttle's ramp is a device-side integration the AI legitimately
+     * bypasses, so enforcing it host-side is a real behaviour decision and
+     * lives with the rest of input validation. See `PLANS/NEON_ORBIT_PHASE_B.md`.
+     */
+    const pitch = clamp(controls.pitch, -1, 1)
+    const yaw = clamp(controls.yaw, -1, 1)
+    const bank = clamp(controls.roll, -1, 1)
+
     // Right-multiplying rotates in the body frame, which is what a stick does.
     // Signs: +Y yaws the nose left and +Z rolls left, so both are negated.
-    _euler.set(controls.pitch * turn, -controls.yaw * turn, -controls.roll * roll, 'YXZ')
+    _euler.set(pitch * turn, -yaw * turn, -bank * roll, 'YXZ')
     _dq.setFromEuler(_euler)
     this.quaternion.multiply(_dq).normalize()
   }
 
   private applyThrottle(controls: Controls, dt: number): void {
-    this.throttle = Math.max(0, Math.min(1, controls.throttle))
+    // Same guard as deflection, and for the same reason: a `NaN` throttle
+    // reaches `speed`, and `speed` reaches `position`, which never comes back.
+    // Zero is the safe reading of "not a number" — the ship coasts down rather
+    // than inheriting a command nobody sent.
+    this.throttle = clamp(controls.throttle, 0, 1)
     const target = this.throttle * this.spec.maxSpeed
     const delta = target - this.speed
     const step = this.spec.accel * dt
@@ -703,4 +729,43 @@ export class Ship implements BoltTarget {
   dispose(): void {
     disposeShipVisual(this.visual)
   }
+}
+
+/**
+ * Bound a commanded value, and reject one that is not a number at all.
+ *
+ * The finite check is not defensive padding — it is the more important half.
+ * An out-of-range deflection is a *cheat*: visible, bounded, and correctable,
+ * because clamping it produces a legal ship. `NaN` is not a cheat, it is
+ * destruction. It propagates through the quaternion into the position, and
+ * every later integration keeps it there: five honest ticks after a single
+ * poisoned one, the hull is still at `NaN` and the participant is gone from the
+ * arena for the rest of the match. There is no recovery path in the flight
+ * model, and if it lands on the host's own ship there is nothing to roll back
+ * to.
+ *
+ * `Math.max`/`Math.min` propagate `NaN` rather than clamping it, so the obvious
+ * clamp does not help.
+ *
+ * And it does not take malice. A *missing* field reads as `undefined` and a
+ * wrong type reads as a string, neither of which is a number at all. JSON
+ * cannot carry `NaN`, but the binary snapshot format at milestone 4 can —
+ * `new Float32Array([NaN])[0]` is `NaN` — so a truncated packet does the same
+ * permanent damage a deliberate one would.
+ *
+ * The guard is deliberately **not** `Number.isFinite`, which is the obvious
+ * spelling and is wrong here: it rejects `Infinity` too, and infinity is a
+ * perfectly clampable request. "Turn as hard as you can" is a legal thing to
+ * ask; the bound is the honest answer. Zeroing it instead would take a hostile
+ * input that the plain clamp already handled correctly and quietly neutralise
+ * it — a regression hiding inside a hardening fix.
+ *
+ * Inert for every producer that exists today, all of which send real numbers in
+ * range.
+ */
+function clamp(v: number, lo: number, hi: number): number {
+  // Not a number at all — missing field, wrong type, or NaN itself.
+  if (typeof v !== 'number' || Number.isNaN(v)) return 0
+  // Finite or infinite, the comparisons below bound it correctly.
+  return v < lo ? lo : v > hi ? hi : v
 }
