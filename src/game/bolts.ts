@@ -120,10 +120,11 @@ export function createBolts(): Bolts {
    * flight at z = -1500 and the sphere still reads centre (0,0,0) r=0 until
    * something calls `computeBoundingSphere` by hand.
    *
-   * The arena is 3400 units across, so the origin is out of frustum most of the
-   * time. The failure is not "bounds too loose to be useful" — it is every bolt
-   * on screen vanishing while the pool is culled against a point nobody is
-   * looking at.
+   * `ARENA_RADIUS` is 3400 — a radius, so 6800 across — and the origin is out
+   * of frustum most of the time. The failure is not "bounds too loose to be
+   * useful"; it is every bolt on screen vanishing while the pool is culled
+   * against a point nobody is looking at. Measured: an r=0 sphere at the origin
+   * fails `Frustum.intersectsSphere` from any camera not pointed at it.
    *
    * That makes the obvious fix — recompute the bounds each frame — a real
    * option rather than a mistake, at the cost of walking the pool per frame.
