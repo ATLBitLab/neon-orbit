@@ -106,20 +106,28 @@ export function createBolts(): Bolts {
   /*
    * Culling off, deliberately — three.js defaults this to `true`.
    *
-   * The first reason is the pool: one mesh spans the whole arena, so its
-   * aggregate bounds are meaningless and culling on them would drop every bolt
-   * at once whenever that sphere left the frustum.
+   * The bounding sphere of an `InstancedMesh` is computed **lazily and exactly
+   * once**: `Frustum.intersectsObject` and `WebGLRenderer` both guard with
+   * `if (object.boundingSphere === null) object.computeBoundingSphere()`, and
+   * nothing invalidates it when instance matrices change. Writing four hundred
+   * new matrices every frame does not mark it stale.
    *
-   * The second reason is not obvious and is the one worth writing down. The
-   * bounding sphere is shared by all four hundred instances, and a single
-   * instance at a non-finite position poisons it — centre and radius both go
-   * `NaN`, verified. With culling off nothing reads it, so the damage stops at
-   * one wasted bolt. Turn culling back on as an optimisation and one malformed
-   * fire direction blanks every bolt on screen.
+   * So with culling on, the sphere is whatever the pool looked like on the
+   * first frame the renderer happened to ask — which in a match is an idle one,
+   * before anyone has fired. Inactive slots are parked at the origin with
+   * `makeScale(0, 0, 0)`, so that snapshot is a **degenerate point at the world
+   * origin, radius zero, frozen for the session**. Measured: twelve bolts in
+   * flight at z = -1500 and the sphere still reads centre (0,0,0) r=0 until
+   * something calls `computeBoundingSphere` by hand.
    *
-   * `Controls.aim` is a fire-direction override and becomes attacker-controlled
-   * at milestone 4, when it starts arriving from strangers. If culling is ever
-   * wanted here, sanitise the direction at the boundary first.
+   * The arena is 3400 units across, so the origin is out of frustum most of the
+   * time. The failure is not "bounds too loose to be useful" — it is every bolt
+   * on screen vanishing while the pool is culled against a point nobody is
+   * looking at.
+   *
+   * That makes the obvious fix — recompute the bounds each frame — a real
+   * option rather than a mistake, at the cost of walking the pool per frame.
+   * It is simply not worth it here for a mesh that is nearly always on screen.
    */
   mesh.frustumCulled = false
   mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_BOLTS * 3), 3)
