@@ -14,11 +14,11 @@
     "check": "npm run typecheck && npm run check:sim && npm run check:balance"
   },
   "dependencies": {
-    "three": "^0.180.0"
+    "three": "^0.185.1"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
-    "@types/three": "^0.180.0",
+    "@types/three": "^0.185.4",
     "typescript": "^5.7.2",
     "vite": "^6.0.7"
   }
