@@ -500,15 +500,48 @@ function testMintingAFactionIsGuarded(): void {
     }
   }
 
-  const zero = mints(0)
-  check('minting from 0 works', zero.ok && zero.value === (FACTION_PLAYER as unknown as number))
-  check('minting a later participant works', mints(3).ok)
+  /*
+   * The identity, across a range, and asserting the *value* rather than merely
+   * that nothing threw.
+   *
+   * `humanFaction(i) === i` is what makes a roster index and a faction
+   * interchangeable, and it is the whole reason the roster can hand out
+   * factions by position. Checking only `ok` lets a mint return the *wrong*
+   * faction silently: `Math.min(index, 2)` collides participants 3, 4 and 5
+   * into one faction — friendly fire then stops them shooting each other, so
+   * late joiners form a mutually invulnerable bloc — and `index === 5 ? -1 : i`
+   * puts participant 5 on the AI side, which is the original bug one index
+   * over. Both passed at 201 ok, exit 0, before this loop existed.
+   *
+   * The previous version asserted the identity at i=0 only while its name
+   * quantified over every valid index. That is the first failure this codebase
+   * ever recorded — a check promising more than it asserts — reappearing in the
+   * assertion labelled as the important one.
+   */
+  /*
+   * A contiguous range, not a hand-picked sample.
+   *
+   * The first version tested [0, 1, 2, 3, 7] — and a mutation that broke
+   * exactly index 5 passed, because 5 was not in the list. The property is
+   * universal over the roster, so sampling it leaves gaps by construction, and
+   * the gap is wherever the next mistake happens to land. Nine indices cost
+   * nothing; picking five costs the one that was skipped.
+   */
+  for (let i = 0; i <= 8; i++) {
+    const m = mints(i)
+    check(`minting index ${i} succeeds`, m.ok, `threw`)
+    check(`minting index ${i} yields exactly ${i}`, m.ok && m.value === i, `got ${m.value}`)
+    check(
+      `index ${i} cannot reach the AI faction`,
+      m.ok && m.value !== (FACTION_AI as unknown as number),
+      `got ${m.value}`,
+    )
+  }
 
-  // The property the guard exists to protect.
-  check(
-    'no valid human index can reach the AI faction',
-    zero.ok && zero.value !== (FACTION_AI as unknown as number),
-  )
+  // Distinctness, which the identity implies but which is the property the
+  // roster actually depends on: no two participants share a faction.
+  const minted = Array.from({ length: 9 }, (_, i) => mints(i).value)
+  check('every index mints a distinct faction', new Set(minted).size === minted.length, minted.join(','))
 }
 
 function testFactionsAreOpenNotTwoSided(): void {
