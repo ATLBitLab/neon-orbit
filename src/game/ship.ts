@@ -24,7 +24,7 @@ import {
   type Hazard,
 } from '../world/environment'
 import { OVERDRIVE_RATE_MULT } from '../world/pickups'
-import type { BoltTarget, Bolts, Team } from './bolts'
+import { FACTION_AI, FACTION_PLAYER, type BoltTarget, type Bolts, type Faction } from './bolts'
 
 export interface Controls {
   /** -1 nose down .. +1 nose up. */
@@ -80,7 +80,7 @@ const _jitter = new THREE.Vector3()
 
 export class Ship implements BoltTarget {
   readonly spec: ShipSpec
-  readonly team: Team
+  readonly faction: Faction
   readonly visual: ShipVisual
   readonly accent: THREE.Color
 
@@ -152,7 +152,7 @@ export class Ship implements BoltTarget {
   private searTimer = 0
 
   onDeath?: (ship: Ship) => void
-  onDamaged?: (ship: Ship, amount: number, from: Team) => void
+  onDamaged?: (ship: Ship, amount: number, from: Faction) => void
   /** Fired instead of `onDamaged` when a Shield ate the hit. */
   onShielded?: (ship: Ship, amount: number) => void
   /** Fired when the hull scrapes a station. */
@@ -168,9 +168,9 @@ export class Ship implements BoltTarget {
    */
   private readonly rng: Rng
 
-  constructor(spec: ShipSpec, team: Team, rng: Rng = unseededRng()) {
+  constructor(spec: ShipSpec, faction: Faction, rng: Rng = unseededRng()) {
     this.spec = spec
-    this.team = team
+    this.faction = faction
     this.rng = rng
     this.hull = spec.maxHull
     this.visual = buildShip(spec)
@@ -482,7 +482,9 @@ export class Ship implements BoltTarget {
         // Kill the inward component and bounce back a little.
         this.velocity.addScaledVector(_normal, -closing * 1.5)
         const impact = Math.abs(closing)
-        this.takeDamage(Math.min(55, 4 + impact * 0.1), this.team === 'player' ? 'enemy' : 'player')
+        // Blamed on "somebody else", which is the one shape that does not
+        // survive more than two factions — see `NOT_ME` below.
+        this.takeDamage(Math.min(55, 4 + impact * 0.1), notMe(this.faction))
         this.onCollide?.(this, impact)
       }
     }
@@ -516,7 +518,7 @@ export class Ship implements BoltTarget {
     // Squared, so the outer edge is a warning you can back out of and the
     // core is unsurvivable rather than the whole zone being uniformly bad.
     const rate = SEAR_DPS * this.solarExposure * this.solarExposure
-    this.takeDamage(rate * elapsed, this.team)
+    this.takeDamage(rate * elapsed, this.faction)
   }
 
   private applyQuirks(controls: Controls, dt: number): void {
@@ -582,7 +584,7 @@ export class Ship implements BoltTarget {
         direction,
         speed: boltSpeed,
         damage: this.spec.damage,
-        team: this.team,
+        faction: this.faction,
         color: this.accent,
       })
     }
@@ -599,7 +601,11 @@ export class Ship implements BoltTarget {
       : this.spec.fireInterval
     this.fireTimer = interval + Math.min(0, this.fireTimer)
     this.shotsFired++
-    ctx.audio.laser(this.team)
+    // Not a faction question. The higher pitch exists so *your own* fire is
+    // pickable out of a swarm, which is about who is listening, not which side
+    // is shooting — a remote human's guns should sound like everyone else's.
+    // Faction cannot express that, so this asks the only question it means.
+    ctx.audio.laser(this.faction === FACTION_PLAYER)
 
     // Heat is charged per shot and Overdrive does not discount it, so a boosted
     // heat gun banks heat twice as fast and reaches the lockout in half the
@@ -621,7 +627,7 @@ export class Ship implements BoltTarget {
     return true
   }
 
-  takeDamage(amount: number, from: Team): void {
+  takeDamage(amount: number, from: Faction): void {
     if (!this.alive || amount <= 0) return
 
     /**
@@ -729,6 +735,25 @@ export class Ship implements BoltTarget {
   dispose(): void {
     disposeShipVisual(this.visual)
   }
+}
+
+/**
+ * Someone other than `faction`, for damage the arena inflicts on its own.
+ *
+ * A station scrape and a mine have no faction, but `takeDamage` wants one, and
+ * blaming the victim would let a ship credit itself. With two sides "the other
+ * one" was well defined. With N it is not, and this function is where that
+ * shows — it can only answer for the two factions that exist today.
+ *
+ * Deliberately preserved rather than fixed. This is what makes chasing a
+ * hostile onto a mine score for you, which the README sells as a tactic, so
+ * changing it here would be a balance change wearing a refactor's clothes. The
+ * real answer is an environment faction plus a scoring rule deciding whether
+ * environment kills count — a match-rules decision, milestone 8 in
+ * `PLANS/NEON_ORBIT_PHASE_B.md`.
+ */
+function notMe(faction: Faction): Faction {
+  return faction === FACTION_PLAYER ? FACTION_AI : FACTION_PLAYER
 }
 
 /**

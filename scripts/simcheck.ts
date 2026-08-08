@@ -15,7 +15,7 @@ import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
-import { createBolts } from '../src/game/bolts'
+import { createBolts, FACTION_AI, FACTION_PLAYER } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
 import { createPilot } from '../src/game/controls'
 import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
@@ -122,10 +122,10 @@ function testPlayerBoltsKillEnemies(): void {
   const bolts = createBolts()
   const ctx: ShipContext = { hazards: [], audio, bolts }
 
-  const player = new Ship(SHIPS.hornet, 'player')
+  const player = new Ship(SHIPS.hornet, FACTION_PLAYER)
   player.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
 
-  const enemy = new Ship(SHIPS.wasp, 'enemy')
+  const enemy = new Ship(SHIPS.wasp, FACTION_AI)
   enemy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -2000))
 
   settle([player, enemy], ctx)
@@ -295,13 +295,13 @@ function testDamageClockDrivesEnemyBars(): void {
   const bolts = createBolts()
   const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
 
-  const player = new Ship(SHIPS.hornet, 'player')
+  const player = new Ship(SHIPS.hornet, FACTION_PLAYER)
   player.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
 
   // A Hornet on the receiving end: six volleys of hull, so it survives every
   // hit this check lands, and a dash quirk rather than the Drone's repair, so
   // nothing quietly refills the hull between assertions.
-  const enemy = new Ship(SHIPS.hornet, 'enemy')
+  const enemy = new Ship(SHIPS.hornet, FACTION_AI)
   enemy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -2000))
 
   settle([player, enemy], ctx)
@@ -397,13 +397,13 @@ function testFriendlyFireIsOff(): void {
   const bolts = createBolts()
   const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
 
-  const shooter = new Ship(SHIPS.drone, 'enemy')
+  const shooter = new Ship(SHIPS.drone, FACTION_AI)
   shooter.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
 
-  const ally = new Ship(SHIPS.wasp, 'enemy')
+  const ally = new Ship(SHIPS.wasp, FACTION_AI)
   ally.spawn(new THREE.Vector3(0, 0, -300), new THREE.Vector3(0, 0, -2000))
 
-  const victim = new Ship(SHIPS.hornet, 'player')
+  const victim = new Ship(SHIPS.hornet, FACTION_PLAYER)
   victim.spawn(new THREE.Vector3(0, 0, -600), new THREE.Vector3(0, 0, -2000))
 
   settle([shooter, ally, victim], ctx)
@@ -434,6 +434,110 @@ function testFriendlyFireIsOff(): void {
   victim.dispose()
 }
 
+
+/**
+ * Factions are open, not a two-sided split wearing a new name.
+ *
+ * The rename from `Team` would be ceremonial if the set still only worked at
+ * two, so this stands up a *third* faction — which is what PvP is: one per
+ * human — and checks the friendly-fire rule holds pairwise rather than
+ * "us and them".
+ *
+ * Nothing in the shipped game creates a third faction yet. That is the point:
+ * this asserts the capability the type now claims, at the moment it is claimed,
+ * rather than waiting for the roster milestone to discover it was never true.
+ */
+function testFactionsAreOpenNotTwoSided(): void {
+  section('Friendly fire is per-faction, and there can be more than two')
+
+  const bolts = createBolts()
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+
+  // Two humans and an NPC: the phase-B arena in miniature.
+  const SECOND_HUMAN = FACTION_PLAYER + 1
+  const alice = new Ship(SHIPS.drone, FACTION_PLAYER)
+  const bob = new Ship(SHIPS.hornet, SECOND_HUMAN)
+  const npc = new Ship(SHIPS.wasp, FACTION_AI)
+  const line = [alice, bob, npc]
+  for (const s of line) s.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  settle(line, ctx)
+
+  const aliceHull = alice.hull
+
+  /*
+   * One volley per pair, stopping at the first confirmed hit.
+   *
+   * Not one line-up, because bolts are consumed on impact: the friendly-fire
+   * test can put a victim behind a bystander only because that bystander is an
+   * *ally* and bolts pass through it. With mutually hostile factions the
+   * nearest ship always blocks, so a single volley cannot reach past it.
+   *
+   * And stopping at first damage rather than at death, so every ship survives
+   * for the pairs tested after it. Three hundred rounds of a Drone kills a
+   * Hornet, and a dead shooter fires nothing — which silently emptied the
+   * volley that matters most here.
+   */
+  function volley(shooter: Ship, target: Ship, place: () => void): boolean {
+    const before = target.hull
+    for (let i = 0; i < 400; i++) {
+      place()
+      shooter.step(controls({ fire: true }), STEP, ctx)
+      bolts.update(STEP, line, [])
+      if (target.hull < before) return true
+    }
+    return false
+  }
+
+  const apart = (s: Ship, y: number) => {
+    s.position.set(0, y, 0)
+    s.velocity.set(0, 0, 0)
+  }
+
+  const humanHitHuman = volley(alice, bob, () => {
+    apart(alice, 0)
+    alice.position.set(0, 0, 0)
+    bob.position.set(0, 0, -300)
+    bob.velocity.set(0, 0, 0)
+    apart(npc, 4000)
+  })
+  const humanHitNpc = volley(alice, npc, () => {
+    alice.position.set(0, 0, 0)
+    alice.velocity.set(0, 0, 0)
+    npc.position.set(0, 0, -300)
+    npc.velocity.set(0, 0, 0)
+    apart(bob, 4000)
+  })
+
+  /*
+   * The discriminating pair: Bob on the NPC, neither of them the player.
+   *
+   * Every other assertion here passes just as well under a two-sided
+   * "us and them" rule, because Alice is the only human and both her targets
+   * are simply not-the-player. Only a shot between two factions that are *both*
+   * non-player separates "same faction" from "same side". Verified by mutation:
+   * restoring a two-sided rule leaves every check but this one green.
+   */
+  const npcHitByOtherNonPlayer = volley(bob, npc, () => {
+    bob.position.set(0, 0, 0)
+    bob.velocity.set(0, 0, 0)
+    npc.position.set(0, 0, -300)
+    npc.velocity.set(0, 0, 0)
+    apart(alice, 4000)
+  })
+
+  check('a human damages another human', humanHitHuman)
+  check('the same human damages an NPC', humanHitNpc)
+  check('two non-player factions can shoot each other', npcHitByOtherNonPlayer,
+    'a two-sided rule would leave this one untouched')
+  check('nobody shot themselves', alice.hull === aliceHull, `alice hull=${alice.hull}/${aliceHull}`)
+  // Guards all four: a shooter that never fired satisfies "unharmed" trivially.
+  check('every volley actually fired', alice.shotsFired > 0 && bob.shotsFired > 0,
+    `alice=${alice.shotsFired} bob=${bob.shotsFired}`)
+
+  bolts.dispose()
+  for (const s of line) s.dispose()
+}
+
 function testBoundaryTurnsShipsAround(): void {
   section('Patrol boundary beats full thrust')
 
@@ -447,7 +551,7 @@ function testBoundaryTurnsShipsAround(): void {
    * and fine — what matters is that it is held near the line and comes back in,
    * not that it is fast while doing so.
    */
-  const radial = new Ship(SHIPS.wasp, 'player')
+  const radial = new Ship(SHIPS.wasp, FACTION_PLAYER)
   radial.spawn(new THREE.Vector3(0, 0, ARENA_RADIUS + 50), new THREE.Vector3(0, 0, ARENA_RADIUS + 5000))
   radial.warpTimer = 0
 
@@ -481,7 +585,7 @@ function testBoundaryTurnsShipsAround(): void {
    * the radial component, so the ship should keep skimming the boundary at real
    * speed rather than grinding to a halt.
    */
-  const oblique = new Ship(SHIPS.wasp, 'player')
+  const oblique = new Ship(SHIPS.wasp, FACTION_PLAYER)
   oblique.spawn(
     new THREE.Vector3(0, 0, ARENA_RADIUS + 20),
     new THREE.Vector3(3000, 0, ARENA_RADIUS + 1200),
@@ -518,7 +622,7 @@ function testQuirks(): void {
   const ctx: ShipContext = { hazards: [], audio, bolts }
 
   /* Wasp: sustained fire must lock the guns out. */
-  const wasp = new Ship(SHIPS.wasp, 'player')
+  const wasp = new Ship(SHIPS.wasp, FACTION_PLAYER)
   wasp.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   wasp.warpTimer = 0
 
@@ -534,10 +638,10 @@ function testQuirks(): void {
   check('overheated guns stop firing', wasp.shotsFired === shotsAtLockout)
 
   /* Drone: hull repairs itself after a quiet spell. */
-  const drone = new Ship(SHIPS.drone, 'enemy')
+  const drone = new Ship(SHIPS.drone, FACTION_AI)
   drone.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   drone.warpTimer = 0
-  drone.takeDamage(80, 'player')
+  drone.takeDamage(80, FACTION_PLAYER)
   const wounded = drone.hull
   for (let i = 0; i < 60 * 2; i++) drone.step(controls(), STEP, ctx)
   check('Drone does not repair inside the delay window', drone.hull === wounded)
@@ -546,7 +650,7 @@ function testQuirks(): void {
   check('repair never exceeds max hull', drone.hull <= drone.spec.maxHull)
 
   /* Hornet: dash adds speed, grants brief immunity, then goes on cooldown. */
-  const hornet = new Ship(SHIPS.hornet, 'player')
+  const hornet = new Ship(SHIPS.hornet, FACTION_PLAYER)
   hornet.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   hornet.warpTimer = 0
   for (let i = 0; i < 30; i++) hornet.step(controls({ throttle: 1 }), STEP, ctx)
@@ -596,7 +700,7 @@ function testSolarSear(): void {
 
   /* ---- A hull parked in the light cooks ---------------------------------- */
 
-  const burning = new Ship(SHIPS.hornet, 'player')
+  const burning = new Ship(SHIPS.hornet, FACTION_PLAYER)
   const deep = SUN_DIRECTION.clone().multiplyScalar(ARENA_RADIUS)
   burning.spawn(deep, new THREE.Vector3(0, 0, 0))
   burning.warpTimer = 0
@@ -627,13 +731,13 @@ function testSolarSear(): void {
 
   /* ---- Damage is not credited as player marksmanship --------------------- */
 
-  const hostile = new Ship(SHIPS.wasp, 'enemy')
+  const hostile = new Ship(SHIPS.wasp, FACTION_AI)
   hostile.spawn(deep, new THREE.Vector3(0, 0, 0))
   hostile.warpTimer = 0
 
   let creditedToPlayer = 0
   hostile.onDamaged = (_self, _amount, from) => {
-    if (from === 'player') creditedToPlayer++
+    if (from === FACTION_PLAYER) creditedToPlayer++
   }
   for (let i = 0; i < 60 * 4 && hostile.alive; i++) {
     hostile.position.copy(deep)
@@ -649,7 +753,7 @@ function testSolarSear(): void {
 
   /* ---- Safe ground stays safe -------------------------------------------- */
 
-  const shaded = new Ship(SHIPS.hornet, 'player')
+  const shaded = new Ship(SHIPS.hornet, FACTION_PLAYER)
   // The anti-sunward patrol line: as far out as a pilot can legally fly, but
   // pointed away from the star.
   const away = SUN_DIRECTION.clone().multiplyScalar(-ARENA_RADIUS)
@@ -665,7 +769,7 @@ function testSolarSear(): void {
 
   /* ---- Materialising ships are not cooked before they can steer ---------- */
 
-  const arriving = new Ship(SHIPS.wasp, 'enemy')
+  const arriving = new Ship(SHIPS.wasp, FACTION_AI)
   arriving.spawn(deep, new THREE.Vector3(0, 0, 0))
   for (let i = 0; i < 30; i++) {
     arriving.position.copy(deep)
@@ -703,7 +807,7 @@ function testBoltPoolDoesNotLeak(): void {
   const bolts = createBolts()
   const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
 
-  const ship = new Ship(SHIPS.wasp, 'player')
+  const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
   ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   ship.warpTimer = 0
 
@@ -1143,7 +1247,7 @@ function testMines(): void {
   const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
 
   const target = field.mines[0]
-  const ship = new Ship(SHIPS.hornet, 'player')
+  const ship = new Ship(SHIPS.hornet, FACTION_PLAYER)
   ship.spawn(target.position.clone(), new THREE.Vector3(0, 0, 0))
   ship.warpTimer = 0
 
@@ -1151,7 +1255,7 @@ function testMines(): void {
 
   const before = ship.hull
   field.detonate(target)
-  ship.takeDamage(MINE_DAMAGE, 'enemy')
+  ship.takeDamage(MINE_DAMAGE, FACTION_AI)
 
   check('detonation damages the ship', ship.hull === before - MINE_DAMAGE, `hull=${ship.hull}`)
   check('a detonated mine is dead', !target.live)
@@ -1164,7 +1268,7 @@ function testMines(): void {
   // The same mine must not keep hurting a ship parked inside its shell.
   const parked = ship.hull
   for (let i = 0; i < 60; i++) {
-    if (field.findContact(ship.position, ship.radius)) ship.takeDamage(MINE_DAMAGE, 'enemy')
+    if (field.findContact(ship.position, ship.radius)) ship.takeDamage(MINE_DAMAGE, FACTION_AI)
     ship.step(controls(), STEP, ctx)
   }
   check('a dead mine cannot re-trigger', ship.hull === parked, `hull=${ship.hull} vs ${parked}`)
@@ -1245,7 +1349,7 @@ function testPickups(): void {
   const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
 
   const repairPad = field.pods.find((p) => p.kind === 'repair')!
-  const ship = new Ship(SHIPS.hornet, 'player')
+  const ship = new Ship(SHIPS.hornet, FACTION_PLAYER)
   ship.spawn(repairPad.position.clone(), new THREE.Vector3(0, 0, 0))
   ship.warpTimer = 0
 
@@ -1264,7 +1368,7 @@ function testPickups(): void {
   // A full hull must not consume the pad.
   check('a pod over a full hull heals nothing', ship.repair(REPAIR_AMOUNT) === 0)
 
-  ship.takeDamage(60, 'enemy')
+  ship.takeDamage(60, FACTION_AI)
   const wounded = ship.hull
   const healed = ship.repair(REPAIR_AMOUNT)
   check('a wounded hull is repaired', healed === REPAIR_AMOUNT, `healed=${healed}`)
@@ -1279,10 +1383,10 @@ function testPickups(): void {
    * timer, so a pod that touched it would mean collecting a heal *postpones*
    * your other heal.
    */
-  const drone = new Ship(SHIPS.drone, 'player')
+  const drone = new Ship(SHIPS.drone, FACTION_PLAYER)
   drone.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   drone.warpTimer = 0
-  drone.takeDamage(120, 'enemy')
+  drone.takeDamage(120, FACTION_AI)
   for (let i = 0; i < 60 * 3; i++) drone.step(controls(), STEP, ctx)
   const clockBefore = drone.sinceHit
   drone.repair(REPAIR_AMOUNT)
@@ -1332,7 +1436,7 @@ function testPickups(): void {
 
   /* ---- Overdrive --------------------------------------------------------- */
 
-  const gunner = new Ship(SHIPS.hornet, 'player')
+  const gunner = new Ship(SHIPS.hornet, FACTION_PLAYER)
   gunner.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   gunner.warpTimer = 0
 
@@ -1341,7 +1445,7 @@ function testPickups(): void {
   // Count shots and total damage over a fixed window, stock and boosted, with
   // the ship pinned — this is the same trick the balance harness uses.
   function fireFor(ship: Ship, seconds: number): { shots: number; damage: number } {
-    const dummy = new Ship(SHIPS.drone, 'enemy')
+    const dummy = new Ship(SHIPS.drone, FACTION_AI)
     dummy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -4000))
     dummy.warpTimer = 0
     let damage = 0
@@ -1391,11 +1495,11 @@ function testPickups(): void {
    * kill thresholds move with it — an earlier version that doubled bolt damage
    * let a boosted Drone delete a Wasp between frames.
    */
-  const boostedBolt = new Ship(SHIPS.drone, 'player')
+  const boostedBolt = new Ship(SHIPS.drone, FACTION_PLAYER)
   boostedBolt.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   boostedBolt.warpTimer = 0
   boostedBolt.engageOverdrive(OVERDRIVE_DURATION)
-  const mark = new Ship(SHIPS.wasp, 'enemy')
+  const mark = new Ship(SHIPS.wasp, FACTION_AI)
   mark.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -4000))
   mark.warpTimer = 0
   let biggestHit = 0
@@ -1440,7 +1544,7 @@ function testPickups(): void {
 
   /* ---- Shield ------------------------------------------------------------ */
 
-  const guarded = new Ship(SHIPS.hornet, 'player')
+  const guarded = new Ship(SHIPS.hornet, FACTION_PLAYER)
   guarded.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   guarded.warpTimer = 0
 
@@ -1457,7 +1561,7 @@ function testPickups(): void {
 
   guarded.engageShield(SHIELD_DURATION)
   const full = guarded.hull
-  guarded.takeDamage(40, 'enemy')
+  guarded.takeDamage(40, FACTION_AI)
   check('a shielded hull takes no damage', guarded.hull === full, `hull=${guarded.hull}`)
   check('the absorbed hit is reported', absorbed === 40, `absorbed=${absorbed}`)
   /**
@@ -1469,7 +1573,7 @@ function testPickups(): void {
   check('a refused hit is not credited as a hit landed', credited === 0, `${credited} credited`)
 
   /* Every damage source, not just bolts. */
-  guarded.takeDamage(MINE_DAMAGE, 'enemy')
+  guarded.takeDamage(MINE_DAMAGE, FACTION_AI)
   check('a shield eats a mine too', guarded.hull === full, `hull=${guarded.hull}`)
 
   /**
@@ -1477,15 +1581,15 @@ function testPickups(): void {
    * nanite timer, so a shielded Drone should keep repairing right through
    * incoming fire — nothing reached its hull.
    */
-  const guardedDrone = new Ship(SHIPS.drone, 'player')
+  const guardedDrone = new Ship(SHIPS.drone, FACTION_PLAYER)
   guardedDrone.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   guardedDrone.warpTimer = 0
-  guardedDrone.takeDamage(120, 'enemy')
+  guardedDrone.takeDamage(120, FACTION_AI)
   for (let i = 0; i < 60 * 8; i++) guardedDrone.step(controls(), STEP, ctx)
   const repairing = guardedDrone.hull
   guardedDrone.engageShield(SHIELD_DURATION)
   for (let i = 0; i < 60; i++) {
-    guardedDrone.takeDamage(10, 'enemy')
+    guardedDrone.takeDamage(10, FACTION_AI)
     guardedDrone.step(controls(), STEP, ctx)
   }
   check(
@@ -1509,7 +1613,7 @@ function testPickups(): void {
   check('shield expires', !guarded.shielded, `${guarded.shieldTimer.toFixed(2)}s left`)
 
   const after = guarded.hull
-  guarded.takeDamage(20, 'enemy')
+  guarded.takeDamage(20, FACTION_AI)
   check('damage lands again once the shield drops', guarded.hull === after - 20, `hull=${guarded.hull}`)
 
   guarded.engageShield(SHIELD_DURATION)
@@ -1708,7 +1812,7 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
   function flownFor(ticks: number, c: Partial<Controls>): THREE.Quaternion {
     const bolts = createBolts()
     const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
-    const ship = new Ship(SHIPS.wasp, 'player')
+    const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
     ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
     ship.warpTimer = 0
     for (let i = 0; i < ticks; i++) ship.step(controls(c), STEP, ctx)
@@ -1762,7 +1866,7 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
   function survives(label: string, c: Partial<Controls>): void {
     const bolts = createBolts()
     const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
-    const ship = new Ship(SHIPS.wasp, 'player')
+    const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
     ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
     ship.warpTimer = 0
 
@@ -2226,7 +2330,7 @@ function testOneFrameDepictsOneInstant(): void {
     direction: new THREE.Vector3(0, 0, -1),
     speed,
     damage: 1,
-    team: 'player',
+    faction: FACTION_PLAYER,
     color: new THREE.Color(0xffffff),
   })
   bolts.update(STEP, [], [])
@@ -2402,6 +2506,7 @@ testPlayerBoltsKillEnemies()
 testHullBarFadeCurve()
 testDamageClockDrivesEnemyBars()
 testFriendlyFireIsOff()
+testFactionsAreOpenNotTwoSided()
 testBoundaryTurnsShipsAround()
 testQuirks()
 testSolarSear()

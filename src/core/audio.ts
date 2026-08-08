@@ -25,7 +25,12 @@ export interface Audio {
   toggleMute(): boolean
   /** Crossfade the background track, or pass null to fade to silence. */
   setMusic(track: MusicTrack | null): void
-  laser(accent: 'player' | 'enemy'): void
+  /**
+   * `local` is whether this is the listener's own ship — not which side fired.
+   * Your guns sit higher so you can pick them out of a swarm; a remote human's
+   * should sound like everyone else's, which is why this is not a faction.
+   */
+  laser(local: boolean): void
   hit(): void
   hullHit(): void
   explosion(big: boolean): void
@@ -147,9 +152,9 @@ export function createAudio(): Audio {
       return muted
     },
 
-    laser(accent) {
-      // Player lasers sit higher so your own fire is distinguishable in a swarm.
-      const base = accent === 'player' ? 1500 : 900
+    laser(local) {
+      // Your own fire sits higher so it is distinguishable in a swarm.
+      const base = local ? 1500 : 900
       tone('square', base, base * 0.28, 0.11, 0.1)
       tone('sawtooth', base * 1.6, base * 0.5, 0.07, 0.045)
     },
