@@ -63,6 +63,30 @@ export const FACTION_PLAYER = 0 as unknown as Faction
  * faction is a deliberate act and `grep humanFaction` finds every one.
  */
 export function humanFaction(index: number): Faction {
+  /*
+   * The brand stops a bare number becoming a faction by accident. This function
+   * is the one place that is allowed on purpose, which makes it the one place
+   * that has to check.
+   *
+   * `humanFaction(-1)` returns `FACTION_AI`, and -1 is what `indexOf` returns
+   * on a miss — so `humanFaction(roster.indexOf(peer))` is a natural-looking
+   * line that quietly puts a human on the NPC side. Friendly fire then makes
+   * that human unable to shoot the AI filler and the filler unable to shoot
+   * back: invulnerable to, and invisible to, exactly the opposition the filler
+   * exists to provide. Silent, and it looks like an AI difficulty bug.
+   *
+   * Throwing rather than substituting, and the contrast with `clamp` in
+   * `ship.ts` is the reason. A non-numeric deflection has an obvious stand-in —
+   * neutral stick, the ship simply does not turn. There is no stand-in for a
+   * participant: any faction picked here is *somebody*, and picking wrong is
+   * the failure above rather than a smaller version of it.
+   */
+  if (!Number.isInteger(index) || index < 0) {
+    throw new RangeError(
+      `humanFaction needs a non-negative integer roster index, got ${index}` +
+        (index === -1 ? ' — an indexOf miss mints FACTION_AI' : ''),
+    )
+  }
   return index as unknown as Faction
 }
 

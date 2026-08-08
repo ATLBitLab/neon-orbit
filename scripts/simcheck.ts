@@ -447,6 +447,53 @@ function testFriendlyFireIsOff(): void {
  * this asserts the capability the type now claims, at the moment it is claimed,
  * rather than waiting for the roster milestone to discover it was never true.
  */
+/**
+ * Minting a faction is guarded, because it is the one hole the brand leaves.
+ *
+ * `Faction` is branded so a bare number cannot become one by accident, which
+ * makes `humanFaction` the single sanctioned cast — and therefore the single
+ * place a bad value gets in. It took anything: `humanFaction(-1)` returned
+ * `FACTION_AI`, and -1 is what `indexOf` returns on a miss.
+ *
+ * The failure it produces is the quiet kind. That human shares a faction with
+ * every NPC, so friendly fire stops them shooting the AI filler and stops the
+ * filler shooting back — invulnerable to and invisible to the opposition it
+ * exists to provide, reading as an AI bug rather than a roster bug.
+ */
+function testMintingAFactionIsGuarded(): void {
+  section('A faction can only be minted from a real roster index')
+
+  function throws(label: string, index: number): void {
+    let threw = false
+    try {
+      humanFaction(index)
+    } catch {
+      threw = true
+    }
+    check(`minting from ${label} is refused`, threw)
+  }
+
+  throws('an indexOf miss (-1)', -1)
+  throws('a negative index', -7)
+  throws('a fractional index', 1.5)
+  throws('NaN', NaN)
+  throws('Infinity', Infinity)
+
+  // The positives, so the guard is not simply rejecting everything — which
+  // would pass all five checks above while breaking every caller.
+  check('minting from 0 works', humanFaction(0) === FACTION_PLAYER)
+  let minted = true
+  try {
+    humanFaction(3)
+  } catch {
+    minted = false
+  }
+  check('minting a later participant works', minted)
+
+  // The property the guard exists to protect.
+  check('no valid human index can reach the AI faction', humanFaction(0) !== FACTION_AI)
+}
+
 function testFactionsAreOpenNotTwoSided(): void {
   section('Friendly fire is per-faction, and there can be more than two')
 
@@ -2611,6 +2658,7 @@ testHullBarFadeCurve()
 testDamageClockDrivesEnemyBars()
 testFriendlyFireIsOff()
 testFactionsAreOpenNotTwoSided()
+testMintingAFactionIsGuarded()
 testBoundaryTurnsShipsAround()
 testQuirks()
 testSolarSear()
