@@ -14,6 +14,7 @@ import { createInput } from './core/input'
 import { createStepClock } from './core/loop'
 import { bestFor, lastShip, recordRun, rememberShip, type RunResult } from './core/scores'
 import { createStage } from './core/stage'
+import { createPilot } from './game/controls'
 import { createGame, STEP } from './game/game'
 import { createHud } from './game/hud'
 import type { ShipId } from './ships/specs'
@@ -59,6 +60,7 @@ function boot() {
   stage.scene.add(environment.group)
 
   const input = createInput(canvas)
+  const pilot = createPilot()
   const audio = createAudio()
   const hud = createHud(overlay)
 
@@ -133,6 +135,9 @@ function boot() {
     rememberShip(id)
     screen = 'flight'
     audio.setMusic('combat')
+    // Back to launch throttle. The pilot outlives any one run, so a fresh
+    // launch has to say so rather than inheriting the last run's last command.
+    pilot.reset()
     game.start(id)
     input.requestPointerLock()
   }
@@ -240,7 +245,11 @@ function boot() {
         // time, so decaying it once per frame would make it recentre faster on
         // a faster display.
         input.update(STEP)
-        game.step()
+        // Reading the device and running the simulation are two steps now, and
+        // this is the seam multiplayer opens: a host would send these controls
+        // as well as flying on them, and a client would fly on controls that
+        // arrived rather than ones it produced.
+        game.step(pilot.advance(input.state, STEP))
       }
       game.render(alpha, frameSeconds)
     }
