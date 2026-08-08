@@ -479,19 +479,36 @@ function testMintingAFactionIsGuarded(): void {
   throws('NaN', NaN)
   throws('Infinity', Infinity)
 
-  // The positives, so the guard is not simply rejecting everything — which
-  // would pass all five checks above while breaking every caller.
-  check('minting from 0 works', humanFaction(0) === FACTION_PLAYER)
-  let minted = true
-  try {
-    humanFaction(3)
-  } catch {
-    minted = false
+  /*
+   * The positives, so the guard is not simply rejecting everything — which
+   * would satisfy all five negatives above while breaking every caller.
+   *
+   * Every one goes through `mints`, and the try/catch is what makes them
+   * *falsifiable* rather than merely present. A bare `humanFaction(0)` here
+   * would throw under a broken guard and take the whole process down before
+   * reaching its own assertion: the mutant is still caught, but by the crash,
+   * and the report says "39 of 201 ran" instead of naming the check. Wrapped,
+   * the same mutation reports `FAIL minting from 0 works` and the suite
+   * finishes. Verified both ways — rejecting only index 3 gives
+   * `exit=1 ok=200 FAIL=1`, naming the assertion.
+   */
+  function mints(index: number): { ok: boolean; value: number } {
+    try {
+      return { ok: true, value: humanFaction(index) as unknown as number }
+    } catch {
+      return { ok: false, value: Number.NaN }
+    }
   }
-  check('minting a later participant works', minted)
+
+  const zero = mints(0)
+  check('minting from 0 works', zero.ok && zero.value === (FACTION_PLAYER as unknown as number))
+  check('minting a later participant works', mints(3).ok)
 
   // The property the guard exists to protect.
-  check('no valid human index can reach the AI faction', humanFaction(0) !== FACTION_AI)
+  check(
+    'no valid human index can reach the AI faction',
+    zero.ok && zero.value !== (FACTION_AI as unknown as number),
+  )
 }
 
 function testFactionsAreOpenNotTwoSided(): void {
