@@ -663,14 +663,28 @@ export function createGame(deps: GameDeps): Game {
   /* Death animation                                                          */
   /* ------------------------------------------------------------------------ */
 
-  /** Contact markers for whatever is still airborne. */
+  /**
+   * Contact markers for whatever is still airborne.
+   *
+   * Reads the *drawn* transform, not the simulation one. The bracket and the
+   * hull bar under it are pinned to a hostile that is itself drawn interpolated,
+   * seen through a camera that is also interpolated — so a marker placed from
+   * the tick pose agrees with its ship only at alpha 1 and swims around it the
+   * rest of the time, by up to `|v| · STEP` — about 7.8 units at a Wasp's top
+   * speed, worst exactly when relative velocity is highest and the bracket is
+   * most useful.
+   *
+   * Callers must therefore run this *after* `syncVisual`, which both call sites
+   * in `render` do. `visual.group.position` is pushed as a live reference, the
+   * same way `enemy.position` was.
+   */
   function refreshContacts(): void {
     contactBuffer.length = 0
     for (const pilot of pilots) {
       const enemy = pilot.ship
       if (!enemy.alive) continue
       contactBuffer.push({
-        position: enemy.position,
+        position: enemy.visual.group.position,
         hullFraction: enemy.hullFraction,
         accent: enemy.spec.accent,
         // The Drone's repair clock, read a second time. It is already exactly

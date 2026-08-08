@@ -742,6 +742,25 @@ function stubHud(): Hud {
 }
 
 /**
+ * A HUD stub that keeps what it was handed.
+ *
+ * The real HUD is DOM and cannot be inspected here, but *what the game tells it*
+ * can be — and that is where the interesting bug lives. A contact bracket is
+ * positioned from whatever `updateContacts` receives, so recording those points
+ * puts an off-scene-graph consumer inside reach of the same invariant check
+ * every mesh already gets. Positions are cloned because the game pushes live
+ * references into the buffer.
+ */
+function recordingHud(): Hud & { contactPoints: THREE.Vector3[] } {
+  const hud = stubHud() as Hud & { contactPoints: THREE.Vector3[] }
+  hud.contactPoints = []
+  hud.updateContacts = (contacts) => {
+    hud.contactPoints = contacts.map((c) => c.position.clone())
+  }
+  return hud
+}
+
+/**
  * A directly-writable input. Unlike the browser's keyboard this gives real
  * proportional deflection, which is what a mouse gives a human player — binary
  * key steering swings past a manoeuvring target and never settles.
@@ -1767,11 +1786,27 @@ function testOneFrameDepictsOneInstant(): void {
    * `frameDt` is zero throughout so the presentation-rate systems — camera
    * smoothing, particles, world spin — cannot move underneath the comparison.
    */
-  function midpointCheck(scene: THREE.Scene, render: (alpha: number) => void) {
+  /**
+   * `extra` exists because the scene graph is not the whole frame, and the
+   * consumers outside it are the ones that get missed.
+   *
+   * The HUD is DOM, not `Object3D`, so a contact bracket placed from the wrong
+   * pose is invisible to `scene.traverse` — and that is exactly where the fourth
+   * instance of this bug turned up, after three had been found and fixed inside
+   * the graph. Anything that positions itself from a ship pose without being a
+   * node in the scene belongs in `extra`, keyed by name.
+   */
+  function midpointCheck(
+    scene: THREE.Scene,
+    render: (alpha: number) => void,
+    extra: () => Map<string, THREE.Vector3> = () => new Map(),
+  ) {
     interface Pose {
       position: THREE.Vector3
-      quaternion: THREE.Quaternion
+      quaternion: THREE.Quaternion | null
     }
+
+    const extraKeys = new Set<string>()
 
     function draw(alpha: number): Map<string, Pose> {
       render(alpha)
@@ -1779,6 +1814,12 @@ function testOneFrameDepictsOneInstant(): void {
       scene.traverse((o) =>
         out.set(o.uuid, { position: o.position.clone(), quaternion: o.quaternion.clone() }),
       )
+      // After the traversal, so a name collision would surface as a failure
+      // rather than silently shadowing a real node.
+      for (const [name, position] of extra()) {
+        extraKeys.add(name)
+        out.set(name, { position: position.clone(), quaternion: null })
+      }
       return out
     }
 
@@ -1787,6 +1828,7 @@ function testOneFrameDepictsOneInstant(): void {
     const atHalf = draw(0.5)
 
     let moved = 0
+    let extraMoved = 0
     let turned = 0
     let disagreed = ''
     for (const [id, a] of at0) {
@@ -1796,9 +1838,10 @@ function testOneFrameDepictsOneInstant(): void {
 
       if (a.position.distanceTo(b.position) >= 1e-6) {
         moved++
+        if (extraKeys.has(id)) extraMoved++
         const want = new THREE.Vector3().lerpVectors(a.position, b.position, 0.5)
         if (!agrees(half.position, want) && !disagreed) {
-          disagreed = `position: drawn ${JSON.stringify(half.position)} want ${JSON.stringify(want)}`
+          disagreed = `${id}: drawn ${JSON.stringify(half.position)} want ${JSON.stringify(want)}`
         }
       }
 
@@ -1809,6 +1852,8 @@ function testOneFrameDepictsOneInstant(): void {
          half-way orientation is *equidistant* from both ends, exactly, with no
          tolerance to justify. Verified against a worst-case tick: the two gaps
          agree to 1e-13 relative. */
+      // `extra` entries are bare points with no orientation of their own.
+      if (!a.quaternion || !b.quaternion || !half.quaternion) continue
       const sweep = a.quaternion.angleTo(b.quaternion)
       if (sweep >= 1e-6) {
         turned++
@@ -1819,7 +1864,7 @@ function testOneFrameDepictsOneInstant(): void {
         }
       }
     }
-    return { moved, turned, disagreed }
+    return { moved, extraMoved, turned, disagreed }
   }
 
   /**
@@ -1925,13 +1970,14 @@ function testOneFrameDepictsOneInstant(): void {
   const scene = new THREE.Scene()
   const camera = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
   const input = stubInput()
+  const hud = recordingHud()
   const game = createGame({
     scene,
     camera,
     environment: stubEnvironment(),
     input,
     audio: silentAudio(),
-    hud: stubHud(),
+    hud,
     bestScoreFor: () => 0,
     onEnd: () => {},
   })
@@ -1943,12 +1989,27 @@ function testOneFrameDepictsOneInstant(): void {
   input.write.fire = true
   for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step()
 
-  const flight = midpointCheck(scene, (alpha) => game.render(alpha, 0))
+  const flight = midpointCheck(
+    scene,
+    (alpha) => game.render(alpha, 0),
+    () => new Map(hud.contactPoints.map((p, i) => [`hud:contact:${i}`, p])),
+  )
   /* Not a sanity check — this is the detector for the "ignores alpha entirely"
      case. Anything pinned to the raw tick pose is identical at 0 and at 1, so it
      never enters the midpoint comparison at all and would pass it vacuously.
      This is the assertion that fails instead. Do not remove it as redundant. */
   check('hulls in flight are moving to compare', flight.moved >= 2, `${flight.moved} moved`)
+  /* The off-graph detector, and it has to count what *moved* rather than what
+     exists. The first version of this asserted only that contacts were present,
+     which a marker pinned to the raw tick pose satisfies perfectly — it is there,
+     it just never varies with alpha, so it never enters the comparison and the
+     check passes on nothing. That is the same vacuous guard this file has now
+     produced twice, once in a check written specifically to prevent it. */
+  check(
+    'HUD contact markers track alpha',
+    flight.extraMoved >= 1,
+    `${hud.contactPoints.length} contacts recorded, ${flight.extraMoved} moved with alpha`,
+  )
   check('hulls in flight are rotating to compare', flight.turned >= 2, `${flight.turned} turned`)
   check('every hull in flight is drawn at one instant', flight.disagreed === '', flight.disagreed)
 
