@@ -1747,6 +1747,54 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
   const under = flownFor(TICKS, { pitch: -1000 })
   const underRef = flownFor(TICKS, { pitch: -1 })
   check('the lower bound is clamped as well', under.angleTo(underRef) < 1e-9)
+
+  /*
+   * A value that is not a number is worse than one that is out of range, and
+   * the ordinary clamp does not stop it: `Math.max`/`Math.min` propagate `NaN`.
+   * It reaches the quaternion, the quaternion reaches the position, and nothing
+   * later puts it back — so this flies poisoned ticks and then *honest* ones,
+   * and asserts the hull recovered. Asserting only during the bad ticks would
+   * miss the part that matters, which is that there is no way home.
+   *
+   * `undefined` is in the list because a missing field is the accidental route
+   * to the same place: no malice needed, just a truncated packet.
+   */
+  function survives(label: string, c: Partial<Controls>): void {
+    const bolts = createBolts()
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+    const ship = new Ship(SHIPS.wasp, 'player')
+    ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+    ship.warpTimer = 0
+
+    for (let i = 0; i < 5; i++) ship.step(controls(c), STEP, ctx)
+    // Honest input again. A hull that cannot recover is out of the match.
+    for (let i = 0; i < 5; i++) ship.step(controls({ throttle: 0.6 }), STEP, ctx)
+
+    const finite =
+      Number.isFinite(ship.position.x) &&
+      Number.isFinite(ship.position.y) &&
+      Number.isFinite(ship.position.z) &&
+      Number.isFinite(ship.quaternion.w) &&
+      Number.isFinite(ship.speed)
+    check(
+      `a hull survives ${label} and flies again`,
+      finite,
+      `pos=(${ship.position.x},${ship.position.y},${ship.position.z}) quat.w=${ship.quaternion.w} speed=${ship.speed}`,
+    )
+    bolts.dispose()
+    ship.dispose()
+  }
+
+  survives('a NaN pitch', { pitch: NaN })
+  survives('a NaN yaw', { yaw: NaN })
+  survives('a NaN roll', { roll: NaN })
+  survives('a NaN throttle', { throttle: NaN })
+  survives('a missing pitch', { pitch: undefined as unknown as number })
+  survives('a missing throttle', { throttle: undefined as unknown as number })
+
+  // Infinity is not the same problem and must still clamp rather than be zeroed.
+  const infinite = flownFor(TICKS, { pitch: Infinity })
+  check('an infinite deflection clamps to full rather than to neutral', infinite.angleTo(legal) < 1e-9)
 }
 
 /**

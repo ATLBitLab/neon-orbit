@@ -371,7 +371,11 @@ export class Ship implements BoltTarget {
   }
 
   private applyThrottle(controls: Controls, dt: number): void {
-    this.throttle = Math.max(0, Math.min(1, controls.throttle))
+    // Same guard as deflection, and for the same reason: a `NaN` throttle
+    // reaches `speed`, and `speed` reaches `position`, which never comes back.
+    // Zero is the safe reading of "not a number" — the ship coasts down rather
+    // than inheriting a command nobody sent.
+    this.throttle = clamp(controls.throttle, 0, 1)
     const target = this.throttle * this.spec.maxSpeed
     const delta = target - this.speed
     const step = this.spec.accel * dt
@@ -727,6 +731,41 @@ export class Ship implements BoltTarget {
   }
 }
 
+/**
+ * Bound a commanded value, and reject one that is not a number at all.
+ *
+ * The finite check is not defensive padding — it is the more important half.
+ * An out-of-range deflection is a *cheat*: visible, bounded, and correctable,
+ * because clamping it produces a legal ship. `NaN` is not a cheat, it is
+ * destruction. It propagates through the quaternion into the position, and
+ * every later integration keeps it there: five honest ticks after a single
+ * poisoned one, the hull is still at `NaN` and the participant is gone from the
+ * arena for the rest of the match. There is no recovery path in the flight
+ * model, and if it lands on the host's own ship there is nothing to roll back
+ * to.
+ *
+ * `Math.max`/`Math.min` propagate `NaN` rather than clamping it, so the obvious
+ * clamp does not help.
+ *
+ * And it does not take malice. A *missing* field reads as `undefined` and a
+ * wrong type reads as a string, neither of which is a number at all. JSON
+ * cannot carry `NaN`, but the binary snapshot format at milestone 4 can —
+ * `new Float32Array([NaN])[0]` is `NaN` — so a truncated packet does the same
+ * permanent damage a deliberate one would.
+ *
+ * The guard is deliberately **not** `Number.isFinite`, which is the obvious
+ * spelling and is wrong here: it rejects `Infinity` too, and infinity is a
+ * perfectly clampable request. "Turn as hard as you can" is a legal thing to
+ * ask; the bound is the honest answer. Zeroing it instead would take a hostile
+ * input that the plain clamp already handled correctly and quietly neutralise
+ * it — a regression hiding inside a hardening fix.
+ *
+ * Inert for every producer that exists today, all of which send real numbers in
+ * range.
+ */
 function clamp(v: number, lo: number, hi: number): number {
+  // Not a number at all — missing field, wrong type, or NaN itself.
+  if (typeof v !== 'number' || Number.isNaN(v)) return 0
+  // Finite or infinite, the comparisons below bound it correctly.
   return v < lo ? lo : v > hi ? hi : v
 }
