@@ -32,8 +32,6 @@ export interface FrameBudget {
 export interface StepClock {
   /** Feed a frame's elapsed real time and get back what to run. */
   advance(elapsedSeconds: number): FrameBudget
-  /** Drop owed time. For resuming from a pause without a burst of catch-up. */
-  reset(): void
 }
 
 /**
@@ -60,10 +58,6 @@ export function createStepClock(step: number, maxFrame: number): StepClock {
       accumulator -= ticks * step
 
       return { ticks, frameSeconds, alpha: accumulator / step }
-    },
-
-    reset() {
-      accumulator = 0
     },
   }
 }

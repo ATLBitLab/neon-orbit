@@ -1728,11 +1728,175 @@ function testTheStepClockNeverLosesTime(): void {
     if (!(a >= 0 && a < 1)) alphaInRange = false
   }
   check('alpha stays in [0, 1)', alphaInRange)
+}
 
-  const resettable = createStepClock(STEP, MAX_FRAME)
-  resettable.advance(STEP * 0.9)
-  resettable.reset()
-  check('reset drops owed time', resettable.advance(STEP * 0.5).ticks === 0)
+/**
+ * Everything drawn in one frame must agree on which instant it depicts.
+ *
+ * This is the invariant behind the whole render half, and it is stricter than
+ * "interpolate the hulls" — which is how it has been broken twice. First bolts
+ * were left on raw tick positions while ships were interpolated. Then the fix
+ * for the chase camera moved the disagreement into the death cutscene: the
+ * camera started interpolating while the wreck it is locked onto did not.
+ *
+ * Both were the same failure. Smoothing one consumer of a shared pose relocates
+ * the mismatch rather than removing it, and the artefact is worse than plain
+ * judder because it is *relative* — two things that should be pinned together
+ * sliding against each other. So the check is on the invariant itself rather
+ * than on any one consumer, and it asserts positions against the arithmetic
+ * they are supposed to be, not against a recorded baseline.
+ */
+function testOneFrameDepictsOneInstant(): void {
+  section('Everything drawn in a frame agrees on one instant')
+
+  const ALPHA = 0.37
+
+  function agrees(actual: THREE.Vector3, want: THREE.Vector3): boolean {
+    return actual.distanceTo(want) < 1e-9
+  }
+
+  /**
+   * Draw the same simulation state at three blends and compare, rather than
+   * reaching into the game for each entity's tick endpoints.
+   *
+   * Interpolation has a property that needs no privileged access to check: with
+   * the simulation held still, whatever is drawn at 0.5 must be the midpoint of
+   * what is drawn at 0 and at 1. Anything that ignores `alpha` collapses all
+   * three onto one point and is caught by the "actually moved" count; anything
+   * that interpolates *differently* from its neighbours fails the midpoint test.
+   * `frameDt` is zero throughout so the presentation-rate systems — camera
+   * smoothing, particles, world spin — cannot move underneath the comparison.
+   */
+  function midpointCheck(scene: THREE.Scene, render: (alpha: number) => void) {
+    function draw(alpha: number): Map<string, THREE.Vector3> {
+      render(alpha)
+      const out = new Map<string, THREE.Vector3>()
+      scene.traverse((o) => out.set(o.uuid, o.position.clone()))
+      return out
+    }
+
+    const at0 = draw(0)
+    const at1 = draw(1)
+    const atHalf = draw(0.5)
+
+    let moved = 0
+    let disagreed = ''
+    for (const [id, p0] of at0) {
+      const p1 = at1.get(id)
+      const half = atHalf.get(id)
+      if (!p1 || !half) continue
+      if (p0.distanceTo(p1) < 1e-6) continue
+      moved++
+      const want = new THREE.Vector3().lerpVectors(p0, p1, 0.5)
+      if (!agrees(half, want) && !disagreed) {
+        disagreed = `drawn ${JSON.stringify(half)} want ${JSON.stringify(want)}`
+      }
+    }
+    return { moved, disagreed }
+  }
+
+  /* ---- Bolts ----------------------------------------------------------- */
+
+  const bolts = createBolts()
+  const origin = new THREE.Vector3(10, -20, 30)
+  const speed = 1450
+  bolts.fire({
+    origin,
+    direction: new THREE.Vector3(0, 0, -1),
+    speed,
+    damage: 1,
+    team: 'player',
+    color: new THREE.Color(0xffffff),
+  })
+  bolts.update(STEP, [], [])
+  bolts.render(ALPHA)
+
+  const boltMatrix = new THREE.Matrix4()
+  bolts.mesh.getMatrixAt(0, boltMatrix)
+  const boltDrawn = new THREE.Vector3().setFromMatrixPosition(boltMatrix)
+  const boltWant = origin.clone().addScaledVector(new THREE.Vector3(0, 0, -1), speed * STEP * ALPHA)
+  // Looser than the hull comparison on purpose: this one round-trips through
+  // the instance matrix, which is a Float32Array, so ~1e-6 of noise is the
+  // storage rather than the maths. Still four orders of magnitude tighter than
+  // the ~24 units a bolt would be out if it ignored alpha entirely.
+  check(
+    'a bolt is drawn at alpha between its last two ticks',
+    boltDrawn.distanceTo(boltWant) < 1e-3,
+    `${JSON.stringify(boltDrawn)} vs ${JSON.stringify(boltWant)}`,
+  )
+  // Guards the assertion above: if the bolt had not moved, the check would pass
+  // for a renderer that ignored alpha entirely.
+  check('the bolt actually travelled', boltDrawn.distanceTo(origin) > 1, `moved ${boltDrawn.distanceTo(origin)}`)
+  bolts.dispose()
+
+  /* ---- Ships in flight -------------------------------------------------- */
+
+  const scene = new THREE.Scene()
+  const input = stubInput()
+  const game = createGame({
+    scene,
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input,
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  game.start('hornet', 0x0a11ce)
+  input.write.throttleUp = true
+  input.write.pitch = 0.5
+  input.write.yaw = -0.3
+  input.write.fire = true
+  for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step()
+
+  const flight = midpointCheck(scene, (alpha) => game.render(alpha, 0))
+  // Player plus the three hostiles that have warped in by eight seconds.
+  check('hulls in flight are moving to compare', flight.moved >= 2, `${flight.moved} moved`)
+  check('every hull in flight is drawn at one instant', flight.disagreed === '', flight.disagreed)
+
+  /* ---- The wreck, mid-cutscene ------------------------------------------ */
+
+  const originalHull = SHIPS.hornet.maxHull
+  SHIPS.hornet.maxHull = 1
+  const dyingScene = new THREE.Scene()
+  const dyingInput = stubInput()
+  const dyingGame = createGame({
+    scene: dyingScene,
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: { ...stubEnvironment(), minefield: armedArena() },
+    input: dyingInput,
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  dyingGame.start('hornet', 0xdead01)
+  dyingInput.write.throttleUp = true
+  let reachedDying = false
+  for (let i = 0; i < Math.ceil(30 / STEP) && !reachedDying; i++) {
+    dyingGame.step()
+    reachedDying = dyingGame.dying
+  }
+
+  check('the run reached the death cutscene', reachedDying)
+  if (reachedDying) {
+    // One more tick so the wreck has drift to interpolate across, and so this
+    // lands inside `WRECK_TUMBLE` while the hull is still on screen and the
+    // camera is still locked to it.
+    dyingGame.step()
+    const cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
+    check('the wreck is moving to compare', cutscene.moved >= 1, `${cutscene.moved} moved`)
+    check(
+      'the wreck is drawn at the same instant as the camera following it',
+      cutscene.disagreed === '',
+      cutscene.disagreed,
+    )
+  }
+
+  SHIPS.hornet.maxHull = originalHull
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1752,6 +1916,7 @@ testARunCanBeWon()
 testDeathPlaysBeforeTheDebrief()
 testASeededRunReproduces()
 testTheStepClockNeverLosesTime()
+testOneFrameDepictsOneInstant()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

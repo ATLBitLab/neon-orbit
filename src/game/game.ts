@@ -768,16 +768,22 @@ export function createGame(deps: GameDeps): Game {
       // Tumble the *visual* only. The chase camera sits in the ship's own frame,
       // so spinning `player.quaternion` would spin the shot instead of the hull
       // and make the last two seconds of the run unwatchable.
+      //
+      // This rotation is the one mesh write the simulation half is allowed, and
+      // it earns the exemption by accumulating: it multiplies into whatever the
+      // mesh already holds rather than being a function of `deathTimer`. Move it
+      // to `render` and the tumble rate becomes frame-rate dependent, which is
+      // the exact thing the fixed step exists to prevent. The wreck's *position*
+      // has no such excuse — it is a plain interpolation, so `render` owns it.
       _spin.set(WRECK_PITCH * dt, WRECK_YAW * dt, WRECK_ROLL * dt)
       _spinQuat.setFromEuler(_spin)
       g.quaternion.multiply(_spinQuat).normalize()
-      g.position.copy(player.position)
 
       player.visual.hullMat.emissive
         .copy(wreckEmissive)
         .lerp(WRECK_HOT, deathTimer / WRECK_TUMBLE)
 
-      if (Math.random() < WRECK_SPARK_RATE * dt) fx.spark(g.position, player.accent, 6)
+      if (Math.random() < WRECK_SPARK_RATE * dt) fx.spark(player.position, player.accent, 6)
     } else if (g.visible) {
       // The ship itself is gone. Debris and cook-offs carry the rest.
       g.visible = false
@@ -947,12 +953,23 @@ export function createGame(deps: GameDeps): Game {
   function render(alpha: number, frameDt: number): void {
     environment.update(frameDt, camera)
 
-    /* The death cutscene. The wreck drives its own transform inside
-       `stepDeathSequence`, so the player is deliberately not synced here —
-       interpolating would fight the tumble — and the instruments stay frozen
-       where `beginDeathSequence` left them. */
+    /* The death cutscene. `syncVisual` is deliberately not called for the
+       player — it would overwrite the accumulated tumble with the ship's own
+       unrotated quaternion — so the wreck's position is interpolated here by
+       hand, at the same `alpha` as everything else in the frame.
+
+       Skipping that is a real artefact rather than a theoretical one: the
+       camera is locked to the wreck, so a wreck sitting on raw tick positions
+       while the camera moves smoothly shimmers against the one thing the player
+       is looking at. The instruments stay frozen where `beginDeathSequence`
+       left them. */
     if (dying) {
       if (player) {
+        player.visual.group.position.lerpVectors(
+          player.prevPosition,
+          player.position,
+          alpha,
+        )
         for (const pilot of pilots) pilot.ship.syncVisual(alpha)
         bolts.render(alpha)
         fx.update(frameDt, camera)

@@ -160,11 +160,21 @@ lever the whole three-airframe design rests on — was not really one number. Ke
 separate: nothing in `step` may read the camera or write a mesh transform, and nothing in
 `render` may write simulation state.
 
-There is exactly one exception, and it is deliberate. `stepDeathSequence` tumbles the wreck's
-mesh from inside `step`. That sequence is a scripted 2.4-second cutscene that begins *after* the
-scoreline is sealed, so it cannot change what a run reports, and its whole design is to move the
-visual without moving the ship the camera is bracketed to. If you add a second exception, be
-this sure about it.
+There is exactly one exception, and it is narrow. `stepDeathSequence` applies the wreck's
+*rotation* to the mesh from inside `step`. It earns that because the tumble accumulates —
+`g.quaternion.multiply(spin)` compounds whatever the mesh already holds rather than being a
+function of elapsed time — so running it per frame would make the tumble rate depend on the
+display, which is the exact thing the fixed step prevents. The wreck's *position* has no such
+excuse and is interpolated in `render` like everything else.
+
+The stronger statement of the rule, and the one worth keeping in mind: **everything drawn in one
+frame must agree on which instant it depicts.** "Interpolate the hulls" is not enough, and has
+been wrong twice — once with bolts left on tick boundaries while ships were smoothed, and once
+with the camera smoothed while the wreck it was locked onto was not. Smoothing one consumer of a
+shared pose relocates the mismatch rather than removing it, and a relative mismatch between two
+things that should be pinned together reads worse than plain judder. `simcheck` asserts the
+invariant directly by drawing one frozen simulation state at three blends and checking the middle
+is the midpoint of the outer two.
 
 **Gameplay randomness comes from the run seed, never `Math.random()`.** `Game.start` takes an
 optional seed and reports it back through `snapshot().seed`. Everything that decides an outcome
