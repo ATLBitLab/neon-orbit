@@ -616,6 +616,11 @@ export function createGame(deps: GameDeps): Game {
         position: enemy.position,
         hullFraction: enemy.hullFraction,
         accent: enemy.spec.accent,
+        // The Drone's repair clock, read a second time. It is already exactly
+        // "seconds since this hull last lost anything", which is the same
+        // question the hull bar's fade asks, and a parallel timer would be a
+        // second thing to remember to reset in `takeDamage`.
+        sinceHit: enemy.sinceHit,
       })
     }
   }

@@ -17,10 +17,61 @@ const MAX_CONTACTS = 8
 /** Fraction of the half-viewport where edge arrows sit. */
 const EDGE_INSET = 0.92
 
+/**
+ * Seconds a hostile's hull bar stays up after the hit that lit it.
+ *
+ * The bar is a record of a hit, not a permanent readout: six of them floating
+ * over the arena for a whole run is instrument clutter you learn to stop
+ * reading, and the bracket they hang off already carries a coarse permanent
+ * hull signal in its own brightness. Fading means the bars that are up are the
+ * fights you are actually in.
+ *
+ * Note what this is *not*. It is not information hiding. `Game.cycleTarget`
+ * walks every live hostile with no damage precondition, and the bottom-right
+ * panel then draws that hull as a number — so the readout is already available
+ * on demand for anything in the arena, touched or not. This is a clutter
+ * budget, and it should be argued for or against on those terms only.
+ */
+export const DAMAGE_BAR_FADE = 5
+/**
+ * Fraction of that window spent at full brightness before the fade begins.
+ *
+ * Without the hold, a re-hit on an already-dim bar only lifts it back to
+ * "slightly less dim" for the frame you are looking at it, and the flash that
+ * is supposed to say *that one connected* is lost. Holding first makes every
+ * hit read as a pop.
+ */
+export const DAMAGE_BAR_HOLD = 0.35
+
+/**
+ * How bright a hull bar is `sinceHit` seconds after its hostile last lost hull.
+ *
+ * The duration lives here rather than arriving in the frame data because it is
+ * a presentation choice, in the same family as `EDGE_INSET` and the bracket
+ * scale curve — not a balance number the HUD would have to reach into the
+ * simulation for.
+ *
+ * Exported for `simcheck`. Everything else about the bar is DOM and has to be
+ * checked in a browser, but this is arithmetic on a number: it is the one place
+ * the requested *shape* — lit on the hit, held, faded out by `DAMAGE_BAR_FADE`
+ * — can be asserted instead of eyeballed.
+ */
+export function barBrightness(sinceHit: number): number {
+  const life = 1 - sinceHit / DAMAGE_BAR_FADE
+  if (life <= 0) return 0
+  return Math.min(1, life / (1 - DAMAGE_BAR_HOLD))
+}
+
 export interface HudContact {
   position: THREE.Vector3
   hullFraction: number
   accent: number
+  /**
+   * Seconds since this hull last took damage, straight off the ship. Raw rather
+   * than pre-faded for the same reason `position` is raw: the game loop reports
+   * what is true, and the HUD decides what that looks like.
+   */
+  sinceHit: number
 }
 
 /** The locked hostile, plus where to aim to actually hit it. */
@@ -274,17 +325,32 @@ export function createHud(parent: HTMLElement): Hud {
   const searGlare = el('div')
   searGlare.id = 'searglare'
 
-  const contacts: { node: HTMLElement; arrow: HTMLElement; bracket: HTMLElement }[] = []
+  // The bar hangs off the marker rather than living in its own overlay so it
+  // inherits the slot's projection for free — one transform per contact per
+  // frame, and the bar cannot drift a frame behind the hull it belongs to.
+  // It carries the player's own hull-gauge classes: "how hurt is that thing"
+  // should read in one colour language wherever it appears.
+  const contacts: {
+    node: HTMLElement
+    arrow: HTMLElement
+    bracket: HTMLElement
+    bar: HTMLElement
+    barFill: HTMLElement
+  }[] = []
   for (let i = 0; i < MAX_CONTACTS; i++) {
     const node = el('div', 'contact')
     const arrow = el('div', undefined, CONTACT_SVG)
     const bracket = el('div', undefined, BRACKET_SVG)
+    const bar = el('div', 'gauge hull contact-hull')
+    const barFill = el('i')
+    bar.append(barFill)
     arrow.style.width = bracket.style.width = '100%'
     arrow.style.height = bracket.style.height = '100%'
     bracket.style.display = 'none'
+    bar.style.display = 'none'
     node.style.display = 'none'
-    node.append(arrow, bracket)
-    contacts.push({ node, arrow, bracket })
+    node.append(arrow, bracket, bar)
+    contacts.push({ node, arrow, bracket, bar, barFill })
     root.append(node)
   }
 
@@ -478,7 +544,13 @@ export function createHud(parent: HTMLElement): Hud {
         slot.node.style.display = 'block'
         slot.node.style.color = `#${contact.accent.toString(16).padStart(6, '0')}`
         // Weakened targets read brighter, so you can pick the finishable one.
-        slot.node.style.opacity = (0.68 + (1 - contact.hullFraction) * 0.32).toFixed(2)
+        // This rides the marker art rather than the slot, because the hull bar
+        // is in the slot too and owns a fade of its own — dimming the whole
+        // node would multiply the two and leave a fresh hit on a healthy
+        // hostile, the loudest thing on screen, drawn at two thirds strength.
+        const marker = (0.68 + (1 - contact.hullFraction) * 0.32).toFixed(2)
+        slot.arrow.style.opacity = marker
+        slot.bracket.style.opacity = marker
 
         if (offscreen) {
           const len = Math.hypot(x, y) || 1
@@ -497,6 +569,21 @@ export function createHud(parent: HTMLElement): Hud {
           slot.node.style.transform = `translate(${px}px, ${py}px) scale(${scale})`
           slot.arrow.style.display = 'none'
           slot.bracket.style.display = 'block'
+        }
+
+        // Hull bar. Lit by the hit itself and faded from there, so it is on
+        // screen exactly while the hostile is worth watching. Off-screen slots
+        // never draw one: the edge marker rotates to point at its contact, and
+        // a bar that rotates with it is a diagonal smear, not a readout.
+        const brightness = offscreen ? 0 : barBrightness(contact.sinceHit)
+        if (brightness > 0) {
+          slot.bar.style.display = 'block'
+          slot.bar.style.opacity = brightness.toFixed(3)
+          slot.barFill.style.width = `${contact.hullFraction * 100}%`
+          slot.bar.classList.toggle('warn', contact.hullFraction <= 0.5 && contact.hullFraction > 0.25)
+          slot.bar.classList.toggle('crit', contact.hullFraction <= 0.25)
+        } else {
+          slot.bar.style.display = 'none'
         }
       }
     },

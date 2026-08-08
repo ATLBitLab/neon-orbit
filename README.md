@@ -35,6 +35,12 @@ instead of a property of your mouse. Sensitivity and self-centring live at the t
 shot to connect against a target crossing at hundreds of units per second. The bottom-right
 panel shows the locked target's hull and range.
 
+**A hostile that has just been hit wears its hull.** Losing hull lights a bar under that
+hostile's bracket, which fades out over five seconds and snaps back to full brightness on
+every fresh hit. Hostiles you have not touched show nothing, so the bars that are up are the
+fight you are actually in — and for a readout that stays put, lock one and read the
+bottom-right panel. The fade window is `DAMAGE_BAR_FADE` in `src/game/hud.ts`.
+
 ## The three airframes
 
 | | Wasp `SK-09` | Hornet `AV-22` | Drone `BX-40` |
