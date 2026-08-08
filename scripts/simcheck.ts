@@ -15,7 +15,7 @@ import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
-import { createBolts, FACTION_AI, FACTION_PLAYER } from '../src/game/bolts'
+import { createBolts, FACTION_AI, FACTION_PLAYER, humanFaction } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
 import { createPilot } from '../src/game/controls'
 import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
@@ -120,7 +120,7 @@ function testPlayerBoltsKillEnemies(): void {
 
   const audio = silentAudio()
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio, bolts }
+  const ctx: ShipContext = { hazards: [], audio, bolts, localFaction: FACTION_PLAYER }
 
   const player = new Ship(SHIPS.hornet, FACTION_PLAYER)
   player.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
@@ -293,7 +293,7 @@ function testDamageClockDrivesEnemyBars(): void {
   section('The damage clock the hull bars are drawn against')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const player = new Ship(SHIPS.hornet, FACTION_PLAYER)
   player.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
@@ -395,7 +395,7 @@ function testFriendlyFireIsOff(): void {
   section('Bolts never damage their own team')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const shooter = new Ship(SHIPS.drone, FACTION_AI)
   shooter.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
@@ -451,10 +451,10 @@ function testFactionsAreOpenNotTwoSided(): void {
   section('Friendly fire is per-faction, and there can be more than two')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   // Two humans and an NPC: the phase-B arena in miniature.
-  const SECOND_HUMAN = FACTION_PLAYER + 1
+  const SECOND_HUMAN = humanFaction(1)
   const alice = new Ship(SHIPS.drone, FACTION_PLAYER)
   const bob = new Ship(SHIPS.hornet, SECOND_HUMAN)
   const npc = new Ship(SHIPS.wasp, FACTION_AI)
@@ -542,7 +542,7 @@ function testBoundaryTurnsShipsAround(): void {
   section('Patrol boundary beats full thrust')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   /**
    * Worst case: the fastest, grippiest hull, nose pointed *straight* out at full
@@ -619,7 +619,7 @@ function testQuirks(): void {
 
   const bolts = createBolts()
   const audio = silentAudio()
-  const ctx: ShipContext = { hazards: [], audio, bolts }
+  const ctx: ShipContext = { hazards: [], audio, bolts, localFaction: FACTION_PLAYER }
 
   /* Wasp: sustained fire must lock the guns out. */
   const wasp = new Ship(SHIPS.wasp, FACTION_PLAYER)
@@ -675,7 +675,7 @@ function testSolarSear(): void {
 
   const bolts = createBolts()
   const audio = silentAudio()
-  const ctx: ShipContext = { hazards: [], audio, bolts }
+  const ctx: ShipContext = { hazards: [], audio, bolts, localFaction: FACTION_PLAYER }
 
   /* ---- Geometry: the zone has to be reachable, and the star must not ----- */
 
@@ -805,7 +805,7 @@ function testBoltPoolDoesNotLeak(): void {
   section('Bolt pool survives saturation')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
   ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
@@ -1244,7 +1244,7 @@ function testMines(): void {
   /* ---- Contact ---------------------------------------------------------- */
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const target = field.mines[0]
   const ship = new Ship(SHIPS.hornet, FACTION_PLAYER)
@@ -1346,7 +1346,7 @@ function testPickups(): void {
   /* ---- Repair ------------------------------------------------------------ */
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const repairPad = field.pods.find((p) => p.kind === 'repair')!
   const ship = new Ship(SHIPS.hornet, FACTION_PLAYER)
@@ -1811,7 +1811,7 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
 
   function flownFor(ticks: number, c: Partial<Controls>): THREE.Quaternion {
     const bolts = createBolts()
-    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
     const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
     ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
     ship.warpTimer = 0
@@ -1865,7 +1865,7 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
    */
   function survives(label: string, c: Partial<Controls>): void {
     const bolts = createBolts()
-    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
     const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
     ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
     ship.warpTimer = 0
@@ -2079,6 +2079,110 @@ function testARunReplaysFromRecordedControls(): void {
  * fixed step, still look approximately right, and would quietly run the game
  * slower than real time on any display whose refresh is not a multiple of 60.
  */
+/**
+ * A pinned fingerprint of a real run, per airframe.
+ *
+ * Every other check here asserts a *property* — a bound holds, a rule fires, a
+ * seed replays. None of them notice a change that is merely different: a tweak
+ * that shifts every trajectory by a hair leaves them all green.
+ *
+ * Milestones 1 and 2 both claimed "no behaviour change", and both times the
+ * evidence was a probe run by hand and pasted into a message. That evidence
+ * evaporates the moment the terminal closes, and it cannot protect the *next*
+ * change. This bakes it in: a closed-loop autopilot flies a seeded run and the
+ * result is compared against numbers stored in this file.
+ *
+ * It is deliberately the most brittle check in the suite, and that is its job.
+ * If it fails, the question is not "what is wrong with the test" — it is
+ * "which number moved, and did I mean to move it". A retune *should* fail this;
+ * the fix is then to update the baseline in the same commit that explains why,
+ * which puts a behaviour change on the record instead of letting it pass as
+ * green.
+ *
+ * Milestone 3 de-singularises `player` across 135 references. This is the net
+ * under it.
+ */
+function testARunMatchesItsRecordedBaseline(): void {
+  section('A seeded run still flies the way it used to')
+
+  /*
+   * Captured from this harness on `feat/factions`.
+   *
+   * What that does and does not establish, stated precisely because a baseline
+   * invites over-reading. It does *not* independently prove milestone 2 changed
+   * nothing — these numbers were recorded after the change. That proof is
+   * separate: a cross-commit probe against `origin/main` before and after, run
+   * once by me and once by BOLTy, byte-identical on all three airframes.
+   *
+   * What this *does* is carry that property forward. From here on, a change
+   * that shifts a trajectory has to say so.
+   */
+  const BASELINE: Record<string, string> = {
+    hornet:
+      '0/0/0/120/177.65902947694352/0 | 10/0/5/120/346.74667078924824/2 | 70/0/13/120/120.17605570806118/3 | 80/0/28/120/10.756811887398108/3',
+    wasp:
+      '0/0/0/70/235.30300057403224/0 | 55/0/19/70/445.3298881633059/2 | 100/0/59/70/292.3947361912082/3 | 115/0/84/70/442.1328492907095/3',
+    drone:
+      '0/0/0/200/125.05555269793625/0 | 0/0/1/180/207.80567967883238/2 | 20/0/5/175/233.0433285191874/3 | 20/0/7/165/197.12698816305436/3',
+  }
+
+  function fly(ship: ShipId): string {
+    const input = stubInput()
+    const pilot = createPilot()
+    const game = createGame({
+      scene: new THREE.Scene(),
+      camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+      environment: stubEnvironment(),
+      input,
+      audio: silentAudio(),
+      hud: stubHud(),
+      bestScoreFor: () => 0,
+      onEnd: () => {},
+    })
+    game.start(ship, 0xfac7107)
+
+    const marks: string[] = []
+    const ticks = Math.ceil(20 / STEP)
+    for (let i = 0; i < ticks; i++) {
+      const t = game.snapshot()?.target ?? null
+      if (t) {
+        input.write.pitch = clampTo(t.pitch * 3, -1, 1)
+        input.write.yaw = clampTo(t.yaw * 3, -1, 1)
+        input.write.fire = Math.abs(t.pitch) < 0.35 && Math.abs(t.yaw) < 0.35
+        input.write.throttleUp = t.range > 260
+        input.write.throttleDown = t.range < 170
+      } else {
+        input.write.pitch = 0
+        input.write.yaw = 0
+        input.write.fire = false
+        input.write.throttleUp = true
+        input.write.throttleDown = false
+      }
+      game.step(pilot.advance(input.state, STEP))
+      if (i % 300 === 0) {
+        const r = game.snapshot()!
+        marks.push(
+          [r.score, r.kills, r.shotsFired, r.playerHull, r.playerSpeed, r.enemiesAirborne].join('/'),
+        )
+      }
+    }
+    return marks.join(' | ')
+  }
+
+  for (const ship of SHIP_ORDER) {
+    const flown = fly(ship)
+    const expected = BASELINE[ship]
+    if (!expected) {
+      // Recording mode: printed so the constant above can be filled in. Fails
+      // rather than passes, so an unfilled baseline cannot masquerade as one
+      // that matched.
+      check(`a ${ship} run has a recorded baseline`, false, `record this: ${flown}`)
+      continue
+    }
+    check(`a ${ship} run matches its baseline`, flown === expected, `got ${flown}`)
+  }
+}
+
 function testTheStepClockNeverLosesTime(): void {
   section('The fixed-step clock converts frames to ticks without drift')
 
@@ -2520,6 +2624,7 @@ testARunReplaysFromRecordedControls()
 testTheAirframeCannotBeAskedToExceedItself()
 testStepDoesNotRetainCallerControls()
 testTheStepClockNeverLosesTime()
+testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)

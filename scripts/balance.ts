@@ -155,7 +155,7 @@ interface Rig {
 /** Two pinned hulls, attacker nose-on at `RANGE`, nobody flying. */
 function rig(attackerId: ShipId, targetId: ShipId): Rig {
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const attacker = new Ship(SHIPS[attackerId], FACTION_PLAYER)
   attacker.spawn(HOME, DOWNRANGE)
@@ -240,7 +240,7 @@ function measureTtk(attackerId: ShipId, defenderId: ShipId, overdrive = false): 
 /** Seconds to burn up parked at full solar exposure. */
 function measureSearDeath(id: ShipId): number {
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   // Deepest point of the burn that a pilot can actually reach: the inner edge
   // of the sear ramp, where exposure saturates at 1.

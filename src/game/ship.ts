@@ -50,6 +50,19 @@ export interface ShipContext {
   hazards: Hazard[]
   audio: Audio
   bolts: Bolts
+  /**
+   * The faction whose ship this machine is *listening from* — the local
+   * participant, not a side.
+   *
+   * Only presentation reads it, and it exists because "is this mine?" cannot be
+   * answered by a constant. On a host-authoritative client the host assigns
+   * ids, so the participant holding faction 1 would evaluate
+   * `faction === FACTION_PLAYER` as false for its own ship and hear its own
+   * guns at the remote pitch — precisely the failure that moving `laser` off
+   * factions was meant to prevent. Fixing the API and leaving the call site
+   * comparing against a constant just moved the coupling down a level.
+   */
+  localFaction: Faction
 }
 
 export const LOCAL_FORWARD = new THREE.Vector3(0, 0, -1)
@@ -605,7 +618,7 @@ export class Ship implements BoltTarget {
     // pickable out of a swarm, which is about who is listening, not which side
     // is shooting — a remote human's guns should sound like everyone else's.
     // Faction cannot express that, so this asks the only question it means.
-    ctx.audio.laser(this.faction === FACTION_PLAYER)
+    ctx.audio.laser(this.faction === ctx.localFaction)
 
     // Heat is charged per shot and Overdrive does not discount it, so a boosted
     // heat gun banks heat twice as fast and reaches the lockout in half the

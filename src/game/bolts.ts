@@ -21,14 +21,23 @@ import type { Hazard } from '../world/environment'
  * point: PvP gives every human their own faction, so the set has to be open.
  * Today it holds exactly the two values it always did, so no run changes.
  *
- * Deliberately an opaque number rather than a union of names. A union cannot
- * express "one per participant", and nothing switches exhaustively on this —
- * every use is an equality test — so the exhaustiveness a union would buy is
- * not being spent anywhere. What is lost is protection against passing an
- * arbitrary number; what is gained is the ability to have more than two sides,
- * which is the whole of phase B.
+ * Deliberately not a union of names: a union cannot express "one per
+ * participant", and nothing switches exhaustively on this — every use is an
+ * equality test — so the exhaustiveness a union would buy is not spent anywhere.
+ *
+ * Equally deliberately not a bare `number`. It was one for exactly one review
+ * round, and `takeDamage(amount: number, from: Faction)` then had two
+ * interchangeable parameters: `takeDamage(FACTION_AI, 50)` compiled, where the
+ * old string union would have rejected it. That is the function damage
+ * attribution and scoring run through, so the swap is silent and expensive.
+ *
+ * The brand costs nothing at runtime — a `Faction` *is* a number — but a plain
+ * number is no longer a `Faction`, so hull, damage and faction stop being
+ * mutually assignable. New factions are minted through `humanFaction` rather
+ * than by casting at the call site.
  */
-export type Faction = number
+declare const factionBrand: unique symbol
+export type Faction = number & { readonly [factionBrand]: unique symbol }
 
 /**
  * Every NPC shares one faction, deliberately.
@@ -38,13 +47,24 @@ export type Faction = number
  * on. Humans are numbered from zero upward instead, so the two sets cannot
  * collide.
  */
-export const FACTION_AI: Faction = -1
+export const FACTION_AI = -1 as unknown as Faction
 
 /**
  * The local human. In PvP, further participants take 1, 2, … — which is why
  * humans count up from zero and the AI sits below it.
  */
-export const FACTION_PLAYER: Faction = 0
+export const FACTION_PLAYER = 0 as unknown as Faction
+
+/**
+ * The faction for the human at `index` in the roster. Zero is the local player
+ * today; PvP hands out 1, 2, … as participants join.
+ *
+ * A named constructor rather than a cast at each call site, so that minting a
+ * faction is a deliberate act and `grep humanFaction` finds every one.
+ */
+export function humanFaction(index: number): Faction {
+  return index as unknown as Faction
+}
 
 /** Anything a bolt can hit. `Ship` satisfies this structurally. */
 export interface BoltTarget {

@@ -261,7 +261,15 @@ export function createGame(deps: GameDeps): Game {
 
   const chase: ChaseCamera = createChaseCamera(camera)
 
-  const ctx: ShipContext = { hazards: environment.hazards, audio, bolts }
+  // The listener is the local player today. Milestone 3 makes this the roster's
+  // local participant, at which point a client holding any faction hears its own
+  // guns correctly.
+  const ctx: ShipContext = {
+    hazards: environment.hazards,
+    audio,
+    bolts,
+    localFaction: FACTION_PLAYER,
+  }
 
   let player: Ship | null = null
   let pilots: EnemyPilot[] = []
