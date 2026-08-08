@@ -1792,7 +1792,17 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
   survives('a missing pitch', { pitch: undefined as unknown as number })
   survives('a missing throttle', { throttle: undefined as unknown as number })
 
-  // Infinity is not the same problem and must still clamp rather than be zeroed.
+  /*
+   * Infinity is a different problem from NaN and must still *clamp*, not be
+   * zeroed. This assertion exists to catch one specific tidy-up: rewriting the
+   * guard in `Ship`'s `clamp` as `Number.isFinite(v) ? … : 0`, which is the
+   * obvious spelling and is wrong. It rejects infinities too, so it would take
+   * an input the plain clamp already bounded correctly and silently neutralise
+   * it — a regression hiding inside the hardening fix for a different one.
+   *
+   * That exact rewrite was proposed and this check is what caught it. If it is
+   * ever the only failure in the suite, the guard has been "simplified".
+   */
   const infinite = flownFor(TICKS, { pitch: Infinity })
   check('an infinite deflection clamps to full rather than to neutral', infinite.angleTo(legal) < 1e-9)
 }

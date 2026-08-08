@@ -102,6 +102,25 @@ export function createBolts(): Bolts {
 
   const mesh = new THREE.InstancedMesh(geometry, material, MAX_BOLTS)
   mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+
+  /*
+   * Culling off, deliberately — three.js defaults this to `true`.
+   *
+   * The first reason is the pool: one mesh spans the whole arena, so its
+   * aggregate bounds are meaningless and culling on them would drop every bolt
+   * at once whenever that sphere left the frustum.
+   *
+   * The second reason is not obvious and is the one worth writing down. The
+   * bounding sphere is shared by all four hundred instances, and a single
+   * instance at a non-finite position poisons it — centre and radius both go
+   * `NaN`, verified. With culling off nothing reads it, so the damage stops at
+   * one wasted bolt. Turn culling back on as an optimisation and one malformed
+   * fire direction blanks every bolt on screen.
+   *
+   * `Controls.aim` is a fire-direction override and becomes attacker-controlled
+   * at milestone 4, when it starts arriving from strangers. If culling is ever
+   * wanted here, sanitise the direction at the boundary first.
+   */
   mesh.frustumCulled = false
   mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX_BOLTS * 3), 3)
   mesh.instanceColor.setUsage(THREE.DynamicDrawUsage)
