@@ -95,6 +95,18 @@ export const STREAM = {
   spawn: 0x5171,
   /** Per-pilot wander, break timing and dash rolls. Offset by pilot index. */
   pilot: 0x9110,
-  /** Per-ship gun spread. Offset by ship index. */
-  guns: 0x6011,
+  /**
+   * Per-enemy gun spread. Offset by the pilot's arrival index.
+   *
+   * Kept distinct from `playerGuns` rather than sharing a base and letting the
+   * player take index -1 or the enemies start at 1: an off-by-one between two
+   * labels is silent, because two streams that collide still each produce
+   * perfectly good random numbers. The first version of this had exactly that
+   * bug — the player and the first enemy drew the identical sequence — and it
+   * was invisible only because the player's spread is always zero, so it never
+   * drew at all.
+   */
+  enemyGuns: 0x6011,
+  /** The player's gun spread. Zero today, so it never draws — see above. */
+  playerGuns: 0x3d02,
 } as const

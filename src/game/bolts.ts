@@ -63,8 +63,24 @@ interface Bolt {
 export interface Bolts {
   mesh: THREE.InstancedMesh
   fire(req: FireRequest): void
-  /** Advances every bolt and resolves hits. Returns this frame's impacts. */
+  /**
+   * Advances every bolt and resolves hits. Returns this tick's impacts.
+   *
+   * Simulation only — it moves bolts and decides what they hit, and writes
+   * nothing to the mesh. `render` draws the result.
+   */
   update(dt: number, targets: BoltTarget[], hazards: Hazard[]): BoltHit[]
+  /**
+   * Draw the pool, `alpha` of the way from each bolt's last tick position to
+   * its current one.
+   *
+   * Bolts need this as much as hulls do, and arguably more: at 980–1450 units/s
+   * one covers 16–24 units per tick, so drawing them only on tick boundaries
+   * makes them stutter visibly against ships that are being interpolated
+   * smoothly — the one thing on screen moving faster than anything else, and
+   * the one thing not smoothed.
+   */
+  render(alpha: number): void
   clear(): void
   dispose(): void
 }
@@ -112,18 +128,21 @@ export function createBolts(): Bolts {
   const quat = new THREE.Quaternion()
   const dir = new THREE.Vector3()
 
-  function writeInstance(i: number, bolt: Bolt) {
+  function writeInstance(i: number, bolt: Bolt, alpha: number) {
     if (!bolt.active) {
       mesh.setMatrixAt(i, hidden)
       return
     }
     dir.copy(bolt.vel).normalize()
     quat.setFromUnitVectors(FORWARD, dir)
-    basis.position.copy(bolt.pos)
+    // A bolt flies dead straight, so interpolating position alone is exact
+    // rather than an approximation — there is no rotation to blend.
+    basis.position.lerpVectors(bolt.prev, bolt.pos, alpha)
     basis.quaternion.copy(quat)
     basis.scale.set(1, 1, BOLT_LENGTH)
     basis.updateMatrix()
     mesh.setMatrixAt(i, basis.matrix)
+    mesh.instanceColor!.setXYZ(i, bolt.color.r, bolt.color.g, bolt.color.b)
   }
 
   /**
@@ -158,7 +177,6 @@ export function createBolts(): Bolts {
         bolt.damage = req.damage
         bolt.team = req.team
         bolt.color.copy(req.color)
-        mesh.instanceColor!.setXYZ(i, req.color.r, req.color.g, req.color.b)
         return
       }
       // Pool exhausted: drop the shot rather than stealing a live bolt.
@@ -169,15 +187,11 @@ export function createBolts(): Bolts {
 
       for (let i = 0; i < MAX_BOLTS; i++) {
         const bolt = pool[i]
-        if (!bolt.active) {
-          mesh.setMatrixAt(i, hidden)
-          continue
-        }
+        if (!bolt.active) continue
 
         bolt.life -= dt
         if (bolt.life <= 0) {
           bolt.active = false
-          mesh.setMatrixAt(i, hidden)
           continue
         }
 
@@ -224,17 +238,16 @@ export function createBolts(): Bolts {
           }
         }
 
-        if (consumed) {
-          bolt.active = false
-          mesh.setMatrixAt(i, hidden)
-        } else {
-          writeInstance(i, bolt)
-        }
+        if (consumed) bolt.active = false
       }
 
+      return hits
+    },
+
+    render(alpha) {
+      for (let i = 0; i < MAX_BOLTS; i++) writeInstance(i, pool[i], alpha)
       mesh.instanceMatrix.needsUpdate = true
       mesh.instanceColor!.needsUpdate = true
-      return hits
     },
 
     clear() {

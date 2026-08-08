@@ -41,7 +41,6 @@ import { createFx, type Fx } from './fx'
 import type { Hud, HudContact, HudTarget } from './hud'
 import { Ship, type Controls, type ShipContext } from './ship'
 
-/** Hulls of each non-chosen type that make up the squadron. */
 /**
  * Seconds of simulation per tick.
  *
@@ -58,6 +57,7 @@ import { Ship, type Controls, type ShipContext } from './ship'
  */
 export const STEP = 1 / 60
 
+/** Hulls of each non-chosen type that make up the squadron. */
 const PER_ENEMY_TYPE = 3
 /** How many enemies are airborne at once. */
 const MAX_ACTIVE = 3
@@ -382,7 +382,7 @@ export function createGame(deps: GameDeps): Game {
     if (!id || !player) return
 
     const index = pilotsSpawned++
-    const ship = new Ship(SHIPS[id], 'enemy', subRng(runSeed, STREAM.guns + index))
+    const ship = new Ship(SHIPS[id], 'enemy', subRng(runSeed, STREAM.enemyGuns + index))
     pickSpawnPoint(_spawnPos)
     ship.spawn(_spawnPos, player.position)
 
@@ -754,6 +754,12 @@ export function createGame(deps: GameDeps): Game {
       // Coast on the last velocity, so the camera has something to trail rather
       // than a hull that stopped dead in space. Airspeed bleeds with it, which
       // is what walks the camera's speed FOV back down as the wreck slows.
+      // Same start-of-tick snapshot `Ship.step` takes, for the same reason: the
+      // chase camera interpolates the wreck's drift, and without this it would
+      // blend against whatever pose the last living tick left behind.
+      player.prevPosition.copy(player.position)
+      player.prevQuaternion.copy(player.quaternion)
+
       const drag = Math.exp(-WRECK_DRAG * dt)
       player.velocity.multiplyScalar(drag)
       player.speed *= drag
@@ -948,8 +954,9 @@ export function createGame(deps: GameDeps): Game {
     if (dying) {
       if (player) {
         for (const pilot of pilots) pilot.ship.syncVisual(alpha)
+        bolts.render(alpha)
         fx.update(frameDt, camera)
-        chase.update(player, frameDt)
+        chase.update(player, frameDt, alpha)
         refreshContacts()
         hud.updateContacts(contactBuffer, camera)
       }
@@ -969,9 +976,12 @@ export function createGame(deps: GameDeps): Game {
 
     player.syncVisual(alpha)
     for (const pilot of pilots) pilot.ship.syncVisual(alpha)
+    bolts.render(alpha)
 
     fx.update(frameDt, camera)
-    chase.update(player, frameDt)
+    // After `syncVisual`, and at the same blend, so the camera follows the pose
+    // actually on screen rather than the tick-quantized one behind it.
+    chase.update(player, frameDt, alpha)
 
     refreshContacts()
 
@@ -1058,7 +1068,7 @@ export function createGame(deps: GameDeps): Game {
       spawnRng = subRng(runSeed, STREAM.spawn)
 
       const spec = SHIPS[shipId]
-      player = new Ship(spec, 'player', subRng(runSeed, STREAM.guns))
+      player = new Ship(spec, 'player', subRng(runSeed, STREAM.playerGuns))
       player.spawn(PLAYER_SPAWN, PLAYER_SPAWN_LOOK)
       player.onDamaged = (_self, amount) => {
         hud.flashDamage()

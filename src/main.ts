@@ -11,6 +11,7 @@ import './style.css'
 import * as THREE from 'three'
 import { createAudio } from './core/audio'
 import { createInput } from './core/input'
+import { createStepClock } from './core/loop'
 import { bestFor, lastShip, recordRun, rememberShip, type RunResult } from './core/scores'
 import { createStage } from './core/stage'
 import { createGame, STEP } from './game/game'
@@ -222,30 +223,26 @@ function boot() {
   /* ---- Loop ------------------------------------------------------------- */
 
   const clock = new THREE.Clock()
+  const stepClock = createStepClock(STEP, MAX_FRAME)
   let splashCleared = false
-  /** Simulation time owed to the fixed step, carried between frames. */
-  let accumulator = 0
 
   function frame() {
-    const frameDt = Math.min(clock.getDelta(), MAX_FRAME)
+    const { ticks, frameSeconds, alpha } = stepClock.advance(clock.getDelta())
 
     if (screen === 'hangar') {
       // The hangar has no simulation to keep honest — it is a turntable and a
       // set of cards — so it runs straight off the frame.
-      environment.update(frameDt, stage.camera)
-      hangar.update(frameDt)
+      environment.update(frameSeconds, stage.camera)
+      hangar.update(frameSeconds)
     } else {
-      accumulator += frameDt
-      while (accumulator >= STEP) {
+      for (let i = 0; i < ticks; i++) {
         // Sampled per tick, not per frame: the virtual stick self-centres over
         // time, so decaying it once per frame would make it recentre faster on
         // a faster display.
         input.update(STEP)
         game.step()
-        accumulator -= STEP
       }
-      // Whatever is left over is how far past the last tick this frame sits.
-      game.render(accumulator / STEP, frameDt)
+      game.render(alpha, frameSeconds)
     }
 
     stage.render()

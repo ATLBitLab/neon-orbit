@@ -126,7 +126,7 @@ be a coin flip with no tell and no counterplay — see the note at the top of `s
 
 ```
 src/
-  core/     stage (renderer + bloom), input, audio, scores, geo, rng
+  core/     stage (renderer + bloom), input, audio, scores, geo, rng, step clock
   ships/    stat specs, procedural hull geometry
   world/    planet, stations, mines, power-up pods, sky, arena assembly
   game/     flight model, AI, projectiles, effects, camera, HUD, orchestration
@@ -145,15 +145,26 @@ change lands on both sides at once.
 **The simulation runs on a fixed step; rendering runs on the frame.** `Game.step()` advances
 exactly 1/60s and takes no delta — there is deliberately no argument for a caller to vary.
 `Game.render(alpha, frameDt)` draws whatever `step` left behind, where `alpha` is how far the
-frame sits between the last two ticks, and `Ship.syncVisual(alpha)` interpolates the hull
-between them so a display faster than 60 Hz still looks smooth. The loop in `src/main.ts`
-accumulates real time and runs as many ticks as it owes.
+frame sits between the last two ticks. `Ship.syncVisual(alpha)`, `Bolts.render(alpha)` and the
+chase camera all interpolate at that same `alpha`, so a display faster than 60 Hz looks smooth
+and — just as important — everything on screen is smoothed *by the same amount*. A hull drawn
+interpolated against bolts drawn on tick boundaries is worse than either drawn consistently.
+
+`src/core/loop.ts` owns the accumulator that turns irregular frames into whole ticks. It is a
+separate module for one reason: inline in the render loop it was the only load-bearing part of
+the fixed step that no headless test could reach.
 
 The split is what makes the flight model honest: with a variable delta the same stick input
 covered different ground on a 30 Hz laptop and a 144 Hz desktop, so a hull's turn rate — the
 lever the whole three-airframe design rests on — was not really one number. Keep the two halves
-separate. Nothing in `step` may read the camera or write a mesh transform; nothing in `render`
-may write simulation state.
+separate: nothing in `step` may read the camera or write a mesh transform, and nothing in
+`render` may write simulation state.
+
+There is exactly one exception, and it is deliberate. `stepDeathSequence` tumbles the wreck's
+mesh from inside `step`. That sequence is a scripted 2.4-second cutscene that begins *after* the
+scoreline is sealed, so it cannot change what a run reports, and its whole design is to move the
+visual without moving the ship the camera is bracketed to. If you add a second exception, be
+this sure about it.
 
 **Gameplay randomness comes from the run seed, never `Math.random()`.** `Game.start` takes an
 optional seed and reports it back through `snapshot().seed`. Everything that decides an outcome

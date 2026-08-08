@@ -16,10 +16,11 @@ import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
+import { createStepClock } from '../src/core/loop'
 import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
-import { SHIPS } from '../src/ships/specs'
+import { SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
 import {
   ARENA_HARD_LIMIT,
   ARENA_RADIUS,
@@ -1536,6 +1537,13 @@ function testPickups(): void {
  * exactly what the run seed being its own stream now makes irrelevant, so
  * leaving it uncontrolled is part of the test.
  */
+interface Played {
+  /** Fingerprints sampled through the run, joined. */
+  trace: string
+  /** The run as it stood at the last tick, for asserting it was a real fight. */
+  final: RunSnapshot | null
+}
+
 function testASeededRunReproduces(): void {
   section('A seeded run reproduces from its seed')
 
@@ -1558,7 +1566,7 @@ function testASeededRunReproduces(): void {
     ].join(' ')
   }
 
-  function playOut(seed: number, ticks: number): string {
+  function playOut(ship: ShipId, seed: number, ticks: number): Played {
     const input = stubInput()
     const game = createGame({
       scene: new THREE.Scene(),
@@ -1571,7 +1579,7 @@ function testASeededRunReproduces(): void {
       onEnd: () => {},
     })
 
-    game.start('hornet', seed)
+    game.start(ship, seed)
 
     const marks: string[] = []
     for (let i = 0; i < ticks; i++) {
@@ -1594,19 +1602,47 @@ function testASeededRunReproduces(): void {
       // then happen to land on the same score would slip past a single check.
       if (i % 90 === 0) marks.push(fingerprint(game.snapshot()))
     }
-    marks.push(fingerprint(game.snapshot()))
-    return marks.join(' | ')
+    const final = game.snapshot()
+    marks.push(fingerprint(final))
+    return { trace: marks.join(' | '), final }
   }
 
-  const TICKS = Math.ceil(20 / STEP)
-  const first = playOut(0x51ede7, TICKS)
-  const again = playOut(0x51ede7, TICKS)
-  const other = playOut(0x51ede8, TICKS)
+  const TICKS = Math.ceil(14 / STEP)
 
-  check('the same seed replays identically', first === again, firstDifference(first, again))
-  check('a different seed is a different fight', first !== other)
-  // A run that never engaged would compare equal for trivial reasons.
-  check('the replayed run was a real fight', first.includes('nolock') === false || first !== 'none')
+  /**
+   * Every airframe gets a turn, because the squadron is always the *other* two
+   * hulls and the quirks are per-hull. Playing only the Hornet means the enemies
+   * are a Wasp and a Drone, neither of which dashes, so the dash roll in
+   * `EnemyPilot` is never exercised and could quietly go back to `Math.random()`
+   * without failing anything. Rotating the player through all three guarantees
+   * each hull appears on the hostile side at least once.
+   */
+  for (const ship of SHIP_ORDER) {
+    const seed = 0x51ede7
+    const first = playOut(ship, seed, TICKS)
+    const again = playOut(ship, seed, TICKS)
+    const other = playOut(ship, seed + 1, TICKS)
+
+    check(
+      `a ${ship} run replays identically from the same seed`,
+      first.trace === again.trace,
+      firstDifference(first.trace, again.trace),
+    )
+    check(`a ${ship} run differs on a different seed`, first.trace !== other.trace)
+
+    /* Two runs that never engaged would compare equal for entirely
+       uninteresting reasons, so the comparison is only worth something if the
+       run it compared was a real fight. Asserted against the final snapshot
+       rather than against the trace string — the first version of this tested
+       the trace and was vacuously true, which is exactly the failure it was
+       supposed to prevent. */
+    const f = first.final
+    check(
+      `the ${ship} run actually fought`,
+      f !== null && f.shotsFired > 0 && f.enemiesAirborne > 0,
+      f ? `shots=${f.shotsFired}, airborne=${f.enemiesAirborne}` : 'no snapshot',
+    )
+  }
 }
 
 /** Where two fingerprints part company, for a failure message worth reading. */
@@ -1620,53 +1656,83 @@ function firstDifference(a: string, b: string): string {
 }
 
 /**
- * The fixed step is what makes the above possible, so it gets its own check:
- * the simulation must not be able to see how fast the display is running.
+ * The step clock — the piece that converts irregular frames into whole ticks.
  *
- * `Game.step` takes no delta at all, which is the enforcement — there is no
- * argument for a caller to vary. This asserts the consequence: N ticks advance
- * the same distance no matter how the caller groups them into frames. Before
- * this change the equivalent test was impossible to write, because `update(dt)`
- * accepted whatever the frame handed it and a 30 Hz browser genuinely flew a
- * different ship from a 144 Hz one.
+ * This is tested directly rather than through the simulation, because through
+ * the simulation it cannot be tested at all. An earlier version of this check
+ * fed `ship.step(..., STEP, ...)` the same number of times down two code paths
+ * and compared the results; since `step` takes a fixed delta, both paths were
+ * identical by construction and the check could not fail. The accumulator it
+ * meant to cover lives in the render loop, which nothing headless executes.
+ *
+ * So the accumulator moved into `src/core/loop.ts` and is exercised here. The
+ * property that matters is that no owed simulation time is ever silently
+ * dropped: a loop that discarded the remainder each frame would still run at a
+ * fixed step, still look approximately right, and would quietly run the game
+ * slower than real time on any display whose refresh is not a multiple of 60.
  */
-function testTheSimulationIgnoresFrameRate(): void {
-  section('Simulation advances independently of frame pacing')
+function testTheStepClockNeverLosesTime(): void {
+  section('The fixed-step clock converts frames to ticks without drift')
 
-  function flyFor(ticks: number, batches: number[]): { x: number; y: number; z: number } {
-    const bolts = createBolts()
-    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
-    const ship = new Ship(SHIPS.wasp, 'player')
-    ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 200, -1000))
-    ship.warpTimer = 0
+  const MAX_FRAME = 1 / 5
 
-    // `batches` stands in for frames of differing length: the same total number
-    // of ticks, dealt out in uneven groups the way a stuttering display would.
-    let done = 0
-    let b = 0
-    while (done < ticks) {
-      const size = Math.min(batches[b++ % batches.length], ticks - done)
-      for (let i = 0; i < size; i++) {
-        ship.step(controls({ pitch: 0.4, yaw: -0.2, throttle: 1 }), STEP, ctx)
-      }
-      done += size
-    }
+  const even = createStepClock(STEP, MAX_FRAME)
+  check('a frame of exactly one step runs exactly one tick', even.advance(STEP).ticks === 1)
+  check('a frame of half a step runs none', even.advance(STEP / 2).ticks === 0)
+  check('the other half completes the tick', even.advance(STEP / 2).ticks === 1)
 
-    const out = { x: ship.position.x, y: ship.position.y, z: ship.position.z }
-    bolts.dispose()
-    ship.dispose()
-    return out
+  /* The one that catches a dropped remainder. Frames of 1.5 steps must average
+     1.5 ticks; a clock that reset its accumulator every frame would return a
+     steady 1 and lose a third of the game's time without ever looking wrong. */
+  const fractional = createStepClock(STEP, MAX_FRAME)
+  let ticks = 0
+  for (let i = 0; i < 200; i++) ticks += fractional.advance(STEP * 1.5).ticks
+  check('fractional frames carry their remainder', ticks === 300, `ran ${ticks} ticks, expected 300`)
+
+  /* Uneven pacing, the way a real display stutters. Total simulated time must
+     track total real time to within the tick that is still in the accumulator. */
+  const uneven = createStepClock(STEP, MAX_FRAME)
+  const frames = [0.004, 0.021, 0.009, 0.033, 0.016, 0.007, 0.048, 0.011]
+  let unevenTicks = 0
+  let realTime = 0
+  for (let i = 0; i < 500; i++) {
+    const dt = frames[i % frames.length]
+    realTime += dt
+    unevenTicks += uneven.advance(dt).ticks
   }
-
-  const steady = flyFor(600, [1])
-  const stuttering = flyFor(600, [3, 1, 7, 2, 5])
-
+  const expected = Math.floor(realTime / STEP)
   check(
-    'the same tick count lands in the same place however frames are grouped',
-    steady.x === stuttering.x && steady.y === stuttering.y && steady.z === stuttering.z,
-    `${JSON.stringify(steady)} vs ${JSON.stringify(stuttering)}`,
+    'uneven frames simulate real time to within one tick',
+    Math.abs(unevenTicks - expected) <= 1,
+    `ran ${unevenTicks} ticks against ${expected} of real time`,
   )
-  check('the ship actually went somewhere', Math.abs(steady.z) > 100, `z=${steady.z}`)
+
+  /* A frame longer than the clamp drops the excess rather than queueing it.
+     Queueing is what turns one slow frame into a permanently slower game. */
+  const stalled = createStepClock(STEP, MAX_FRAME)
+  const afterStall = stalled.advance(10)
+  check(
+    'a stalled frame is clamped rather than queued',
+    afterStall.ticks === Math.floor(MAX_FRAME / STEP),
+    `ran ${afterStall.ticks} ticks for a 10s frame`,
+  )
+  check('a clamped frame reports the clamped delta', afterStall.frameSeconds === MAX_FRAME)
+
+  /* Alpha is a blend factor and is handed straight to `lerp`/`slerp`. Out of
+     range it would extrapolate rather than interpolate, throwing hulls past
+     where the simulation ever put them. */
+  const blend = createStepClock(STEP, MAX_FRAME)
+  let alphaInRange = true
+  for (let i = 0; i < 500; i++) {
+    const a = blend.advance(frames[i % frames.length]).alpha
+    if (!(a >= 0 && a < 1)) alphaInRange = false
+  }
+  check('alpha stays in [0, 1)', alphaInRange)
+
+  const resettable = createStepClock(STEP, MAX_FRAME)
+  resettable.advance(STEP * 0.9)
+  resettable.reset()
+  check('reset drops owed time', resettable.advance(STEP * 0.5).ticks === 0)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1685,7 +1751,7 @@ testPickups()
 testARunCanBeWon()
 testDeathPlaysBeforeTheDebrief()
 testASeededRunReproduces()
-testTheSimulationIgnoresFrameRate()
+testTheStepClockNeverLosesTime()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)
