@@ -1768,10 +1768,17 @@ function testOneFrameDepictsOneInstant(): void {
    * smoothing, particles, world spin — cannot move underneath the comparison.
    */
   function midpointCheck(scene: THREE.Scene, render: (alpha: number) => void) {
-    function draw(alpha: number): Map<string, THREE.Vector3> {
+    interface Pose {
+      position: THREE.Vector3
+      quaternion: THREE.Quaternion
+    }
+
+    function draw(alpha: number): Map<string, Pose> {
       render(alpha)
-      const out = new Map<string, THREE.Vector3>()
-      scene.traverse((o) => out.set(o.uuid, o.position.clone()))
+      const out = new Map<string, Pose>()
+      scene.traverse((o) =>
+        out.set(o.uuid, { position: o.position.clone(), quaternion: o.quaternion.clone() }),
+      )
       return out
     }
 
@@ -1780,19 +1787,39 @@ function testOneFrameDepictsOneInstant(): void {
     const atHalf = draw(0.5)
 
     let moved = 0
+    let turned = 0
     let disagreed = ''
-    for (const [id, p0] of at0) {
-      const p1 = at1.get(id)
+    for (const [id, a] of at0) {
+      const b = at1.get(id)
       const half = atHalf.get(id)
-      if (!p1 || !half) continue
-      if (p0.distanceTo(p1) < 1e-6) continue
-      moved++
-      const want = new THREE.Vector3().lerpVectors(p0, p1, 0.5)
-      if (!agrees(half, want) && !disagreed) {
-        disagreed = `drawn ${JSON.stringify(half)} want ${JSON.stringify(want)}`
+      if (!b || !half) continue
+
+      if (a.position.distanceTo(b.position) >= 1e-6) {
+        moved++
+        const want = new THREE.Vector3().lerpVectors(a.position, b.position, 0.5)
+        if (!agrees(half.position, want) && !disagreed) {
+          disagreed = `position: drawn ${JSON.stringify(half.position)} want ${JSON.stringify(want)}`
+        }
+      }
+
+      /* Orientation is half of a pose and is checked the same way, but not with
+         the same arithmetic: slerp is not linear in alpha, so the half-way
+         orientation is not the componentwise midpoint of the ends. It is
+         something better — slerp turns at constant angular velocity, so the
+         half-way orientation is *equidistant* from both ends, exactly, with no
+         tolerance to justify. Verified against a worst-case tick: the two gaps
+         agree to 1e-13 relative. */
+      const sweep = a.quaternion.angleTo(b.quaternion)
+      if (sweep >= 1e-6) {
+        turned++
+        const toStart = half.quaternion.angleTo(a.quaternion)
+        const toEnd = half.quaternion.angleTo(b.quaternion)
+        if (Math.abs(toStart - toEnd) > sweep * 1e-3 && !disagreed) {
+          disagreed = `rotation: ${toStart} to start vs ${toEnd} to end, over ${sweep}`
+        }
       }
     }
-    return { moved, disagreed }
+    return { moved, turned, disagreed }
   }
 
   /**
@@ -1804,30 +1831,44 @@ function testOneFrameDepictsOneInstant(): void {
    * the one consumer this whole invariant was discovered through ended up
    * unguarded.
    *
-   * Driven here at a delta large enough that the smoothing factor is exactly 1,
-   * so the camera lands on its ideal pose in a single call. That pose is a pure
-   * function of the drawn ship transform, and therefore of alpha, with no
-   * accumulated state left to drift between the three measurements.
+   * `SNAP` and the two settling calls below are one mechanism, not two
+   * conveniences, and neither works without the other. A delta that large makes
+   * the smoothing factor exactly 1, so the camera lands on its ideal pose in a
+   * single call — a pure function of the drawn ship transform, and therefore of
+   * alpha, with no accumulated state left to drift between measurements. The
+   * same delta drives `shakeAmount *= exp(-6 * dt)` to exactly zero, so the
+   * first call spends whatever camera shake the run accumulated and the second
+   * settles with the shake provably gone rather than merely small. Shake is
+   * applied with `Math.random`, so leaving any of it inside a measurement is how
+   * a check ends up failing once a fortnight — worse than not existing.
    */
   function cameraTracksAlpha(
     camera: THREE.PerspectiveCamera,
     render: (alpha: number, frameDt: number) => void,
   ) {
     const SNAP = 1000
-    // Twice: the first call spends whatever camera shake the run accumulated
-    // (which is applied with `Math.random`, and would otherwise land in a
-    // measurement), the second settles cleanly with the shake already at zero.
     render(0, SNAP)
     render(0, SNAP)
     const c0 = camera.position.clone()
+    const q0 = camera.quaternion.clone()
     render(1, SNAP)
     const c1 = camera.position.clone()
+    const q1 = camera.quaternion.clone()
     render(0.5, SNAP)
     const cHalf = camera.position.clone()
+    const qHalf = camera.quaternion.clone()
 
     const travel = c0.distanceTo(c1)
     const mid = new THREE.Vector3().lerpVectors(c0, c1, 0.5)
-    return { travel, deviation: cHalf.distanceTo(mid) }
+
+    // Same equidistance property as the scene traversal uses, for the same
+    // reason: the view direction is half of what the camera does per frame, and
+    // an orientation pinned to the raw tick pose judders the entire view.
+    const sweep = q0.angleTo(q1)
+    const rotationSkew =
+      sweep < 1e-9 ? 0 : Math.abs(qHalf.angleTo(q0) - qHalf.angleTo(q1)) / sweep
+
+    return { travel, deviation: cHalf.distanceTo(mid), sweep, rotationSkew }
   }
 
   /**
@@ -1908,6 +1949,7 @@ function testOneFrameDepictsOneInstant(): void {
      never enters the midpoint comparison at all and would pass it vacuously.
      This is the assertion that fails instead. Do not remove it as redundant. */
   check('hulls in flight are moving to compare', flight.moved >= 2, `${flight.moved} moved`)
+  check('hulls in flight are rotating to compare', flight.turned >= 2, `${flight.turned} turned`)
   check('every hull in flight is drawn at one instant', flight.disagreed === '', flight.disagreed)
 
   const flightCam = cameraTracksAlpha(camera, (alpha, dt) => game.render(alpha, dt))
@@ -1920,6 +1962,16 @@ function testOneFrameDepictsOneInstant(): void {
     'the camera in flight sits on the interpolation between ticks',
     flightCam.deviation < flightCam.travel * CAMERA_CURVATURE,
     `off by ${flightCam.deviation} over ${flightCam.travel}`,
+  )
+  check(
+    'the camera in flight turns with alpha rather than snapping per tick',
+    flightCam.sweep > 1e-6,
+    `swept ${flightCam.sweep} rad`,
+  )
+  check(
+    'the camera in flight is half-turned at half alpha',
+    flightCam.rotationSkew < 1e-3,
+    `skew ${flightCam.rotationSkew}`,
   )
 
   /* ---- The wreck, mid-cutscene ------------------------------------------ */
@@ -1972,6 +2024,23 @@ function testOneFrameDepictsOneInstant(): void {
       'the camera following the wreck sits on the interpolation',
       wreckCam.deviation < wreckCam.travel * CAMERA_CURVATURE,
       `off by ${wreckCam.deviation} over ${wreckCam.travel}`,
+    )
+    /* Deliberately no rotation check on the cutscene camera, and the reason is
+       worth writing down rather than leaving as a gap.
+
+       `stepDeathSequence` never touches `player.quaternion` — the tumble is
+       applied to the mesh alone, so the camera stays bracketed to the hull
+       instead of spinning with it. The simulated orientation is therefore
+       frozen for the whole cutscene, both ends of the interpolation are equal,
+       and there is no alpha-varying rotation here to assert. Demanding one
+       fails against correct code; asserting the skew anyway would pass on an
+       empty comparison, which is the vacuous-guard mistake this file has
+       already made once. Camera rotation is covered by the flight case above,
+       where it actually varies. */
+    check(
+      'the cutscene camera does not rotate with the tumbling wreck',
+      wreckCam.sweep < 1e-9,
+      `swept ${wreckCam.sweep} rad — the camera is following the mesh, not the hull`,
     )
   }
 
