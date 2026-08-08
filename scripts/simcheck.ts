@@ -1795,6 +1795,56 @@ function testOneFrameDepictsOneInstant(): void {
     return { moved, disagreed }
   }
 
+  /**
+   * The camera needs its own check, because `midpointCheck` structurally cannot
+   * see it: it is never added to the scene, so the traversal misses it, and it
+   * moves by `1 - exp(-follow * dt)`, which at the zero delta that keeps the
+   * comparison stable is exactly zero. Both of those are the right calls for
+   * everything else and together they make the camera invisible — which is how
+   * the one consumer this whole invariant was discovered through ended up
+   * unguarded.
+   *
+   * Driven here at a delta large enough that the smoothing factor is exactly 1,
+   * so the camera lands on its ideal pose in a single call. That pose is a pure
+   * function of the drawn ship transform, and therefore of alpha, with no
+   * accumulated state left to drift between the three measurements.
+   */
+  function cameraTracksAlpha(
+    camera: THREE.PerspectiveCamera,
+    render: (alpha: number, frameDt: number) => void,
+  ) {
+    const SNAP = 1000
+    // Twice: the first call spends whatever camera shake the run accumulated
+    // (which is applied with `Math.random`, and would otherwise land in a
+    // measurement), the second settles cleanly with the shake already at zero.
+    render(0, SNAP)
+    render(0, SNAP)
+    const c0 = camera.position.clone()
+    render(1, SNAP)
+    const c1 = camera.position.clone()
+    render(0.5, SNAP)
+    const cHalf = camera.position.clone()
+
+    const travel = c0.distanceTo(c1)
+    const mid = new THREE.Vector3().lerpVectors(c0, c1, 0.5)
+    return { travel, deviation: cHalf.distanceTo(mid) }
+  }
+
+  /**
+   * How far off the midpoint the camera is allowed to sit, as a fraction of how
+   * far it travels across the tick.
+   *
+   * Not zero, and the reason is real rather than a fudge: the camera's offset
+   * hangs off the *slerped* orientation, and slerp is not linear in alpha, so
+   * the exact midpoint is not the mid-slerp. The error is second order in the
+   * rotation covered by one tick. Measured worst case — the hardest-turning
+   * hull at full rate — is 0.16%, so this leaves better than tenfold headroom
+   * while staying far below anything a real regression produces: a camera that
+   * ignored alpha would not move between the two ends at all, and is caught by
+   * the travel check rather than this one.
+   */
+  const CAMERA_CURVATURE = 0.02
+
   /* ---- Bolts ----------------------------------------------------------- */
 
   const bolts = createBolts()
@@ -1832,10 +1882,11 @@ function testOneFrameDepictsOneInstant(): void {
   /* ---- Ships in flight -------------------------------------------------- */
 
   const scene = new THREE.Scene()
+  const camera = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
   const input = stubInput()
   const game = createGame({
     scene,
-    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    camera,
     environment: stubEnvironment(),
     input,
     audio: silentAudio(),
@@ -1852,19 +1903,35 @@ function testOneFrameDepictsOneInstant(): void {
   for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step()
 
   const flight = midpointCheck(scene, (alpha) => game.render(alpha, 0))
-  // Player plus the three hostiles that have warped in by eight seconds.
+  /* Not a sanity check — this is the detector for the "ignores alpha entirely"
+     case. Anything pinned to the raw tick pose is identical at 0 and at 1, so it
+     never enters the midpoint comparison at all and would pass it vacuously.
+     This is the assertion that fails instead. Do not remove it as redundant. */
   check('hulls in flight are moving to compare', flight.moved >= 2, `${flight.moved} moved`)
   check('every hull in flight is drawn at one instant', flight.disagreed === '', flight.disagreed)
+
+  const flightCam = cameraTracksAlpha(camera, (alpha, dt) => game.render(alpha, dt))
+  check(
+    'the camera in flight tracks alpha rather than the raw tick pose',
+    flightCam.travel > 1e-6,
+    `travelled ${flightCam.travel}`,
+  )
+  check(
+    'the camera in flight sits on the interpolation between ticks',
+    flightCam.deviation < flightCam.travel * CAMERA_CURVATURE,
+    `off by ${flightCam.deviation} over ${flightCam.travel}`,
+  )
 
   /* ---- The wreck, mid-cutscene ------------------------------------------ */
 
   const originalHull = SHIPS.hornet.maxHull
   SHIPS.hornet.maxHull = 1
   const dyingScene = new THREE.Scene()
+  const dyingCamera = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
   const dyingInput = stubInput()
   const dyingGame = createGame({
     scene: dyingScene,
-    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    camera: dyingCamera,
     environment: { ...stubEnvironment(), minefield: armedArena() },
     input: dyingInput,
     audio: silentAudio(),
@@ -1888,11 +1955,23 @@ function testOneFrameDepictsOneInstant(): void {
     // camera is still locked to it.
     dyingGame.step()
     const cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
+    /* As above, this is the detector rather than a sanity check: a wreck pinned
+       to the raw tick pose never moves between 0 and 1, so the midpoint below
+       would pass on an empty comparison. This is what actually fails. */
     check('the wreck is moving to compare', cutscene.moved >= 1, `${cutscene.moved} moved`)
+    check('the wreck is drawn at one instant', cutscene.disagreed === '', cutscene.disagreed)
+
+    // And the other half of the pairing the wreck check is named for.
+    const wreckCam = cameraTracksAlpha(dyingCamera, (alpha, dt) => dyingGame.render(alpha, dt))
     check(
-      'the wreck is drawn at the same instant as the camera following it',
-      cutscene.disagreed === '',
-      cutscene.disagreed,
+      'the camera following the wreck tracks alpha too',
+      wreckCam.travel > 1e-6,
+      `travelled ${wreckCam.travel}`,
+    )
+    check(
+      'the camera following the wreck sits on the interpolation',
+      wreckCam.deviation < wreckCam.travel * CAMERA_CURVATURE,
+      `off by ${wreckCam.deviation} over ${wreckCam.travel}`,
     )
   }
 
