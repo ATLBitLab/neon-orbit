@@ -16,11 +16,11 @@ import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts } from '../src/game/bolts'
-import { createGame, DEATH_SEQUENCE } from '../src/game/game'
+import { createStepClock } from '../src/core/loop'
+import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
-import { mulberry32 } from '../src/core/rng'
-import { SHIPS } from '../src/ships/specs'
+import { SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
 import {
   ARENA_HARD_LIMIT,
   ARENA_RADIUS,
@@ -742,6 +742,25 @@ function stubHud(): Hud {
 }
 
 /**
+ * A HUD stub that keeps what it was handed.
+ *
+ * The real HUD is DOM and cannot be inspected here, but *what the game tells it*
+ * can be — and that is where the interesting bug lives. A contact bracket is
+ * positioned from whatever `updateContacts` receives, so recording those points
+ * puts an off-scene-graph consumer inside reach of the same invariant check
+ * every mesh already gets. Positions are cloned because the game pushes live
+ * references into the buffer.
+ */
+function recordingHud(): Hud & { contactPoints: THREE.Vector3[] } {
+  const hud = stubHud() as Hud & { contactPoints: THREE.Vector3[] }
+  hud.contactPoints = []
+  hud.updateContacts = (contacts) => {
+    hud.contactPoints = contacts.map((c) => c.position.clone())
+  }
+  return hud
+}
+
+/**
  * A directly-writable input. Unlike the browser's keyboard this gives real
  * proportional deflection, which is what a mouse gives a human player — binary
  * key steering swings past a manoeuvring target and never settles.
@@ -803,6 +822,7 @@ function stubEnvironment(): Environment {
       update() {},
       dispose() {},
     },
+    step() {},
     update() {},
     dispose() {},
   }
@@ -836,12 +856,16 @@ function stubEnvironment(): Environment {
  * the moment an unrelated change added two `THREE` objects to the scene, because
  * `MathUtils.generateUUID` draws from `Math.random`, so constructing any
  * geometry or material shifts the stream and the whole run diverges.
+ *
+ * That is also why the seed now goes in through `start` rather than by swapping
+ * the global `Math.random` out from under the process, which is what this used
+ * to do. The run's own draws come from its seed and share a stream with nothing
+ * else, so building a mesh can no longer move the fight.
  */
+const WIN_SEED = 0x5120fa11
+
 function testARunCanBeWon(): void {
   section('A cleared roster reports a win')
-
-  const realRandom = Math.random
-  Math.random = mulberry32(0x5120fa11)
 
   const originalHulls = {
     wasp: SHIPS.wasp.maxHull,
@@ -879,7 +903,7 @@ function testARunCanBeWon(): void {
     },
   })
 
-  game.start('hornet')
+  game.start('hornet', WIN_SEED)
 
   const budget = Math.ceil(240 / STEP)
   let frames = 0
@@ -909,7 +933,7 @@ function testARunCanBeWon(): void {
       input.write.throttleDown = false
     }
 
-    game.update(STEP)
+    game.step()
   }
 
   SHIPS.wasp.maxHull = originalHulls.wasp
@@ -920,7 +944,6 @@ function testARunCanBeWon(): void {
   SHIPS.hornet.damage = originalGuns.damage
   SHIPS.wasp.radius = originalRadii.wasp
   SHIPS.drone.radius = originalRadii.drone
-  Math.random = realRandom
 
   const run = result as RunResult | null
   check('the run resolved', run !== null, `gave up after ${(frames * STEP).toFixed(0)}s`)
@@ -1019,7 +1042,7 @@ function testDeathPlaysBeforeTheDebrief(): void {
   const budget = Math.ceil(20 / STEP)
   let frames = 0
   for (; frames < budget && resultFrame < 0; frames++) {
-    game.update(STEP)
+    game.step()
 
     if (deathFrame < 0 && (game.snapshot()?.playerHull ?? 1) <= 0) deathFrame = frames
     if (game.dying) {
@@ -1283,10 +1306,20 @@ function testPickups(): void {
   eye.position.set(0, 0, 800)
   eye.updateMatrixWorld()
 
+  // `step` runs the respawn clock and `update` runs the billboarding — both are
+  // driven here so this still covers the render path it always did, while
+  // asserting against the half that actually decides whether a pad is there.
+  function tick(seconds: number): void {
+    for (let i = 0; i < Math.round(seconds / STEP); i++) {
+      field.step(STEP)
+      field.update(STEP, eye)
+    }
+  }
+
   const half = repairPad.respawnIn / 2
-  for (let i = 0; i < Math.round(half / STEP); i++) field.update(STEP, eye)
+  tick(half)
   check('it stays gone while the clock runs', !repairPad.live, `${repairPad.respawnIn.toFixed(1)}s left`)
-  for (let i = 0; i < Math.round((half + 1) / STEP); i++) field.update(STEP, eye)
+  tick(half + 1)
   check('it re-arms once the clock expires', repairPad.live)
   check('a re-armed pad registers contact again', field.findContact(repairPad.position, 40) === repairPad)
 
@@ -1502,6 +1535,579 @@ function testPickups(): void {
   mines.dispose()
 }
 
+/**
+ * The determinism contract: a run is a function of its seed and its inputs, and
+ * of nothing else.
+ *
+ * This is the check the netcode work rests on. Server authority, host-peer play
+ * and replay-verified scores all reduce to the same claim — that the same seed
+ * fed the same inputs produces the same fight — and that claim is cheap to
+ * believe and easy to break. Any new `Math.random()` on a path that decides an
+ * outcome breaks it, and this is what catches that.
+ *
+ * The two runs are played by the same closed-loop autopilot rather than a fixed
+ * input tape, deliberately: an autopilot steers from what it sees, so the
+ * smallest divergence in a hostile's position changes the next input and the two
+ * runs peel apart fast. A fixed tape would let a small drift stay small and pass.
+ *
+ * Note what is *not* controlled here — each run builds its own scene, meshes and
+ * materials, and every one of those draws from the global `Math.random` through
+ * `THREE.MathUtils.generateUUID`. That used to be enough to move a run. It is
+ * exactly what the run seed being its own stream now makes irrelevant, so
+ * leaving it uncontrolled is part of the test.
+ */
+interface Played {
+  /** Fingerprints sampled through the run, joined. */
+  trace: string
+  /** The run as it stood at the last tick, for asserting it was a real fight. */
+  final: RunSnapshot | null
+}
+
+function testASeededRunReproduces(): void {
+  section('A seeded run reproduces from its seed')
+
+  /** The parts of a run a divergence would surface in. */
+  function fingerprint(run: RunSnapshot | null): string {
+    if (!run) return 'none'
+    const t = run.target
+    return [
+      run.score,
+      run.kills,
+      run.shotsFired,
+      run.playerHull,
+      run.playerSpeed,
+      run.enemiesAirborne,
+      run.enemiesQueued,
+      run.solarExposure,
+      // Bearing to the locked hostile — the most sensitive number available
+      // here, since it moves with every AI wander decision.
+      t ? `${t.yaw},${t.pitch},${t.range},${t.hull}` : 'nolock',
+    ].join(' ')
+  }
+
+  function playOut(ship: ShipId, seed: number, ticks: number): Played {
+    const input = stubInput()
+    const game = createGame({
+      scene: new THREE.Scene(),
+      camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+      environment: stubEnvironment(),
+      input,
+      audio: silentAudio(),
+      hud: stubHud(),
+      bestScoreFor: () => 0,
+      onEnd: () => {},
+    })
+
+    game.start(ship, seed)
+
+    const marks: string[] = []
+    for (let i = 0; i < ticks; i++) {
+      const target = game.snapshot()?.target ?? null
+      if (target) {
+        input.write.pitch = clampTo(target.pitch * 3, -1, 1)
+        input.write.yaw = clampTo(target.yaw * 3, -1, 1)
+        input.write.fire = Math.abs(target.pitch) < 0.35 && Math.abs(target.yaw) < 0.35
+        input.write.throttleUp = target.range > 260
+        input.write.throttleDown = target.range < 170
+      } else {
+        input.write.pitch = 0
+        input.write.yaw = 0
+        input.write.fire = false
+        input.write.throttleUp = true
+        input.write.throttleDown = false
+      }
+      game.step()
+      // Sampled along the way, not just at the end: two runs that diverge and
+      // then happen to land on the same score would slip past a single check.
+      if (i % 90 === 0) marks.push(fingerprint(game.snapshot()))
+    }
+    const final = game.snapshot()
+    marks.push(fingerprint(final))
+    return { trace: marks.join(' | '), final }
+  }
+
+  const TICKS = Math.ceil(14 / STEP)
+
+  /**
+   * Every airframe gets a turn, because the squadron is always the *other* two
+   * hulls and the quirks are per-hull. Playing only the Hornet means the enemies
+   * are a Wasp and a Drone, neither of which dashes, so the dash roll in
+   * `EnemyPilot` is never exercised and could quietly go back to `Math.random()`
+   * without failing anything. Rotating the player through all three guarantees
+   * each hull appears on the hostile side at least once.
+   */
+  for (const ship of SHIP_ORDER) {
+    const seed = 0x51ede7
+    const first = playOut(ship, seed, TICKS)
+    const again = playOut(ship, seed, TICKS)
+    const other = playOut(ship, seed + 1, TICKS)
+
+    check(
+      `a ${ship} run replays identically from the same seed`,
+      first.trace === again.trace,
+      firstDifference(first.trace, again.trace),
+    )
+    check(`a ${ship} run differs on a different seed`, first.trace !== other.trace)
+
+    /* Two runs that never engaged would compare equal for entirely
+       uninteresting reasons, so the comparison is only worth something if the
+       run it compared was a real fight. Asserted against the final snapshot
+       rather than against the trace string — the first version of this tested
+       the trace and was vacuously true, which is exactly the failure it was
+       supposed to prevent. */
+    const f = first.final
+    check(
+      `the ${ship} run actually fought`,
+      f !== null && f.shotsFired > 0 && f.enemiesAirborne > 0,
+      f ? `shots=${f.shotsFired}, airborne=${f.enemiesAirborne}` : 'no snapshot',
+    )
+  }
+}
+
+/** Where two fingerprints part company, for a failure message worth reading. */
+function firstDifference(a: string, b: string): string {
+  const left = a.split(' | ')
+  const right = b.split(' | ')
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    if (left[i] !== right[i]) return `diverged at mark ${i}: "${left[i]}" vs "${right[i]}"`
+  }
+  return 'identical'
+}
+
+/**
+ * The step clock — the piece that converts irregular frames into whole ticks.
+ *
+ * This is tested directly rather than through the simulation, because through
+ * the simulation it cannot be tested at all. An earlier version of this check
+ * fed `ship.step(..., STEP, ...)` the same number of times down two code paths
+ * and compared the results; since `step` takes a fixed delta, both paths were
+ * identical by construction and the check could not fail. The accumulator it
+ * meant to cover lives in the render loop, which nothing headless executes.
+ *
+ * So the accumulator moved into `src/core/loop.ts` and is exercised here. The
+ * property that matters is that no owed simulation time is ever silently
+ * dropped: a loop that discarded the remainder each frame would still run at a
+ * fixed step, still look approximately right, and would quietly run the game
+ * slower than real time on any display whose refresh is not a multiple of 60.
+ */
+function testTheStepClockNeverLosesTime(): void {
+  section('The fixed-step clock converts frames to ticks without drift')
+
+  const MAX_FRAME = 1 / 5
+
+  const even = createStepClock(STEP, MAX_FRAME)
+  check('a frame of exactly one step runs exactly one tick', even.advance(STEP).ticks === 1)
+  check('a frame of half a step runs none', even.advance(STEP / 2).ticks === 0)
+  check('the other half completes the tick', even.advance(STEP / 2).ticks === 1)
+
+  /* The one that catches a dropped remainder. Frames of 1.5 steps must average
+     1.5 ticks; a clock that reset its accumulator every frame would return a
+     steady 1 and lose a third of the game's time without ever looking wrong. */
+  const fractional = createStepClock(STEP, MAX_FRAME)
+  let ticks = 0
+  for (let i = 0; i < 200; i++) ticks += fractional.advance(STEP * 1.5).ticks
+  check('fractional frames carry their remainder', ticks === 300, `ran ${ticks} ticks, expected 300`)
+
+  /* Uneven pacing, the way a real display stutters. Total simulated time must
+     track total real time to within the tick that is still in the accumulator. */
+  const uneven = createStepClock(STEP, MAX_FRAME)
+  const frames = [0.004, 0.021, 0.009, 0.033, 0.016, 0.007, 0.048, 0.011]
+  let unevenTicks = 0
+  let realTime = 0
+  for (let i = 0; i < 500; i++) {
+    const dt = frames[i % frames.length]
+    realTime += dt
+    unevenTicks += uneven.advance(dt).ticks
+  }
+  const expected = Math.floor(realTime / STEP)
+  check(
+    'uneven frames simulate real time to within one tick',
+    Math.abs(unevenTicks - expected) <= 1,
+    `ran ${unevenTicks} ticks against ${expected} of real time`,
+  )
+
+  /* A frame longer than the clamp drops the excess rather than queueing it.
+     Queueing is what turns one slow frame into a permanently slower game. */
+  const stalled = createStepClock(STEP, MAX_FRAME)
+  const afterStall = stalled.advance(10)
+  check(
+    'a stalled frame is clamped rather than queued',
+    afterStall.ticks === Math.floor(MAX_FRAME / STEP),
+    `ran ${afterStall.ticks} ticks for a 10s frame`,
+  )
+  check('a clamped frame reports the clamped delta', afterStall.frameSeconds === MAX_FRAME)
+
+  /* Alpha is a blend factor and is handed straight to `lerp`/`slerp`. Out of
+     range it would extrapolate rather than interpolate, throwing hulls past
+     where the simulation ever put them. */
+  const blend = createStepClock(STEP, MAX_FRAME)
+  let alphaInRange = true
+  for (let i = 0; i < 500; i++) {
+    const a = blend.advance(frames[i % frames.length]).alpha
+    if (!(a >= 0 && a < 1)) alphaInRange = false
+  }
+  check('alpha stays in [0, 1)', alphaInRange)
+}
+
+/**
+ * Everything drawn in one frame must agree on which instant it depicts.
+ *
+ * This is the invariant behind the whole render half, and it is stricter than
+ * "interpolate the hulls" — which is how it has been broken twice. First bolts
+ * were left on raw tick positions while ships were interpolated. Then the fix
+ * for the chase camera moved the disagreement into the death cutscene: the
+ * camera started interpolating while the wreck it is locked onto did not.
+ *
+ * Both were the same failure. Smoothing one consumer of a shared pose relocates
+ * the mismatch rather than removing it, and the artefact is worse than plain
+ * judder because it is *relative* — two things that should be pinned together
+ * sliding against each other. So the check is on the invariant itself rather
+ * than on any one consumer, and it asserts positions against the arithmetic
+ * they are supposed to be, not against a recorded baseline.
+ */
+function testOneFrameDepictsOneInstant(): void {
+  section('Everything drawn in a frame agrees on one instant')
+
+  const ALPHA = 0.37
+
+  function agrees(actual: THREE.Vector3, want: THREE.Vector3): boolean {
+    return actual.distanceTo(want) < 1e-9
+  }
+
+  /**
+   * Draw the same simulation state at three blends and compare, rather than
+   * reaching into the game for each entity's tick endpoints.
+   *
+   * Interpolation has a property that needs no privileged access to check: with
+   * the simulation held still, whatever is drawn at 0.5 must be the midpoint of
+   * what is drawn at 0 and at 1. Anything that ignores `alpha` collapses all
+   * three onto one point and is caught by the "actually moved" count; anything
+   * that interpolates *differently* from its neighbours fails the midpoint test.
+   * `frameDt` is zero throughout so the presentation-rate systems — camera
+   * smoothing, particles, world spin — cannot move underneath the comparison.
+   */
+  /**
+   * `extra` exists because the scene graph is not the whole frame, and the
+   * consumers outside it are the ones that get missed.
+   *
+   * The HUD is DOM, not `Object3D`, so a contact bracket placed from the wrong
+   * pose is invisible to `scene.traverse` — and that is exactly where the fourth
+   * instance of this bug turned up, after three had been found and fixed inside
+   * the graph. Anything that positions itself from a ship pose without being a
+   * node in the scene belongs in `extra`, keyed by name.
+   */
+  function midpointCheck(
+    scene: THREE.Scene,
+    render: (alpha: number) => void,
+    extra: () => Map<string, THREE.Vector3> = () => new Map(),
+  ) {
+    interface Pose {
+      position: THREE.Vector3
+      quaternion: THREE.Quaternion | null
+    }
+
+    const extraKeys = new Set<string>()
+
+    function draw(alpha: number): Map<string, Pose> {
+      render(alpha)
+      const out = new Map<string, Pose>()
+      scene.traverse((o) =>
+        out.set(o.uuid, { position: o.position.clone(), quaternion: o.quaternion.clone() }),
+      )
+      // After the traversal, so a name collision would surface as a failure
+      // rather than silently shadowing a real node.
+      for (const [name, position] of extra()) {
+        extraKeys.add(name)
+        out.set(name, { position: position.clone(), quaternion: null })
+      }
+      return out
+    }
+
+    const at0 = draw(0)
+    const at1 = draw(1)
+    const atHalf = draw(0.5)
+
+    let moved = 0
+    let extraMoved = 0
+    let turned = 0
+    let disagreed = ''
+    for (const [id, a] of at0) {
+      const b = at1.get(id)
+      const half = atHalf.get(id)
+      if (!b || !half) continue
+
+      if (a.position.distanceTo(b.position) >= 1e-6) {
+        moved++
+        if (extraKeys.has(id)) extraMoved++
+        const want = new THREE.Vector3().lerpVectors(a.position, b.position, 0.5)
+        if (!agrees(half.position, want) && !disagreed) {
+          disagreed = `${id}: drawn ${JSON.stringify(half.position)} want ${JSON.stringify(want)}`
+        }
+      }
+
+      /* Orientation is half of a pose and is checked the same way, but not with
+         the same arithmetic: slerp is not linear in alpha, so the half-way
+         orientation is not the componentwise midpoint of the ends. It is
+         something better — slerp turns at constant angular velocity, so the
+         half-way orientation is *equidistant* from both ends, exactly, with no
+         tolerance to justify. Verified against a worst-case tick: the two gaps
+         agree to 1e-13 relative. */
+      // `extra` entries are bare points with no orientation of their own.
+      if (!a.quaternion || !b.quaternion || !half.quaternion) continue
+      const sweep = a.quaternion.angleTo(b.quaternion)
+      if (sweep >= 1e-6) {
+        turned++
+        const toStart = half.quaternion.angleTo(a.quaternion)
+        const toEnd = half.quaternion.angleTo(b.quaternion)
+        if (Math.abs(toStart - toEnd) > sweep * 1e-3 && !disagreed) {
+          disagreed = `rotation: ${toStart} to start vs ${toEnd} to end, over ${sweep}`
+        }
+      }
+    }
+    return { moved, extraMoved, turned, disagreed }
+  }
+
+  /**
+   * The camera needs its own check, because `midpointCheck` structurally cannot
+   * see it: it is never added to the scene, so the traversal misses it, and it
+   * moves by `1 - exp(-follow * dt)`, which at the zero delta that keeps the
+   * comparison stable is exactly zero. Both of those are the right calls for
+   * everything else and together they make the camera invisible — which is how
+   * the one consumer this whole invariant was discovered through ended up
+   * unguarded.
+   *
+   * `SNAP` and the two settling calls below are one mechanism, not two
+   * conveniences, and neither works without the other. A delta that large makes
+   * the smoothing factor exactly 1, so the camera lands on its ideal pose in a
+   * single call — a pure function of the drawn ship transform, and therefore of
+   * alpha, with no accumulated state left to drift between measurements. The
+   * same delta drives `shakeAmount *= exp(-6 * dt)` to exactly zero, so the
+   * first call spends whatever camera shake the run accumulated and the second
+   * settles with the shake provably gone rather than merely small. Shake is
+   * applied with `Math.random`, so leaving any of it inside a measurement is how
+   * a check ends up failing once a fortnight — worse than not existing.
+   */
+  function cameraTracksAlpha(
+    camera: THREE.PerspectiveCamera,
+    render: (alpha: number, frameDt: number) => void,
+  ) {
+    const SNAP = 1000
+    render(0, SNAP)
+    render(0, SNAP)
+    const c0 = camera.position.clone()
+    const q0 = camera.quaternion.clone()
+    render(1, SNAP)
+    const c1 = camera.position.clone()
+    const q1 = camera.quaternion.clone()
+    render(0.5, SNAP)
+    const cHalf = camera.position.clone()
+    const qHalf = camera.quaternion.clone()
+
+    const travel = c0.distanceTo(c1)
+    const mid = new THREE.Vector3().lerpVectors(c0, c1, 0.5)
+
+    // Same equidistance property as the scene traversal uses, for the same
+    // reason: the view direction is half of what the camera does per frame, and
+    // an orientation pinned to the raw tick pose judders the entire view.
+    const sweep = q0.angleTo(q1)
+    const rotationSkew =
+      sweep < 1e-9 ? 0 : Math.abs(qHalf.angleTo(q0) - qHalf.angleTo(q1)) / sweep
+
+    return { travel, deviation: cHalf.distanceTo(mid), sweep, rotationSkew }
+  }
+
+  /**
+   * How far off the midpoint the camera is allowed to sit, as a fraction of how
+   * far it travels across the tick.
+   *
+   * Not zero, and the reason is real rather than a fudge: the camera's offset
+   * hangs off the *slerped* orientation, and slerp is not linear in alpha, so
+   * the exact midpoint is not the mid-slerp. The error is second order in the
+   * rotation covered by one tick. Measured worst case — the hardest-turning
+   * hull at full rate — is 0.16%, so this leaves better than tenfold headroom
+   * while staying far below anything a real regression produces: a camera that
+   * ignored alpha would not move between the two ends at all, and is caught by
+   * the travel check rather than this one.
+   */
+  const CAMERA_CURVATURE = 0.02
+
+  /* ---- Bolts ----------------------------------------------------------- */
+
+  const bolts = createBolts()
+  const origin = new THREE.Vector3(10, -20, 30)
+  const speed = 1450
+  bolts.fire({
+    origin,
+    direction: new THREE.Vector3(0, 0, -1),
+    speed,
+    damage: 1,
+    team: 'player',
+    color: new THREE.Color(0xffffff),
+  })
+  bolts.update(STEP, [], [])
+  bolts.render(ALPHA)
+
+  const boltMatrix = new THREE.Matrix4()
+  bolts.mesh.getMatrixAt(0, boltMatrix)
+  const boltDrawn = new THREE.Vector3().setFromMatrixPosition(boltMatrix)
+  const boltWant = origin.clone().addScaledVector(new THREE.Vector3(0, 0, -1), speed * STEP * ALPHA)
+  // Looser than the hull comparison on purpose: this one round-trips through
+  // the instance matrix, which is a Float32Array, so ~1e-6 of noise is the
+  // storage rather than the maths. Still four orders of magnitude tighter than
+  // the ~24 units a bolt would be out if it ignored alpha entirely.
+  check(
+    'a bolt is drawn at alpha between its last two ticks',
+    boltDrawn.distanceTo(boltWant) < 1e-3,
+    `${JSON.stringify(boltDrawn)} vs ${JSON.stringify(boltWant)}`,
+  )
+  // Guards the assertion above: if the bolt had not moved, the check would pass
+  // for a renderer that ignored alpha entirely.
+  check('the bolt actually travelled', boltDrawn.distanceTo(origin) > 1, `moved ${boltDrawn.distanceTo(origin)}`)
+  bolts.dispose()
+
+  /* ---- Ships in flight -------------------------------------------------- */
+
+  const scene = new THREE.Scene()
+  const camera = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
+  const input = stubInput()
+  const hud = recordingHud()
+  const game = createGame({
+    scene,
+    camera,
+    environment: stubEnvironment(),
+    input,
+    audio: silentAudio(),
+    hud,
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  game.start('hornet', 0x0a11ce)
+  input.write.throttleUp = true
+  input.write.pitch = 0.5
+  input.write.yaw = -0.3
+  input.write.fire = true
+  for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step()
+
+  const flight = midpointCheck(
+    scene,
+    (alpha) => game.render(alpha, 0),
+    () => new Map(hud.contactPoints.map((p, i) => [`hud:contact:${i}`, p])),
+  )
+  /* Not a sanity check — this is the detector for the "ignores alpha entirely"
+     case. Anything pinned to the raw tick pose is identical at 0 and at 1, so it
+     never enters the midpoint comparison at all and would pass it vacuously.
+     This is the assertion that fails instead. Do not remove it as redundant. */
+  check('hulls in flight are moving to compare', flight.moved >= 2, `${flight.moved} moved`)
+  /* The off-graph detector, and it has to count what *moved* rather than what
+     exists. The first version of this asserted only that contacts were present,
+     which a marker pinned to the raw tick pose satisfies perfectly — it is there,
+     it just never varies with alpha, so it never enters the comparison and the
+     check passes on nothing. That is the same vacuous guard this file has now
+     produced twice, once in a check written specifically to prevent it. */
+  check(
+    'HUD contact markers track alpha',
+    flight.extraMoved >= 1,
+    `${hud.contactPoints.length} contacts recorded, ${flight.extraMoved} moved with alpha`,
+  )
+  check('hulls in flight are rotating to compare', flight.turned >= 2, `${flight.turned} turned`)
+  check('every hull in flight is drawn at one instant', flight.disagreed === '', flight.disagreed)
+
+  const flightCam = cameraTracksAlpha(camera, (alpha, dt) => game.render(alpha, dt))
+  check(
+    'the camera in flight tracks alpha rather than the raw tick pose',
+    flightCam.travel > 1e-6,
+    `travelled ${flightCam.travel}`,
+  )
+  check(
+    'the camera in flight sits on the interpolation between ticks',
+    flightCam.deviation < flightCam.travel * CAMERA_CURVATURE,
+    `off by ${flightCam.deviation} over ${flightCam.travel}`,
+  )
+  check(
+    'the camera in flight turns with alpha rather than snapping per tick',
+    flightCam.sweep > 1e-6,
+    `swept ${flightCam.sweep} rad`,
+  )
+  check(
+    'the camera in flight is half-turned at half alpha',
+    flightCam.rotationSkew < 1e-3,
+    `skew ${flightCam.rotationSkew}`,
+  )
+
+  /* ---- The wreck, mid-cutscene ------------------------------------------ */
+
+  const originalHull = SHIPS.hornet.maxHull
+  SHIPS.hornet.maxHull = 1
+  const dyingScene = new THREE.Scene()
+  const dyingCamera = new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000)
+  const dyingInput = stubInput()
+  const dyingGame = createGame({
+    scene: dyingScene,
+    camera: dyingCamera,
+    environment: { ...stubEnvironment(), minefield: armedArena() },
+    input: dyingInput,
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  dyingGame.start('hornet', 0xdead01)
+  dyingInput.write.throttleUp = true
+  let reachedDying = false
+  for (let i = 0; i < Math.ceil(30 / STEP) && !reachedDying; i++) {
+    dyingGame.step()
+    reachedDying = dyingGame.dying
+  }
+
+  check('the run reached the death cutscene', reachedDying)
+  if (reachedDying) {
+    // One more tick so the wreck has drift to interpolate across, and so this
+    // lands inside `WRECK_TUMBLE` while the hull is still on screen and the
+    // camera is still locked to it.
+    dyingGame.step()
+    const cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
+    /* As above, this is the detector rather than a sanity check: a wreck pinned
+       to the raw tick pose never moves between 0 and 1, so the midpoint below
+       would pass on an empty comparison. This is what actually fails. */
+    check('the wreck is moving to compare', cutscene.moved >= 1, `${cutscene.moved} moved`)
+    check('the wreck is drawn at one instant', cutscene.disagreed === '', cutscene.disagreed)
+
+    // And the other half of the pairing the wreck check is named for.
+    const wreckCam = cameraTracksAlpha(dyingCamera, (alpha, dt) => dyingGame.render(alpha, dt))
+    check(
+      'the camera following the wreck tracks alpha too',
+      wreckCam.travel > 1e-6,
+      `travelled ${wreckCam.travel}`,
+    )
+    check(
+      'the camera following the wreck sits on the interpolation',
+      wreckCam.deviation < wreckCam.travel * CAMERA_CURVATURE,
+      `off by ${wreckCam.deviation} over ${wreckCam.travel}`,
+    )
+    /* Deliberately no rotation check on the cutscene camera, and the reason is
+       worth writing down rather than leaving as a gap.
+
+       `stepDeathSequence` never touches `player.quaternion` — the tumble is
+       applied to the mesh alone, so the camera stays bracketed to the hull
+       instead of spinning with it. The simulated orientation is therefore
+       frozen for the whole cutscene, both ends of the interpolation are equal,
+       and there is no alpha-varying rotation here to assert. Demanding one
+       fails against correct code; asserting the skew anyway would pass on an
+       empty comparison, which is the vacuous-guard mistake this file has
+       already made once. Camera rotation is covered by the flight case above,
+       where it actually varies. */
+    check(
+      'the cutscene camera does not rotate with the tumbling wreck',
+      wreckCam.sweep < 1e-9,
+      `swept ${wreckCam.sweep} rad — the camera is following the mesh, not the hull`,
+    )
+  }
+
+  SHIPS.hornet.maxHull = originalHull
+}
+
 /* -------------------------------------------------------------------------- */
 
 console.log('NEON ORBIT — headless simulation checks')
@@ -1517,6 +2123,9 @@ testMines()
 testPickups()
 testARunCanBeWon()
 testDeathPlaysBeforeTheDebrief()
+testASeededRunReproduces()
+testTheStepClockNeverLosesTime()
+testOneFrameDepictsOneInstant()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

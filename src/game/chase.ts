@@ -9,7 +9,7 @@
  */
 
 import * as THREE from 'three'
-import type { Ship } from './ship'
+import { LOCAL_FORWARD, type Ship } from './ship'
 
 /** Camera distance and height as multiples of the ship's own length. */
 const DISTANCE = 1.85
@@ -31,11 +31,26 @@ const _look = new THREE.Vector3()
 const _matrix = new THREE.Matrix4()
 const _quat = new THREE.Quaternion()
 const _shake = new THREE.Vector3()
+/** The drawn pose, blended out of the ship's last two ticks. */
+const _pos = new THREE.Vector3()
+const _rot = new THREE.Quaternion()
 
 export interface ChaseCamera {
   /** Snap straight to the ideal pose — use on spawn to avoid a fly-in. */
   reset(ship: Ship): void
-  update(ship: Ship, dt: number): void
+  /**
+   * `alpha` is the same blend the hull is drawn at. The camera has to follow
+   * the pose that is actually on screen, not the tick-quantized one behind it:
+   * chasing the raw simulation transform while the hull is drawn interpolated
+   * makes the ship shimmer against its own camera between ticks, which is a
+   * subtler and more unpleasant artefact than plain judder.
+   *
+   * Deliberately reads the interpolated *simulation* transform rather than the
+   * mesh. During the death cutscene the wreck tumbles its visual only — see
+   * `stepDeathSequence` — and a camera that followed the mesh would spin with
+   * it and make the last seconds of a run unwatchable.
+   */
+  update(ship: Ship, dt: number, alpha?: number): void
   /** Add a knock, in world units of camera displacement. */
   shake(amount: number): void
 }
@@ -44,26 +59,38 @@ export function createChaseCamera(camera: THREE.PerspectiveCamera): ChaseCamera 
   let shakeAmount = 0
   let fov = BASE_FOV
 
+  /** Blend the ship's last two ticks into `_pos` / `_rot`. */
+  function drawnPose(ship: Ship, alpha: number) {
+    if (alpha >= 1) {
+      _pos.copy(ship.position)
+      _rot.copy(ship.quaternion)
+    } else {
+      _pos.lerpVectors(ship.prevPosition, ship.position, alpha)
+      _rot.copy(ship.prevQuaternion).slerp(ship.quaternion, alpha)
+    }
+  }
+
   function pose(ship: Ship, out: THREE.Vector3) {
     const scale = ship.visual.length
-    _back.set(0, 0, 1).applyQuaternion(ship.quaternion)
-    _up.set(0, 1, 0).applyQuaternion(ship.quaternion)
+    _back.set(0, 0, 1).applyQuaternion(_rot)
+    _up.set(0, 1, 0).applyQuaternion(_rot)
     out
-      .copy(ship.position)
+      .copy(_pos)
       .addScaledVector(_back, scale * DISTANCE)
       .addScaledVector(_up, scale * HEIGHT)
   }
 
   function aim(ship: Ship) {
-    ship.forward(_forward)
-    _look.copy(ship.position).addScaledVector(_forward, ship.visual.length * LEAD)
-    _up.set(0, 1, 0).applyQuaternion(ship.quaternion)
+    _forward.copy(LOCAL_FORWARD).applyQuaternion(_rot)
+    _look.copy(_pos).addScaledVector(_forward, ship.visual.length * LEAD)
+    _up.set(0, 1, 0).applyQuaternion(_rot)
     _matrix.lookAt(camera.position, _look, _up)
     _quat.setFromRotationMatrix(_matrix)
   }
 
   return {
     reset(ship) {
+      drawnPose(ship, 1)
       pose(ship, _desired)
       camera.position.copy(_desired)
       aim(ship)
@@ -74,7 +101,8 @@ export function createChaseCamera(camera: THREE.PerspectiveCamera): ChaseCamera 
       camera.updateProjectionMatrix()
     },
 
-    update(ship, dt) {
+    update(ship, dt, alpha = 1) {
+      drawnPose(ship, alpha)
       pose(ship, _desired)
       camera.position.lerp(_desired, 1 - Math.exp(-POSITION_FOLLOW * dt))
 

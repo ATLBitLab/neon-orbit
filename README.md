@@ -126,7 +126,7 @@ be a coin flip with no tell and no counterplay — see the note at the top of `s
 
 ```
 src/
-  core/     stage (renderer + bloom), input, audio, scores, geo, rng
+  core/     stage (renderer + bloom), input, audio, scores, geo, rng, step clock
   ships/    stat specs, procedural hull geometry
   world/    planet, stations, mines, power-up pods, sky, arena assembly
   game/     flight model, AI, projectiles, effects, camera, HUD, orchestration
@@ -141,6 +141,51 @@ A few decisions worth knowing before changing things:
 move ships — it produces the same `Controls` struct the player produces and hands it to
 `Ship.step`. An enemy Wasp is fast because a Wasp is fast, so it cannot cheat, and a balance
 change lands on both sides at once.
+
+**The simulation runs on a fixed step; rendering runs on the frame.** `Game.step()` advances
+exactly 1/60s and takes no delta — there is deliberately no argument for a caller to vary.
+`Game.render(alpha, frameDt)` draws whatever `step` left behind, where `alpha` is how far the
+frame sits between the last two ticks. `Ship.syncVisual(alpha)`, `Bolts.render(alpha)` and the
+chase camera all interpolate at that same `alpha`, so a display faster than 60 Hz looks smooth
+and — just as important — everything on screen is smoothed *by the same amount*. A hull drawn
+interpolated against bolts drawn on tick boundaries is worse than either drawn consistently.
+
+`src/core/loop.ts` owns the accumulator that turns irregular frames into whole ticks. It is a
+separate module for one reason: inline in the render loop it was the only load-bearing part of
+the fixed step that no headless test could reach.
+
+The split is what makes the flight model honest: with a variable delta the same stick input
+covered different ground on a 30 Hz laptop and a 144 Hz desktop, so a hull's turn rate — the
+lever the whole three-airframe design rests on — was not really one number. Keep the two halves
+separate: nothing in `step` may read the camera or write a mesh transform, and nothing in
+`render` may write simulation state.
+
+There is exactly one exception, and it is narrow. `stepDeathSequence` applies the wreck's
+*rotation* to the mesh from inside `step`. It earns that because the tumble accumulates —
+`g.quaternion.multiply(spin)` compounds whatever the mesh already holds rather than being a
+function of elapsed time — so running it per frame would make the tumble rate depend on the
+display, which is the exact thing the fixed step prevents. The wreck's *position* has no such
+excuse and is interpolated in `render` like everything else.
+
+The stronger statement of the rule, and the one worth keeping in mind: **everything drawn in one
+frame must agree on which instant it depicts.** "Interpolate the hulls" is not enough, and has
+been wrong twice — once with bolts left on tick boundaries while ships were smoothed, and once
+with the camera smoothed while the wreck it was locked onto was not. Smoothing one consumer of a
+shared pose relocates the mismatch rather than removing it, and a relative mismatch between two
+things that should be pinned together reads worse than plain judder. `simcheck` asserts the
+invariant directly by drawing one frozen simulation state at three blends and checking the middle
+is the midpoint of the outer two.
+
+**Gameplay randomness comes from the run seed, never `Math.random()`.** `Game.start` takes an
+optional seed and reports it back through `snapshot().seed`. Everything that decides an outcome
+— squadron order, arrival points, AI wander and break timing, gun spread — draws from a
+substream of it (`subRng` in `src/core/rng.ts`), so a run is a function of its seed and its
+inputs and nothing else. Cosmetic scatter — particles, camera shake, wreck sparks — is exempt
+and still uses `Math.random()` directly.
+
+Two viewers of one run may see different sparks; they may not see different hulls. `simcheck`
+asserts this by playing the same seed twice and comparing, so a stray `Math.random()` on a path
+that decides something fails the build rather than surfacing later as a desync.
 
 **Everything is procedural.** No textures, no models, no audio files. Hulls and stations are
 coarse primitives merged into non-indexed geometry so recomputed normals stay hard-faceted;

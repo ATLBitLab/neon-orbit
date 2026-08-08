@@ -91,7 +91,20 @@ export interface Environment {
   /** Power-up pods. Harmless, so they are not hazards and the AI ignores them. */
   pickups: Pickups
   planet: Planet
-  /** The camera is needed because power-up pods billboard — see `pickups.ts`. */
+  /**
+   * Advance the parts of the world that decide outcomes. Today that is only
+   * power-up respawn clocks — stations, mines, debris and sky all animate
+   * without ever changing what the arena *is*. Runs on the simulation's fixed
+   * tick, and is the only half a headless run needs.
+   */
+  step(dt: number): void
+  /**
+   * Advance the parts of the world that only have to look right: spin, drift,
+   * pulse and billboarding. Runs once per rendered frame at the frame's own
+   * delta, so it stays smooth on a display faster than the tick rate.
+   *
+   * The camera is needed because power-up pods billboard — see `pickups.ts`.
+   */
   update(dt: number, camera: THREE.Camera): void
   dispose(): void
 }
@@ -276,6 +289,10 @@ export function buildEnvironment(): Environment {
     minefield,
     pickups,
     planet,
+    step(dt: number) {
+      pickups.step(dt)
+    },
+
     update(dt: number, camera: THREE.Camera) {
       sky.update(dt)
       planet.update(dt)
