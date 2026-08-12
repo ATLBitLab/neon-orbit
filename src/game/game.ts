@@ -35,7 +35,7 @@ import {
   type PickupKind,
 } from '../world/pickups'
 import { EnemyPilot } from './ai'
-import { createBolts, type Bolts } from './bolts'
+import { createBolts, FACTION_AI, FACTION_PLAYER, type Bolts } from './bolts'
 import { createChaseCamera, type ChaseCamera } from './chase'
 import { LAUNCH_THROTTLE } from './controls'
 import { createFx, type Fx } from './fx'
@@ -261,7 +261,15 @@ export function createGame(deps: GameDeps): Game {
 
   const chase: ChaseCamera = createChaseCamera(camera)
 
-  const ctx: ShipContext = { hazards: environment.hazards, audio, bolts }
+  // The listener is the local player today. Milestone 3 makes this the roster's
+  // local participant, at which point a client holding any faction hears its own
+  // guns correctly.
+  const ctx: ShipContext = {
+    hazards: environment.hazards,
+    audio,
+    bolts,
+    localFaction: FACTION_PLAYER,
+  }
 
   let player: Ship | null = null
   let pilots: EnemyPilot[] = []
@@ -416,12 +424,12 @@ export function createGame(deps: GameDeps): Game {
     if (!id || !player) return
 
     const index = pilotsSpawned++
-    const ship = new Ship(SHIPS[id], 'enemy', subRng(runSeed, STREAM.enemyGuns + index))
+    const ship = new Ship(SHIPS[id], FACTION_AI, subRng(runSeed, STREAM.enemyGuns + index))
     pickSpawnPoint(_spawnPos)
     ship.spawn(_spawnPos, player.position)
 
     ship.onDamaged = (_self, amount, from) => {
-      if (from !== 'player') return
+      if (from !== FACTION_PLAYER) return
       playerHits++
       score += Math.round(amount)
     }
@@ -491,7 +499,11 @@ export function createGame(deps: GameDeps): Game {
       }
       if (target === player) hud.callout('MINE', '#ff3b4e', 1.2)
 
-      target.takeDamage(MINE_DAMAGE, target === player ? 'enemy' : 'player')
+      // Attributed to "not the victim" so a hostile chased onto a mine scores
+      // for the player — documented behaviour, and the one place the arena has
+      // to name a culprit it does not have. See `notMe` in `ship.ts`: this is
+      // the shape that stops working once there are more than two factions.
+      target.takeDamage(MINE_DAMAGE, target === player ? FACTION_AI : FACTION_PLAYER)
     }
   }
 
@@ -1115,7 +1127,7 @@ export function createGame(deps: GameDeps): Game {
       spawnRng = subRng(runSeed, STREAM.spawn)
 
       const spec = SHIPS[shipId]
-      player = new Ship(spec, 'player', subRng(runSeed, STREAM.playerGuns))
+      player = new Ship(spec, FACTION_PLAYER, subRng(runSeed, STREAM.playerGuns))
       player.spawn(PLAYER_SPAWN, PLAYER_SPAWN_LOOK)
       player.onDamaged = (_self, amount) => {
         hud.flashDamage()

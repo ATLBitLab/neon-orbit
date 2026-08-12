@@ -25,7 +25,7 @@
 
 import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
-import { createBolts } from '../src/game/bolts'
+import { createBolts, FACTION_AI, FACTION_PLAYER } from '../src/game/bolts'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import {
   SHIPS,
@@ -155,13 +155,13 @@ interface Rig {
 /** Two pinned hulls, attacker nose-on at `RANGE`, nobody flying. */
 function rig(attackerId: ShipId, targetId: ShipId): Rig {
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
-  const attacker = new Ship(SHIPS[attackerId], 'player')
+  const attacker = new Ship(SHIPS[attackerId], FACTION_PLAYER)
   attacker.spawn(HOME, DOWNRANGE)
   attacker.warpTimer = 0
 
-  const target = new Ship(SHIPS[targetId], 'enemy')
+  const target = new Ship(SHIPS[targetId], FACTION_AI)
   target.spawn(DOWNRANGE, new THREE.Vector3(0, 0, -4000))
   target.warpTimer = 0
 
@@ -240,12 +240,12 @@ function measureTtk(attackerId: ShipId, defenderId: ShipId, overdrive = false): 
 /** Seconds to burn up parked at full solar exposure. */
 function measureSearDeath(id: ShipId): number {
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   // Deepest point of the burn that a pilot can actually reach: the inner edge
   // of the sear ramp, where exposure saturates at 1.
   const deep = SUN_DIRECTION.clone().multiplyScalar(SUN_DISTANCE - SEAR_INNER)
-  const ship = new Ship(SHIPS[id], 'player')
+  const ship = new Ship(SHIPS[id], FACTION_PLAYER)
   ship.spawn(deep, HOME)
   ship.warpTimer = 0
 

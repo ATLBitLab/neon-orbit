@@ -14,7 +14,81 @@
 import * as THREE from 'three'
 import type { Hazard } from '../world/environment'
 
-export type Team = 'player' | 'enemy'
+/**
+ * Who a ship belongs to, for the purpose of who is allowed to shoot it.
+ *
+ * This replaces a two-valued `'player' | 'enemy'`, and the widening is the
+ * point: PvP gives every human their own faction, so the set has to be open.
+ * Today it holds exactly the two values it always did, so no run changes.
+ *
+ * Deliberately not a union of names: a union cannot express "one per
+ * participant", and nothing switches exhaustively on this — every use is an
+ * equality test — so the exhaustiveness a union would buy is not spent anywhere.
+ *
+ * Equally deliberately not a bare `number`. It was one for exactly one review
+ * round, and `takeDamage(amount: number, from: Faction)` then had two
+ * interchangeable parameters: `takeDamage(FACTION_AI, 50)` compiled, where the
+ * old string union would have rejected it. That is the function damage
+ * attribution and scoring run through, so the swap is silent and expensive.
+ *
+ * The brand costs nothing at runtime — a `Faction` *is* a number — but a plain
+ * number is no longer a `Faction`, so hull, damage and faction stop being
+ * mutually assignable. New factions are minted through `humanFaction` rather
+ * than by casting at the call site.
+ */
+declare const factionBrand: unique symbol
+export type Faction = number & { readonly [factionBrand]: unique symbol }
+
+/**
+ * Every NPC shares one faction, deliberately.
+ *
+ * The friendly-fire rule below documents why enemies must not shred each other
+ * in a shared firing line. Giving each NPC its own faction turns that warning
+ * on. Humans are numbered from zero upward instead, so the two sets cannot
+ * collide.
+ */
+export const FACTION_AI = -1 as unknown as Faction
+
+/**
+ * The local human. In PvP, further participants take 1, 2, … — which is why
+ * humans count up from zero and the AI sits below it.
+ */
+export const FACTION_PLAYER = 0 as unknown as Faction
+
+/**
+ * The faction for the human at `index` in the roster. Zero is the local player
+ * today; PvP hands out 1, 2, … as participants join.
+ *
+ * A named constructor rather than a cast at each call site, so that minting a
+ * faction is a deliberate act and `grep humanFaction` finds every one.
+ */
+export function humanFaction(index: number): Faction {
+  /*
+   * The brand stops a bare number becoming a faction by accident. This function
+   * is the one place that is allowed on purpose, which makes it the one place
+   * that has to check.
+   *
+   * `humanFaction(-1)` returns `FACTION_AI`, and -1 is what `indexOf` returns
+   * on a miss — so `humanFaction(roster.indexOf(peer))` is a natural-looking
+   * line that quietly puts a human on the NPC side. Friendly fire then makes
+   * that human unable to shoot the AI filler and the filler unable to shoot
+   * back: invulnerable to, and invisible to, exactly the opposition the filler
+   * exists to provide. Silent, and it looks like an AI difficulty bug.
+   *
+   * Throwing rather than substituting, and the contrast with `clamp` in
+   * `ship.ts` is the reason. A non-numeric deflection has an obvious stand-in —
+   * neutral stick, the ship simply does not turn. There is no stand-in for a
+   * participant: any faction picked here is *somebody*, and picking wrong is
+   * the failure above rather than a smaller version of it.
+   */
+  if (!Number.isInteger(index) || index < 0) {
+    throw new RangeError(
+      `humanFaction needs a non-negative integer roster index, got ${index}` +
+        (index === -1 ? ' — an indexOf miss mints FACTION_AI' : ''),
+    )
+  }
+  return index as unknown as Faction
+}
 
 /** Anything a bolt can hit. `Ship` satisfies this structurally. */
 export interface BoltTarget {
@@ -23,8 +97,8 @@ export interface BoltTarget {
   readonly alive: boolean
   /** False while warping in or phase-dashing. */
   readonly targetable: boolean
-  readonly team: Team
-  takeDamage(amount: number, from: Team): void
+  readonly faction: Faction
+  takeDamage(amount: number, from: Faction): void
 }
 
 export interface FireRequest {
@@ -32,7 +106,7 @@ export interface FireRequest {
   direction: THREE.Vector3
   speed: number
   damage: number
-  team: Team
+  faction: Faction
   color: THREE.Color
 }
 
@@ -40,7 +114,7 @@ export interface BoltHit {
   point: THREE.Vector3
   target: BoltTarget | null
   damage: number
-  team: Team
+  faction: Faction
   color: THREE.Color
 }
 
@@ -56,7 +130,7 @@ interface Bolt {
   vel: THREE.Vector3
   life: number
   damage: number
-  team: Team
+  faction: Faction
   color: THREE.Color
 }
 
@@ -141,7 +215,7 @@ export function createBolts(): Bolts {
     vel: new THREE.Vector3(),
     life: 0,
     damage: 0,
-    team: 'enemy' as Team,
+    faction: FACTION_AI,
     color: new THREE.Color(),
   }))
 
@@ -203,7 +277,7 @@ export function createBolts(): Bolts {
         bolt.vel.copy(req.direction).normalize().multiplyScalar(req.speed)
         bolt.life = BOLT_LIFETIME
         bolt.damage = req.damage
-        bolt.team = req.team
+        bolt.faction = req.faction
         bolt.color.copy(req.color)
         return
       }
@@ -233,7 +307,7 @@ export function createBolts(): Bolts {
           // Friendly fire is off, which also covers a ship shooting itself:
           // enemies would otherwise shred each other while chasing you
           // through the same firing line, and win the game on your behalf.
-          if (target.team === bolt.team) continue
+          if (target.faction === bolt.faction) continue
 
           const reach = target.radius + BOLT_RADIUS
           if (segmentDistanceSq(bolt.prev, bolt.pos, target.position) <= reach * reach) {
@@ -241,10 +315,10 @@ export function createBolts(): Bolts {
               point: closest.clone(),
               target,
               damage: bolt.damage,
-              team: bolt.team,
+              faction: bolt.faction,
               color: bolt.color.clone(),
             })
-            target.takeDamage(bolt.damage, bolt.team)
+            target.takeDamage(bolt.damage, bolt.faction)
             consumed = true
             break
           }
@@ -257,7 +331,7 @@ export function createBolts(): Bolts {
                 point: closest.clone(),
                 target: null,
                 damage: 0,
-                team: bolt.team,
+                faction: bolt.faction,
                 color: bolt.color.clone(),
               })
               consumed = true

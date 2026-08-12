@@ -15,7 +15,7 @@ import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
-import { createBolts } from '../src/game/bolts'
+import { createBolts, FACTION_AI, FACTION_PLAYER, humanFaction } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
 import { createPilot } from '../src/game/controls'
 import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
@@ -120,12 +120,12 @@ function testPlayerBoltsKillEnemies(): void {
 
   const audio = silentAudio()
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio, bolts }
+  const ctx: ShipContext = { hazards: [], audio, bolts, localFaction: FACTION_PLAYER }
 
-  const player = new Ship(SHIPS.hornet, 'player')
+  const player = new Ship(SHIPS.hornet, FACTION_PLAYER)
   player.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
 
-  const enemy = new Ship(SHIPS.wasp, 'enemy')
+  const enemy = new Ship(SHIPS.wasp, FACTION_AI)
   enemy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -2000))
 
   settle([player, enemy], ctx)
@@ -293,15 +293,15 @@ function testDamageClockDrivesEnemyBars(): void {
   section('The damage clock the hull bars are drawn against')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
-  const player = new Ship(SHIPS.hornet, 'player')
+  const player = new Ship(SHIPS.hornet, FACTION_PLAYER)
   player.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
 
   // A Hornet on the receiving end: six volleys of hull, so it survives every
   // hit this check lands, and a dash quirk rather than the Drone's repair, so
   // nothing quietly refills the hull between assertions.
-  const enemy = new Ship(SHIPS.hornet, 'enemy')
+  const enemy = new Ship(SHIPS.hornet, FACTION_AI)
   enemy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -2000))
 
   settle([player, enemy], ctx)
@@ -395,15 +395,15 @@ function testFriendlyFireIsOff(): void {
   section('Bolts never damage their own team')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
-  const shooter = new Ship(SHIPS.drone, 'enemy')
+  const shooter = new Ship(SHIPS.drone, FACTION_AI)
   shooter.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
 
-  const ally = new Ship(SHIPS.wasp, 'enemy')
+  const ally = new Ship(SHIPS.wasp, FACTION_AI)
   ally.spawn(new THREE.Vector3(0, 0, -300), new THREE.Vector3(0, 0, -2000))
 
-  const victim = new Ship(SHIPS.hornet, 'player')
+  const victim = new Ship(SHIPS.hornet, FACTION_PLAYER)
   victim.spawn(new THREE.Vector3(0, 0, -600), new THREE.Vector3(0, 0, -2000))
 
   settle([shooter, ally, victim], ctx)
@@ -434,11 +434,212 @@ function testFriendlyFireIsOff(): void {
   victim.dispose()
 }
 
+
+/**
+ * Factions are open, not a two-sided split wearing a new name.
+ *
+ * The rename from `Team` would be ceremonial if the set still only worked at
+ * two, so this stands up a *third* faction — which is what PvP is: one per
+ * human — and checks the friendly-fire rule holds pairwise rather than
+ * "us and them".
+ *
+ * Nothing in the shipped game creates a third faction yet. That is the point:
+ * this asserts the capability the type now claims, at the moment it is claimed,
+ * rather than waiting for the roster milestone to discover it was never true.
+ */
+/**
+ * Minting a faction is guarded, because it is the one hole the brand leaves.
+ *
+ * `Faction` is branded so a bare number cannot become one by accident, which
+ * makes `humanFaction` the single sanctioned cast — and therefore the single
+ * place a bad value gets in. It took anything: `humanFaction(-1)` returned
+ * `FACTION_AI`, and -1 is what `indexOf` returns on a miss.
+ *
+ * The failure it produces is the quiet kind. That human shares a faction with
+ * every NPC, so friendly fire stops them shooting the AI filler and stops the
+ * filler shooting back — invulnerable to and invisible to the opposition it
+ * exists to provide, reading as an AI bug rather than a roster bug.
+ */
+function testMintingAFactionIsGuarded(): void {
+  section('A faction can only be minted from a real roster index')
+
+  function throws(label: string, index: number): void {
+    let threw = false
+    try {
+      humanFaction(index)
+    } catch {
+      threw = true
+    }
+    check(`minting from ${label} is refused`, threw)
+  }
+
+  throws('an indexOf miss (-1)', -1)
+  throws('a negative index', -7)
+  throws('a fractional index', 1.5)
+  throws('NaN', NaN)
+  throws('Infinity', Infinity)
+
+  /*
+   * The positives, so the guard is not simply rejecting everything — which
+   * would satisfy all five negatives above while breaking every caller.
+   *
+   * Every one goes through `mints`, and the try/catch is what makes them
+   * *falsifiable* rather than merely present. A bare `humanFaction(0)` here
+   * would throw under a broken guard and take the whole process down before
+   * reaching its own assertion: the mutant is still caught, but by the crash,
+   * and the report says "39 of 201 ran" instead of naming the check. Wrapped,
+   * the same mutation reports `FAIL minting from 0 works` and the suite
+   * finishes. Verified both ways — rejecting only index 3 gives
+   * `exit=1 ok=200 FAIL=1`, naming the assertion.
+   */
+  function mints(index: number): { ok: boolean; value: number } {
+    try {
+      return { ok: true, value: humanFaction(index) as unknown as number }
+    } catch {
+      return { ok: false, value: Number.NaN }
+    }
+  }
+
+  /*
+   * The identity, across a range, and asserting the *value* rather than merely
+   * that nothing threw.
+   *
+   * `humanFaction(i) === i` is what makes a roster index and a faction
+   * interchangeable, and it is the whole reason the roster can hand out
+   * factions by position. Checking only `ok` lets a mint return the *wrong*
+   * faction silently: `Math.min(index, 2)` collides participants 3, 4 and 5
+   * into one faction — friendly fire then stops them shooting each other, so
+   * late joiners form a mutually invulnerable bloc — and `index === 5 ? -1 : i`
+   * puts participant 5 on the AI side, which is the original bug one index
+   * over. Both passed at 201 ok, exit 0, before this loop existed.
+   *
+   * The previous version asserted the identity at i=0 only while its name
+   * quantified over every valid index. That is the first failure this codebase
+   * ever recorded — a check promising more than it asserts — reappearing in the
+   * assertion labelled as the important one.
+   */
+  /*
+   * A contiguous range, not a hand-picked sample.
+   *
+   * The first version tested [0, 1, 2, 3, 7] — and a mutation that broke
+   * exactly index 5 passed, because 5 was not in the list. The property is
+   * universal over the roster, so sampling it leaves gaps by construction, and
+   * the gap is wherever the next mistake happens to land. Nine indices cost
+   * nothing; picking five costs the one that was skipped.
+   */
+  for (let i = 0; i <= 8; i++) {
+    const m = mints(i)
+    check(`minting index ${i} succeeds`, m.ok, `threw`)
+    check(`minting index ${i} yields exactly ${i}`, m.ok && m.value === i, `got ${m.value}`)
+    check(
+      `index ${i} cannot reach the AI faction`,
+      m.ok && m.value !== (FACTION_AI as unknown as number),
+      `got ${m.value}`,
+    )
+  }
+
+  // Distinctness, which the identity implies but which is the property the
+  // roster actually depends on: no two participants share a faction.
+  const minted = Array.from({ length: 9 }, (_, i) => mints(i).value)
+  check('every index mints a distinct faction', new Set(minted).size === minted.length, minted.join(','))
+}
+
+function testFactionsAreOpenNotTwoSided(): void {
+  section('Friendly fire is per-faction, and there can be more than two')
+
+  const bolts = createBolts()
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
+
+  // Two humans and an NPC: the phase-B arena in miniature.
+  const SECOND_HUMAN = humanFaction(1)
+  const alice = new Ship(SHIPS.drone, FACTION_PLAYER)
+  const bob = new Ship(SHIPS.hornet, SECOND_HUMAN)
+  const npc = new Ship(SHIPS.wasp, FACTION_AI)
+  const line = [alice, bob, npc]
+  for (const s of line) s.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  settle(line, ctx)
+
+  const aliceHull = alice.hull
+
+  /*
+   * One volley per pair, stopping at the first confirmed hit.
+   *
+   * Not one line-up, because bolts are consumed on impact: the friendly-fire
+   * test can put a victim behind a bystander only because that bystander is an
+   * *ally* and bolts pass through it. With mutually hostile factions the
+   * nearest ship always blocks, so a single volley cannot reach past it.
+   *
+   * And stopping at first damage rather than at death, so every ship survives
+   * for the pairs tested after it. Three hundred rounds of a Drone kills a
+   * Hornet, and a dead shooter fires nothing — which silently emptied the
+   * volley that matters most here.
+   */
+  function volley(shooter: Ship, target: Ship, place: () => void): boolean {
+    const before = target.hull
+    for (let i = 0; i < 400; i++) {
+      place()
+      shooter.step(controls({ fire: true }), STEP, ctx)
+      bolts.update(STEP, line, [])
+      if (target.hull < before) return true
+    }
+    return false
+  }
+
+  const apart = (s: Ship, y: number) => {
+    s.position.set(0, y, 0)
+    s.velocity.set(0, 0, 0)
+  }
+
+  const humanHitHuman = volley(alice, bob, () => {
+    apart(alice, 0)
+    alice.position.set(0, 0, 0)
+    bob.position.set(0, 0, -300)
+    bob.velocity.set(0, 0, 0)
+    apart(npc, 4000)
+  })
+  const humanHitNpc = volley(alice, npc, () => {
+    alice.position.set(0, 0, 0)
+    alice.velocity.set(0, 0, 0)
+    npc.position.set(0, 0, -300)
+    npc.velocity.set(0, 0, 0)
+    apart(bob, 4000)
+  })
+
+  /*
+   * The discriminating pair: Bob on the NPC, neither of them the player.
+   *
+   * Every other assertion here passes just as well under a two-sided
+   * "us and them" rule, because Alice is the only human and both her targets
+   * are simply not-the-player. Only a shot between two factions that are *both*
+   * non-player separates "same faction" from "same side". Verified by mutation:
+   * restoring a two-sided rule leaves every check but this one green.
+   */
+  const npcHitByOtherNonPlayer = volley(bob, npc, () => {
+    bob.position.set(0, 0, 0)
+    bob.velocity.set(0, 0, 0)
+    npc.position.set(0, 0, -300)
+    npc.velocity.set(0, 0, 0)
+    apart(alice, 4000)
+  })
+
+  check('a human damages another human', humanHitHuman)
+  check('the same human damages an NPC', humanHitNpc)
+  check('two non-player factions can shoot each other', npcHitByOtherNonPlayer,
+    'a two-sided rule would leave this one untouched')
+  check('nobody shot themselves', alice.hull === aliceHull, `alice hull=${alice.hull}/${aliceHull}`)
+  // Guards all four: a shooter that never fired satisfies "unharmed" trivially.
+  check('every volley actually fired', alice.shotsFired > 0 && bob.shotsFired > 0,
+    `alice=${alice.shotsFired} bob=${bob.shotsFired}`)
+
+  bolts.dispose()
+  for (const s of line) s.dispose()
+}
+
 function testBoundaryTurnsShipsAround(): void {
   section('Patrol boundary beats full thrust')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   /**
    * Worst case: the fastest, grippiest hull, nose pointed *straight* out at full
@@ -447,7 +648,7 @@ function testBoundaryTurnsShipsAround(): void {
    * and fine — what matters is that it is held near the line and comes back in,
    * not that it is fast while doing so.
    */
-  const radial = new Ship(SHIPS.wasp, 'player')
+  const radial = new Ship(SHIPS.wasp, FACTION_PLAYER)
   radial.spawn(new THREE.Vector3(0, 0, ARENA_RADIUS + 50), new THREE.Vector3(0, 0, ARENA_RADIUS + 5000))
   radial.warpTimer = 0
 
@@ -481,7 +682,7 @@ function testBoundaryTurnsShipsAround(): void {
    * the radial component, so the ship should keep skimming the boundary at real
    * speed rather than grinding to a halt.
    */
-  const oblique = new Ship(SHIPS.wasp, 'player')
+  const oblique = new Ship(SHIPS.wasp, FACTION_PLAYER)
   oblique.spawn(
     new THREE.Vector3(0, 0, ARENA_RADIUS + 20),
     new THREE.Vector3(3000, 0, ARENA_RADIUS + 1200),
@@ -515,10 +716,10 @@ function testQuirks(): void {
 
   const bolts = createBolts()
   const audio = silentAudio()
-  const ctx: ShipContext = { hazards: [], audio, bolts }
+  const ctx: ShipContext = { hazards: [], audio, bolts, localFaction: FACTION_PLAYER }
 
   /* Wasp: sustained fire must lock the guns out. */
-  const wasp = new Ship(SHIPS.wasp, 'player')
+  const wasp = new Ship(SHIPS.wasp, FACTION_PLAYER)
   wasp.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   wasp.warpTimer = 0
 
@@ -534,10 +735,10 @@ function testQuirks(): void {
   check('overheated guns stop firing', wasp.shotsFired === shotsAtLockout)
 
   /* Drone: hull repairs itself after a quiet spell. */
-  const drone = new Ship(SHIPS.drone, 'enemy')
+  const drone = new Ship(SHIPS.drone, FACTION_AI)
   drone.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   drone.warpTimer = 0
-  drone.takeDamage(80, 'player')
+  drone.takeDamage(80, FACTION_PLAYER)
   const wounded = drone.hull
   for (let i = 0; i < 60 * 2; i++) drone.step(controls(), STEP, ctx)
   check('Drone does not repair inside the delay window', drone.hull === wounded)
@@ -546,7 +747,7 @@ function testQuirks(): void {
   check('repair never exceeds max hull', drone.hull <= drone.spec.maxHull)
 
   /* Hornet: dash adds speed, grants brief immunity, then goes on cooldown. */
-  const hornet = new Ship(SHIPS.hornet, 'player')
+  const hornet = new Ship(SHIPS.hornet, FACTION_PLAYER)
   hornet.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   hornet.warpTimer = 0
   for (let i = 0; i < 30; i++) hornet.step(controls({ throttle: 1 }), STEP, ctx)
@@ -571,7 +772,7 @@ function testSolarSear(): void {
 
   const bolts = createBolts()
   const audio = silentAudio()
-  const ctx: ShipContext = { hazards: [], audio, bolts }
+  const ctx: ShipContext = { hazards: [], audio, bolts, localFaction: FACTION_PLAYER }
 
   /* ---- Geometry: the zone has to be reachable, and the star must not ----- */
 
@@ -596,7 +797,7 @@ function testSolarSear(): void {
 
   /* ---- A hull parked in the light cooks ---------------------------------- */
 
-  const burning = new Ship(SHIPS.hornet, 'player')
+  const burning = new Ship(SHIPS.hornet, FACTION_PLAYER)
   const deep = SUN_DIRECTION.clone().multiplyScalar(ARENA_RADIUS)
   burning.spawn(deep, new THREE.Vector3(0, 0, 0))
   burning.warpTimer = 0
@@ -627,13 +828,13 @@ function testSolarSear(): void {
 
   /* ---- Damage is not credited as player marksmanship --------------------- */
 
-  const hostile = new Ship(SHIPS.wasp, 'enemy')
+  const hostile = new Ship(SHIPS.wasp, FACTION_AI)
   hostile.spawn(deep, new THREE.Vector3(0, 0, 0))
   hostile.warpTimer = 0
 
   let creditedToPlayer = 0
   hostile.onDamaged = (_self, _amount, from) => {
-    if (from === 'player') creditedToPlayer++
+    if (from === FACTION_PLAYER) creditedToPlayer++
   }
   for (let i = 0; i < 60 * 4 && hostile.alive; i++) {
     hostile.position.copy(deep)
@@ -649,7 +850,7 @@ function testSolarSear(): void {
 
   /* ---- Safe ground stays safe -------------------------------------------- */
 
-  const shaded = new Ship(SHIPS.hornet, 'player')
+  const shaded = new Ship(SHIPS.hornet, FACTION_PLAYER)
   // The anti-sunward patrol line: as far out as a pilot can legally fly, but
   // pointed away from the star.
   const away = SUN_DIRECTION.clone().multiplyScalar(-ARENA_RADIUS)
@@ -665,7 +866,7 @@ function testSolarSear(): void {
 
   /* ---- Materialising ships are not cooked before they can steer ---------- */
 
-  const arriving = new Ship(SHIPS.wasp, 'enemy')
+  const arriving = new Ship(SHIPS.wasp, FACTION_AI)
   arriving.spawn(deep, new THREE.Vector3(0, 0, 0))
   for (let i = 0; i < 30; i++) {
     arriving.position.copy(deep)
@@ -701,9 +902,9 @@ function testBoltPoolDoesNotLeak(): void {
   section('Bolt pool survives saturation')
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
-  const ship = new Ship(SHIPS.wasp, 'player')
+  const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
   ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
   ship.warpTimer = 0
 
@@ -1140,10 +1341,10 @@ function testMines(): void {
   /* ---- Contact ---------------------------------------------------------- */
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const target = field.mines[0]
-  const ship = new Ship(SHIPS.hornet, 'player')
+  const ship = new Ship(SHIPS.hornet, FACTION_PLAYER)
   ship.spawn(target.position.clone(), new THREE.Vector3(0, 0, 0))
   ship.warpTimer = 0
 
@@ -1151,7 +1352,7 @@ function testMines(): void {
 
   const before = ship.hull
   field.detonate(target)
-  ship.takeDamage(MINE_DAMAGE, 'enemy')
+  ship.takeDamage(MINE_DAMAGE, FACTION_AI)
 
   check('detonation damages the ship', ship.hull === before - MINE_DAMAGE, `hull=${ship.hull}`)
   check('a detonated mine is dead', !target.live)
@@ -1164,7 +1365,7 @@ function testMines(): void {
   // The same mine must not keep hurting a ship parked inside its shell.
   const parked = ship.hull
   for (let i = 0; i < 60; i++) {
-    if (field.findContact(ship.position, ship.radius)) ship.takeDamage(MINE_DAMAGE, 'enemy')
+    if (field.findContact(ship.position, ship.radius)) ship.takeDamage(MINE_DAMAGE, FACTION_AI)
     ship.step(controls(), STEP, ctx)
   }
   check('a dead mine cannot re-trigger', ship.hull === parked, `hull=${ship.hull} vs ${parked}`)
@@ -1242,10 +1443,10 @@ function testPickups(): void {
   /* ---- Repair ------------------------------------------------------------ */
 
   const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
 
   const repairPad = field.pods.find((p) => p.kind === 'repair')!
-  const ship = new Ship(SHIPS.hornet, 'player')
+  const ship = new Ship(SHIPS.hornet, FACTION_PLAYER)
   ship.spawn(repairPad.position.clone(), new THREE.Vector3(0, 0, 0))
   ship.warpTimer = 0
 
@@ -1264,7 +1465,7 @@ function testPickups(): void {
   // A full hull must not consume the pad.
   check('a pod over a full hull heals nothing', ship.repair(REPAIR_AMOUNT) === 0)
 
-  ship.takeDamage(60, 'enemy')
+  ship.takeDamage(60, FACTION_AI)
   const wounded = ship.hull
   const healed = ship.repair(REPAIR_AMOUNT)
   check('a wounded hull is repaired', healed === REPAIR_AMOUNT, `healed=${healed}`)
@@ -1279,10 +1480,10 @@ function testPickups(): void {
    * timer, so a pod that touched it would mean collecting a heal *postpones*
    * your other heal.
    */
-  const drone = new Ship(SHIPS.drone, 'player')
+  const drone = new Ship(SHIPS.drone, FACTION_PLAYER)
   drone.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   drone.warpTimer = 0
-  drone.takeDamage(120, 'enemy')
+  drone.takeDamage(120, FACTION_AI)
   for (let i = 0; i < 60 * 3; i++) drone.step(controls(), STEP, ctx)
   const clockBefore = drone.sinceHit
   drone.repair(REPAIR_AMOUNT)
@@ -1332,7 +1533,7 @@ function testPickups(): void {
 
   /* ---- Overdrive --------------------------------------------------------- */
 
-  const gunner = new Ship(SHIPS.hornet, 'player')
+  const gunner = new Ship(SHIPS.hornet, FACTION_PLAYER)
   gunner.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   gunner.warpTimer = 0
 
@@ -1341,7 +1542,7 @@ function testPickups(): void {
   // Count shots and total damage over a fixed window, stock and boosted, with
   // the ship pinned — this is the same trick the balance harness uses.
   function fireFor(ship: Ship, seconds: number): { shots: number; damage: number } {
-    const dummy = new Ship(SHIPS.drone, 'enemy')
+    const dummy = new Ship(SHIPS.drone, FACTION_AI)
     dummy.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -4000))
     dummy.warpTimer = 0
     let damage = 0
@@ -1391,11 +1592,11 @@ function testPickups(): void {
    * kill thresholds move with it — an earlier version that doubled bolt damage
    * let a boosted Drone delete a Wasp between frames.
    */
-  const boostedBolt = new Ship(SHIPS.drone, 'player')
+  const boostedBolt = new Ship(SHIPS.drone, FACTION_PLAYER)
   boostedBolt.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   boostedBolt.warpTimer = 0
   boostedBolt.engageOverdrive(OVERDRIVE_DURATION)
-  const mark = new Ship(SHIPS.wasp, 'enemy')
+  const mark = new Ship(SHIPS.wasp, FACTION_AI)
   mark.spawn(new THREE.Vector3(0, 0, -400), new THREE.Vector3(0, 0, -4000))
   mark.warpTimer = 0
   let biggestHit = 0
@@ -1440,7 +1641,7 @@ function testPickups(): void {
 
   /* ---- Shield ------------------------------------------------------------ */
 
-  const guarded = new Ship(SHIPS.hornet, 'player')
+  const guarded = new Ship(SHIPS.hornet, FACTION_PLAYER)
   guarded.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   guarded.warpTimer = 0
 
@@ -1457,7 +1658,7 @@ function testPickups(): void {
 
   guarded.engageShield(SHIELD_DURATION)
   const full = guarded.hull
-  guarded.takeDamage(40, 'enemy')
+  guarded.takeDamage(40, FACTION_AI)
   check('a shielded hull takes no damage', guarded.hull === full, `hull=${guarded.hull}`)
   check('the absorbed hit is reported', absorbed === 40, `absorbed=${absorbed}`)
   /**
@@ -1469,7 +1670,7 @@ function testPickups(): void {
   check('a refused hit is not credited as a hit landed', credited === 0, `${credited} credited`)
 
   /* Every damage source, not just bolts. */
-  guarded.takeDamage(MINE_DAMAGE, 'enemy')
+  guarded.takeDamage(MINE_DAMAGE, FACTION_AI)
   check('a shield eats a mine too', guarded.hull === full, `hull=${guarded.hull}`)
 
   /**
@@ -1477,15 +1678,15 @@ function testPickups(): void {
    * nanite timer, so a shielded Drone should keep repairing right through
    * incoming fire — nothing reached its hull.
    */
-  const guardedDrone = new Ship(SHIPS.drone, 'player')
+  const guardedDrone = new Ship(SHIPS.drone, FACTION_PLAYER)
   guardedDrone.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   guardedDrone.warpTimer = 0
-  guardedDrone.takeDamage(120, 'enemy')
+  guardedDrone.takeDamage(120, FACTION_AI)
   for (let i = 0; i < 60 * 8; i++) guardedDrone.step(controls(), STEP, ctx)
   const repairing = guardedDrone.hull
   guardedDrone.engageShield(SHIELD_DURATION)
   for (let i = 0; i < 60; i++) {
-    guardedDrone.takeDamage(10, 'enemy')
+    guardedDrone.takeDamage(10, FACTION_AI)
     guardedDrone.step(controls(), STEP, ctx)
   }
   check(
@@ -1509,7 +1710,7 @@ function testPickups(): void {
   check('shield expires', !guarded.shielded, `${guarded.shieldTimer.toFixed(2)}s left`)
 
   const after = guarded.hull
-  guarded.takeDamage(20, 'enemy')
+  guarded.takeDamage(20, FACTION_AI)
   check('damage lands again once the shield drops', guarded.hull === after - 20, `hull=${guarded.hull}`)
 
   guarded.engageShield(SHIELD_DURATION)
@@ -1707,8 +1908,8 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
 
   function flownFor(ticks: number, c: Partial<Controls>): THREE.Quaternion {
     const bolts = createBolts()
-    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
-    const ship = new Ship(SHIPS.wasp, 'player')
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
+    const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
     ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
     ship.warpTimer = 0
     for (let i = 0; i < ticks; i++) ship.step(controls(c), STEP, ctx)
@@ -1761,8 +1962,8 @@ function testTheAirframeCannotBeAskedToExceedItself(): void {
    */
   function survives(label: string, c: Partial<Controls>): void {
     const bolts = createBolts()
-    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts }
-    const ship = new Ship(SHIPS.wasp, 'player')
+    const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
+    const ship = new Ship(SHIPS.wasp, FACTION_PLAYER)
     ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
     ship.warpTimer = 0
 
@@ -1975,6 +2176,110 @@ function testARunReplaysFromRecordedControls(): void {
  * fixed step, still look approximately right, and would quietly run the game
  * slower than real time on any display whose refresh is not a multiple of 60.
  */
+/**
+ * A pinned fingerprint of a real run, per airframe.
+ *
+ * Every other check here asserts a *property* — a bound holds, a rule fires, a
+ * seed replays. None of them notice a change that is merely different: a tweak
+ * that shifts every trajectory by a hair leaves them all green.
+ *
+ * Milestones 1 and 2 both claimed "no behaviour change", and both times the
+ * evidence was a probe run by hand and pasted into a message. That evidence
+ * evaporates the moment the terminal closes, and it cannot protect the *next*
+ * change. This bakes it in: a closed-loop autopilot flies a seeded run and the
+ * result is compared against numbers stored in this file.
+ *
+ * It is deliberately the most brittle check in the suite, and that is its job.
+ * If it fails, the question is not "what is wrong with the test" — it is
+ * "which number moved, and did I mean to move it". A retune *should* fail this;
+ * the fix is then to update the baseline in the same commit that explains why,
+ * which puts a behaviour change on the record instead of letting it pass as
+ * green.
+ *
+ * Milestone 3 de-singularises `player` across 135 references. This is the net
+ * under it.
+ */
+function testARunMatchesItsRecordedBaseline(): void {
+  section('A seeded run still flies the way it used to')
+
+  /*
+   * Captured from this harness on `feat/factions`.
+   *
+   * What that does and does not establish, stated precisely because a baseline
+   * invites over-reading. It does *not* independently prove milestone 2 changed
+   * nothing — these numbers were recorded after the change. That proof is
+   * separate: a cross-commit probe against `origin/main` before and after, run
+   * once by me and once by BOLTy, byte-identical on all three airframes.
+   *
+   * What this *does* is carry that property forward. From here on, a change
+   * that shifts a trajectory has to say so.
+   */
+  const BASELINE: Record<string, string> = {
+    hornet:
+      '0/0/0/120/177.65902947694352/0 | 10/0/5/120/346.74667078924824/2 | 70/0/13/120/120.17605570806118/3 | 80/0/28/120/10.756811887398108/3',
+    wasp:
+      '0/0/0/70/235.30300057403224/0 | 55/0/19/70/445.3298881633059/2 | 100/0/59/70/292.3947361912082/3 | 115/0/84/70/442.1328492907095/3',
+    drone:
+      '0/0/0/200/125.05555269793625/0 | 0/0/1/180/207.80567967883238/2 | 20/0/5/175/233.0433285191874/3 | 20/0/7/165/197.12698816305436/3',
+  }
+
+  function fly(ship: ShipId): string {
+    const input = stubInput()
+    const pilot = createPilot()
+    const game = createGame({
+      scene: new THREE.Scene(),
+      camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+      environment: stubEnvironment(),
+      input,
+      audio: silentAudio(),
+      hud: stubHud(),
+      bestScoreFor: () => 0,
+      onEnd: () => {},
+    })
+    game.start(ship, 0xfac7107)
+
+    const marks: string[] = []
+    const ticks = Math.ceil(20 / STEP)
+    for (let i = 0; i < ticks; i++) {
+      const t = game.snapshot()?.target ?? null
+      if (t) {
+        input.write.pitch = clampTo(t.pitch * 3, -1, 1)
+        input.write.yaw = clampTo(t.yaw * 3, -1, 1)
+        input.write.fire = Math.abs(t.pitch) < 0.35 && Math.abs(t.yaw) < 0.35
+        input.write.throttleUp = t.range > 260
+        input.write.throttleDown = t.range < 170
+      } else {
+        input.write.pitch = 0
+        input.write.yaw = 0
+        input.write.fire = false
+        input.write.throttleUp = true
+        input.write.throttleDown = false
+      }
+      game.step(pilot.advance(input.state, STEP))
+      if (i % 300 === 0) {
+        const r = game.snapshot()!
+        marks.push(
+          [r.score, r.kills, r.shotsFired, r.playerHull, r.playerSpeed, r.enemiesAirborne].join('/'),
+        )
+      }
+    }
+    return marks.join(' | ')
+  }
+
+  for (const ship of SHIP_ORDER) {
+    const flown = fly(ship)
+    const expected = BASELINE[ship]
+    if (!expected) {
+      // Recording mode: printed so the constant above can be filled in. Fails
+      // rather than passes, so an unfilled baseline cannot masquerade as one
+      // that matched.
+      check(`a ${ship} run has a recorded baseline`, false, `record this: ${flown}`)
+      continue
+    }
+    check(`a ${ship} run matches its baseline`, flown === expected, `got ${flown}`)
+  }
+}
+
 function testTheStepClockNeverLosesTime(): void {
   section('The fixed-step clock converts frames to ticks without drift')
 
@@ -2226,7 +2531,7 @@ function testOneFrameDepictsOneInstant(): void {
     direction: new THREE.Vector3(0, 0, -1),
     speed,
     damage: 1,
-    team: 'player',
+    faction: FACTION_PLAYER,
     color: new THREE.Color(0xffffff),
   })
   bolts.update(STEP, [], [])
@@ -2402,6 +2707,8 @@ testPlayerBoltsKillEnemies()
 testHullBarFadeCurve()
 testDamageClockDrivesEnemyBars()
 testFriendlyFireIsOff()
+testFactionsAreOpenNotTwoSided()
+testMintingAFactionIsGuarded()
 testBoundaryTurnsShipsAround()
 testQuirks()
 testSolarSear()
@@ -2415,6 +2722,7 @@ testARunReplaysFromRecordedControls()
 testTheAirframeCannotBeAskedToExceedItself()
 testStepDoesNotRetainCallerControls()
 testTheStepClockNeverLosesTime()
+testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
