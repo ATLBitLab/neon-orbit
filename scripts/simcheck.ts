@@ -21,6 +21,7 @@ import { createPilot, type Pilot } from '../src/game/controls'
 import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
+import { createDevHook, installDevHook, type DevHook } from '../src/core/dev-hook'
 import { createScreens, type PauseHost, type Screen } from '../src/ui/screens'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
@@ -3809,10 +3810,10 @@ function testTheScreenMachineCanBeLeftAgain(): void {
   moving.screens.moveTo('hangar')
   check('and the hangar', moving.screens.screen === 'hangar', moving.screens.screen)
 
-  /* Every screen the dev hook documents is reachable and reported. `window.__neon.screen`
-     read a bare `screen` after the state moved out of `main.ts`, which compiles against
-     the DOM global — so it returned the browser's `Screen` object instead of any of
-     these. Caught in review, not by a check, because nothing named the four values. */
+  /* All four documented screens are reachable. What the *dev hook* reports for them is
+     `testTheDevHookReadsTheRunningGame`, which reads them through an installed
+     `window.__neon` — this rig would have been perfectly green while the hook returned
+     the browser's `Screen` object, which is exactly what happened. */
   const reachable = new Set<Screen>()
   const tour = rig('hangar', () => true)
   reachable.add(tour.screens.screen)
@@ -3824,7 +3825,7 @@ function testTheScreenMachineCanBeLeftAgain(): void {
   tour.screens.moveTo('debrief')
   reachable.add(tour.screens.screen)
   check(
-    'all four documented screens are reachable and reported by name',
+    'all four documented screens are reachable',
     reachable.size === 4 &&
       ['hangar', 'flight', 'paused', 'debrief'].every((s) => reachable.has(s as Screen)),
     [...reachable].join(','),
@@ -3889,6 +3890,128 @@ function testTheScreenMachineCanBeLeftAgain(): void {
 
   game.dispose()
   SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * `window.__neon`, read through an installed hook rather than described.
+ *
+ * The hook regressed once already: moving the screen state out of `main.ts` left it
+ * reading a bare `screen`, which compiles against the DOM global, so it reported the
+ * browser's `Screen` object instead of any documented value. The repair was one line —
+ * and the check written to protect it toured a local `createScreens` rig and never
+ * touched `window.__neon` at all. Restoring the exact stale read left TypeScript, 396
+ * simulation checks, 41 balance checks, 42 mutations and the build entirely green.
+ *
+ * That is the same mistake as the pause rounds, in the smallest possible form: a check
+ * that certifies the *source* and claims the *reader*. So this installs the hook on a
+ * stand-in global and reads it back — the property descriptor, the getters, and the
+ * objects behind them.
+ *
+ * The two properties that matter are liveness and provenance. A hook snapshotted at
+ * construction reports boot-time values forever, which for a debugging surface is worse
+ * than not existing; and a hook reading the wrong source is what happened.
+ */
+function testTheDevHookReadsTheRunningGame(): void {
+  section('The dev hook reads the running game')
+
+  const screens = createScreens({
+    pause: () => true,
+    resume: () => {},
+    showPanel: () => {},
+    hidePanel: () => {},
+    grabPointer: () => {},
+  })
+  const device = stubInput()
+  const game = newMatch()
+  const launched: ShipId[] = []
+
+  const host: { __neon?: DevHook } = {}
+  installDevHook(host, createDevHook({
+    screens,
+    game,
+    input: device,
+    start: (ship) => launched.push(ship),
+  }))
+
+  const hook = host.__neon
+  check('the hook is installed under its documented name', hook !== undefined)
+  if (!hook) return
+
+  /* ---- The screen, across every documented value -------------------------- */
+
+  const reported: string[] = []
+  reported.push(hook.screen)
+  screens.moveTo('flight')
+  reported.push(hook.screen)
+  screens.togglePause()
+  reported.push(hook.screen)
+  screens.togglePause()
+  screens.moveTo('debrief')
+  reported.push(hook.screen)
+
+  check(
+    'it reports all four documented screens, by name, as the app moves',
+    reported.join(',') === 'hangar,flight,paused,debrief',
+    reported.join(','),
+  )
+  /* The stale read this replaces returned a browser `Screen` *object*, which is not a
+     string at all — so the shape is asserted rather than only the values. */
+  check(
+    'and reports them as strings rather than whatever else is in scope',
+    reported.every((r) => typeof r === 'string'),
+    reported.map((r) => typeof r).join(','),
+  )
+
+  /* ---- Liveness: every field tracks the thing behind it ------------------- */
+
+  screens.moveTo('flight')
+  game.start({ ships: ['hornet'], seed: 0x0eb0 })
+  const atStart = hook.run
+  check('the run view arrives with the match', atStart !== null && atStart.hull > 0,
+    `${atStart === null ? 'null' : atStart.hull}`)
+
+  const intents: Controls[] = [controls({ throttle: 0.8 })]
+  for (let i = 0; i < 60; i++) game.step(intents)
+  const later = hook.run
+  check(
+    'and keeps up with it rather than reporting the moment it was built',
+    later !== null && atStart !== null && later.elapsed > atStart.elapsed,
+    `${atStart?.elapsed} -> ${later?.elapsed}`,
+  )
+
+  device.write.pitch = 0.5
+  device.write.fire = true
+  check(
+    'the input view is live too',
+    hook.input.pitch === 0.5 && hook.input.fire === true,
+    `pitch=${hook.input.pitch} fire=${hook.input.fire}`,
+  )
+  /* Read-only in the sense that matters: writing to what the console is shown must not
+     reach the device, or `__neon` becomes a cheat rather than a window. */
+  hook.input.pitch = -1
+  check('and writing to it does not reach the device', device.state.pitch === 0.5,
+    `device pitch=${device.state.pitch}`)
+
+  hook.start('wasp')
+  check('the launch command reaches the app', launched.join(',') === 'wasp', launched.join(','))
+
+  /* ---- Reinstallable, which is what `configurable` is for ---------------- */
+
+  let reinstalled = true
+  try {
+    installDevHook(host, createDevHook({
+      screens,
+      game,
+      input: device,
+      start: (ship) => launched.push(ship),
+    }))
+  } catch {
+    reinstalled = false
+  }
+  check('the hook can be replaced, as a hot reload does', reinstalled,
+    'the second install threw — a reloaded session would keep the dead one')
+
+  game.dispose()
 }
 
 /**
@@ -5007,6 +5130,7 @@ testTheSquadronIsNotAFunctionOfTheWatcher()
 testTheDrawnSeatIsClampedNotTrusted()
 testARefusedCallChangesNothing()
 testTheScreenMachineCanBeLeftAgain()
+testTheDevHookReadsTheRunningGame()
 testTheLoopSurvivesTheEndOfARun()
 testScoringIsPerSeat()
 testTwoScorersKeepSeparateStreaks()

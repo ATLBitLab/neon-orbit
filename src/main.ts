@@ -10,6 +10,7 @@
 import './style.css'
 import * as THREE from 'three'
 import { createAudio } from './core/audio'
+import { createDevHook, installDevHook } from './core/dev-hook'
 import { createInput } from './core/input'
 import { createStepClock } from './core/loop'
 import { bestFor, lastShip, recordRun, rememberShip, type RunResult } from './core/scores'
@@ -198,26 +199,12 @@ function boot() {
 
   /* ---- Dev console hook -------------------------------------------------- */
 
+  // Built and installed by `src/core/dev-hook.ts`, which a headless run can execute.
+  // The version that lived here read a bare `screen` after the screen state moved out,
+  // which compiles against the DOM global — so the hook reported the browser's `Screen`
+  // object rather than any of the four values the README documents.
   if (import.meta.env.DEV) {
-    Object.defineProperty(window, '__neon', {
-      value: {
-        get screen() {
-          // `screens.screen`, not a bare `screen`: the refactor that moved this state
-          // out left `return screen` compiling against the DOM global, so the dev hook
-          // started reporting the browser's `Screen` object instead of 'hangar' |
-          // 'flight' | 'paused' | 'debrief' as the README promises.
-          return screens.screen
-        },
-        get run() {
-          return game.snapshot()
-        },
-        get input() {
-          return { ...input.state, pointerLocked: input.pointerLocked }
-        },
-        start: startRun,
-      },
-      configurable: true,
-    })
+    installDevHook(window, createDevHook({ screens, game, input, start: startRun }))
   }
 
   /* ---- Loop ------------------------------------------------------------- */

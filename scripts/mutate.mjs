@@ -198,6 +198,38 @@ const MUTATIONS = [
   },
 
   /* ---- Atomicity: a refused call must cost nothing ----------------------- */
+  /* ---- The dev hook: the reader, not only its source ----------------------- */
+  {
+    /*
+     * The exact regression, in its new home: the hook reports a value captured when it
+     * was built rather than the app's current screen. This is what "reads a stale
+     * screen" becomes once the bare-global spelling is impossible — and the check that
+     * used to claim this ground toured a local rig and stayed green through it.
+     */
+    name: 'the dev hook reports the screen it was built with',
+    file: 'src/core/dev-hook.ts',
+    from: '    get screen() {\n      return sources.screens.screen\n    },',
+    to: '    screen: sources.screens.screen,',
+  },
+  {
+    name: 'the dev hook reports the run it was built with',
+    file: 'src/core/dev-hook.ts',
+    from: '    get run() {\n      return sources.game.snapshot()\n    },',
+    to: '    run: sources.game.snapshot(),',
+  },
+  {
+    name: 'the dev hook hands the console the live input struct',
+    file: 'src/core/dev-hook.ts',
+    from: '      return { ...sources.input.state, pointerLocked: sources.input.pointerLocked }',
+    to: '      return Object.assign(sources.input.state, { pointerLocked: sources.input.pointerLocked })',
+  },
+  {
+    name: 'the dev hook cannot be reinstalled by a hot reload',
+    file: 'src/core/dev-hook.ts',
+    from: '  Object.defineProperty(target, name, { value: hook, configurable: true })',
+    to: '  Object.defineProperty(target, name, { value: hook, configurable: false })',
+  },
+
   /* ---- The screen machine: one entry per regression round ------------------ */
   {
     // Round 1, restored: show the panel without honouring the refusal.
@@ -375,7 +407,7 @@ console.log('NEON ORBIT — mutation runs against scripts/simcheck.ts\n')
  * If you added or removed checks on purpose, bump this in the same commit. If you did
  * not, something stopped running.
  */
-const EXPECTED_ASSERTIONS = 396
+const EXPECTED_ASSERTIONS = 405
 const PASS_SUMMARY = 'All checks passed.'
 
 /**
