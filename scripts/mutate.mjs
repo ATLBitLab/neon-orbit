@@ -199,6 +199,18 @@ const MUTATIONS = [
 
   /* ---- Atomicity: a refused call must cost nothing ----------------------- */
   {
+    name: 'pause claims to have paused when it refused',
+    file: 'src/game/game.ts',
+    from: '      if (!active || anySeatWrecked()) return false',
+    to: '      if (!active || anySeatWrecked()) return true',
+  },
+  {
+    name: 'the environment advances while the match is paused',
+    file: 'src/game/game.ts',
+    from: '    if (!live) return\n    environment.step(STEP)',
+    to: '    environment.step(STEP)\n    if (!live) return',
+  },
+  {
     // The one that would have crashed the shipped game on every debrief frame while
     // the whole headless suite stayed green.
     name: 'the intent count is checked even when no match is running',
@@ -273,22 +285,109 @@ if (changed) {
 const only = process.argv[2]
 console.log('NEON ORBIT — mutation runs against scripts/simcheck.ts\n')
 
+/**
+ * How many assertions `check:sim` runs when nothing is wrong.
+ *
+ * Pinned, and deliberately brittle for the same reason the recorded baseline in
+ * `simcheck.ts` is: it is the only thing that can tell "the suite is green" from "the
+ * suite is green and ran everything". Green-and-short is the dangerous one, because
+ * every verdict in this file is "did the suite report a failure" and a suite missing a
+ * whole test invocation still reports none.
+ *
+ * If you added or removed checks on purpose, bump this in the same commit. If you did
+ * not, something stopped running.
+ */
+const EXPECTED_ASSERTIONS = 367
+const PASS_SUMMARY = 'All checks passed.'
+
+/**
+ * Why a control run cannot be trusted, or `null` if it can.
+ *
+ * Four ways it fails, and only the first two were checked before. A run that exits 0
+ * with 348 of 367 assertions and prints its own cheerful summary satisfied the old
+ * guard completely — reproduced by deleting one nine-assertion invocation from a
+ * detached copy of this head, after which all mutants were still reported caught and
+ * the harness exited 0.
+ */
+function controlProblem(r) {
+  if (r.code !== 0) return `it exited ${r.code}`
+  if (r.fail !== 0) return `${r.fail} check(s) failed`
+  if (r.ok === 0) return 'it ran no assertions at all'
+  if (r.last !== PASS_SUMMARY) {
+    return `it never reached its own summary (last line ${JSON.stringify(r.last)})`
+  }
+  if (r.ok !== EXPECTED_ASSERTIONS) {
+    return `it ran ${r.ok} assertions where ${EXPECTED_ASSERTIONS} were expected — ${
+      r.ok < EXPECTED_ASSERTIONS ? 'something stopped running' : 'checks were added'
+    }; bump EXPECTED_ASSERTIONS in scripts/mutate.mjs if that was deliberate`
+  }
+  return null
+}
+
+/*
+ * Self-test, before anything else: prove the control guard can *fail*.
+ *
+ * A guard nobody has seen reject anything is documentation. This removes one real test
+ * invocation from `simcheck.ts`, confirms `controlProblem` names the shortfall, and puts
+ * it back — so the thing that catches a partial suite is exercised on every run rather
+ * than having been checked by hand once, by the person who wrote it, in a commit nobody
+ * can replay.
+ */
+const SELF_TEST_FILE = 'scripts/simcheck.ts'
+const SELF_TEST_ANCHOR = '\ntestTwoScorersKeepSeparateStreaks()\n'
+{
+  const source = readFileSync(SELF_TEST_FILE, 'utf8')
+  if (source.split(SELF_TEST_ANCHOR).length - 1 !== 1) {
+    console.error(
+      `Refusing to run: the self-test anchor ${JSON.stringify(SELF_TEST_ANCHOR.trim())} is not in ` +
+        `${SELF_TEST_FILE} exactly once. The control guard would go unexercised.`,
+    )
+    process.exit(2)
+  }
+  writeFileSync(SELF_TEST_FILE, source.split(SELF_TEST_ANCHOR).join('\n'))
+  let partial
+  try {
+    partial = runSuite()
+  } finally {
+    writeFileSync(SELF_TEST_FILE, source)
+  }
+  const complaint = controlProblem(partial)
+  console.log(
+    `self-test (one test invocation removed): exit=${partial.code} ok=${partial.ok} ` +
+      `FAIL=${partial.fail} -> ${complaint ?? 'ACCEPTED'}`,
+  )
+  if (!complaint) {
+    console.error(
+      '\nRefusing to run: the control guard accepted a suite with a whole test missing.',
+    )
+    process.exit(2)
+  }
+  if (partial.fail !== 0 || partial.code !== 0) {
+    console.error(
+      '\nRefusing to run: removing that invocation made the suite fail, so this proves nothing ' +
+        'about a green-but-short run. Pick an anchor whose absence leaves the suite passing.',
+    )
+    process.exit(2)
+  }
+  console.log('  (green, short, and correctly refused — the guard bites)\n')
+}
+
 /*
  * The control run, and it is not ceremony.
  *
- * Every verdict below is "did the suite report a failure", which is only evidence
- * that the *mutation* did something if the suite reported none to begin with. Against
- * an already-failing suite this harness prints "28 caught" and exits 0 while proving
+ * Every verdict below is "did the suite report a failure", which is only evidence that
+ * the *mutation* did something if the suite reported none to begin with. Against an
+ * already-failing suite this harness prints "29 caught" and exits 0 while proving
  * nothing at all — the same shape as comparing two empty strings, which this codebase
- * has now recorded five times. So: measure the floor first, and refuse to draw
- * conclusions from a baseline that is not clean.
+ * has now recorded five times.
  */
 const baseline = runSuite()
 console.log(
   `control (no mutation): exit=${baseline.code} ok=${baseline.ok} FAIL=${baseline.fail} last=${JSON.stringify(baseline.last)}\n`,
 )
-if (baseline.code !== 0 || baseline.fail !== 0 || baseline.ok === 0) {
-  console.error('Refusing to run: the unmutated suite is not green.')
+const problem = controlProblem(baseline)
+if (problem) {
+  console.error(`Refusing to run: the unmutated suite cannot be trusted — ${problem}.`)
   console.error('Every mutation would report a failure and none of it would mean anything.')
   process.exit(2)
 }

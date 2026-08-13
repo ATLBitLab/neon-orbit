@@ -3496,6 +3496,85 @@ function testPauseIsMirroredAcrossSeats(): void {
   check('and a cutscene anywhere refuses the pause', fromWreck === false && fromSurvivor === false,
     'a wreck mid-explosion was frozen')
 
+  /*
+   * `pause()` says whether it paused, and a caller must be able to trust that
+   * instead of predicting it.
+   *
+   * This is the assertion standing in for a bug that lived in `src/main.ts`, which
+   * this file cannot reach: the pause *screen* was gated on `dying` — the drawn
+   * seat's explosion — while `pause()` refuses for *any* seat's. With a remote
+   * participant wrecked and the local hull flying the two disagreed, the panel went
+   * up, the pause was refused, and the frame loop kept stepping combat behind the
+   * overlay: 140 units of travel in the following second.
+   *
+   * So the property asserted is the one a caller needs: **`dying` is not the pause
+   * condition**, and the only reliable answer is the return value. A future caller
+   * that reaches for `dying` again gets caught here.
+   */
+  {
+    const field = disarmedArena()
+    const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+    game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: 1 })
+    const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+    for (let i = 0; i < 90; i++) game.step(hands)
+    field.arm()
+    for (let i = 0; i < 5; i++) game.step(hands)
+
+    const remoteWrecked = game.snapshot(0)?.phase === 'wrecked'
+    const localFlying = game.snapshot(1)?.phase === 'flying'
+    check('the state is a remote wreck with the drawn seat still flying',
+      remoteWrecked && localFlying,
+      `remote ${game.snapshot(0)?.phase}, drawn ${game.snapshot(1)?.phase}`)
+
+    const saidDying = game.dying
+    const accepted = game.pause()
+    check('`dying` is false here — it is the drawn seat only', saidDying === false, `dying=${saidDying}`)
+    check('pause refuses anyway, and says so', accepted === false, `pause() returned ${accepted}`)
+    check('its answer matches what actually happened', accepted === game.paused,
+      `returned ${accepted}, paused=${game.paused}`)
+
+    // And the simulation really is still advancing, which is what made the overlay a
+    // lie rather than a cosmetic slip.
+    const before = game.snapshot(1)!.position
+    for (let i = 0; i < 60; i++) game.step(hands)
+    const after = game.snapshot(1)!.position
+    const travelled = Math.hypot(after.x - before.x, after.y - before.y, after.z - before.z)
+    check('a refused pause leaves the match running, as it must', travelled > 1,
+      `${travelled.toFixed(1)} units`)
+    game.dispose()
+  }
+
+  /* The mirror: a pause that *is* accepted stops everything, the environment
+     included. `environment.step` used to run before the not-live return, so a paused
+     game kept its pod respawn clocks ticking — pre-existing, and fixed with the pause
+     path rather than left next to it. */
+  {
+    let envTicks = 0
+    const counted: Environment = { ...stubEnvironment(), step: () => { envTicks++ } }
+    const game = newMatch({ environment: counted })
+    game.start({ ships: ['hornet'], seed: 0x9a05e })
+    const hands = [controls({ throttle: 0.6 })]
+    for (let i = 0; i < 30; i++) game.step(hands)
+    const ranBefore = envTicks
+    const accepted = game.pause()
+    const at = game.snapshot(0)!.position
+    for (let i = 0; i < 120; i++) game.step(hands)
+    const still = game.snapshot(0)!.position
+
+    check('a healthy match accepts the pause', accepted === true && game.paused)
+    check('the environment advanced while the match was running', ranBefore === 30, `${ranBefore} ticks`)
+    check('and advances not at all while it is paused', envTicks === ranBefore,
+      `${envTicks - ranBefore} tick(s) during the pause`)
+    check('nor does the hull move', at.x === still.x && at.y === still.y && at.z === still.z,
+      `moved to ${still.z}`)
+
+    game.resume()
+    for (let i = 0; i < 10; i++) game.step(hands)
+    check('and both start again on resume', envTicks === ranBefore + 10 &&
+      game.snapshot(0)!.position.z !== still.z, `${envTicks - ranBefore} env ticks after resume`)
+    game.dispose()
+  }
+
   SHIPS.wasp.maxHull = originalHull
 }
 

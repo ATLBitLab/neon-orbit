@@ -148,12 +148,22 @@ function boot() {
 
   function pauseRun() {
     if (screen !== 'flight') return
-    // The run is over and the wreck is still burning. Escape here — or the
-    // pointer lock the browser drops when you press it — must not park a pause
-    // menu in front of the explosion with a debrief already queued behind it.
-    if (game.dying) return
+    /*
+     * Ask the game, and only put a screen up if it said yes.
+     *
+     * A wreck is still burning somewhere. Escape here — or the pointer lock the
+     * browser drops when you press it — must not park a pause menu in front of an
+     * explosion with a debrief queued behind it.
+     *
+     * This used to test `game.dying` and then pause, which is two answers to one
+     * question. `dying` is the *drawn* seat's explosion; `pause()` refuses while
+     * *any* seat is exploding. With a remote participant wrecked and the local hull
+     * still flying the two disagreed: the panel went up, the pause was refused, and
+     * the frame loop kept stepping combat behind the overlay — measured at 140 units
+     * of travel in the following second.
+     */
+    if (!game.pause()) return
     screen = 'paused'
-    game.pause()
     pause.show(input.invertPitch, audio.muted)
   }
 

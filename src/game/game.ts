@@ -252,7 +252,18 @@ export interface Game {
    * run never calls it.
    */
   render(alpha: number, frameDt: number): void
-  pause(): void
+  /**
+   * Freeze the simulation, and report whether it actually froze.
+   *
+   * The return value is load-bearing rather than a convenience. Pausing is refused
+   * while any seat is mid-explosion, and a caller that decides on its own whether
+   * that is the case will eventually disagree — `src/main.ts` gated its pause
+   * *screen* on `dying`, which is the drawn seat only, so with a remote seat wrecked
+   * it showed the panel while this method refused, and the match kept fighting
+   * behind the overlay. Measured at 140 units of travel in the second after the
+   * player pressed Escape. Ask, then act on the answer.
+   */
+  pause(): boolean
   resume(): void
   /**
    * Drop the run without reporting a result. Used by "abort" — a player who
@@ -1337,8 +1348,17 @@ export function createGame(deps: GameDeps): Game {
       )
     }
 
-    environment.step(STEP)
+    /*
+     * The environment advances only while the match does.
+     *
+     * It used to run before the early return, so a paused game kept its pod respawn
+     * clocks ticking and a player who paused for a minute came back to a re-armed
+     * arena. That predates the roster — byte for byte the same on the base commit —
+     * and it is fixed here because this is the line the roster work moved, and
+     * leaving a known-wrong neighbour untouched is how it gets inherited again.
+     */
     if (!live) return
+    environment.step(STEP)
 
     elapsed += STEP
 
@@ -1779,10 +1799,11 @@ export function createGame(deps: GameDeps): Game {
        * — one wreck, one hull still flying — could be frozen from one machine and
        * not from another. With one seat the two readings are the same sentence.
        */
-      if (!active || anySeatWrecked()) return
+      if (!active || anySeatWrecked()) return false
       paused = true
       input.reset()
       input.releasePointerLock()
+      return true
     },
 
     resume() {
