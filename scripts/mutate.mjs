@@ -198,27 +198,59 @@ const MUTATIONS = [
   },
 
   /* ---- Atomicity: a refused call must cost nothing ----------------------- */
+  /* ---- The pause transition: three rounds of regression, one per entry ---- */
   {
-    /*
-     * The caller-boundary mutant: the exact regression that shipped, restored. It
-     * shows the panel and changes screen without honouring the refusal, which is what
-     * `main.ts` used to do — and what stayed invisible while 367 checks and 31
-     * mutants were green, because nothing executed the transition.
-     */
+    // Round 1, restored: show the panel without honouring the refusal.
     name: 'the pause transition ignores a refused pause',
-    file: 'src/ui/pause-flow.ts',
-    from: "      if (!host.pause()) return 'flight'\n      host.showPanel()",
-    to: "      host.pause()\n      host.showPanel()",
+    file: 'src/ui/screens.ts',
+    from: '      if (!host.pause()) return\n      host.showPanel()',
+    to: '      host.pause()\n      host.showPanel()',
   },
   {
     name: 'the pause transition shows the panel before asking',
-    file: 'src/ui/pause-flow.ts',
-    from: "      if (!host.pause()) return 'flight'\n      host.showPanel()",
-    to: "      host.showPanel()\n      if (!host.pause()) return 'flight'",
+    file: 'src/ui/screens.ts',
+    from: '      if (!host.pause()) return\n      host.showPanel()',
+    to: '      host.showPanel()\n      if (!host.pause()) return',
+  },
+  {
+    /*
+     * Round 3, restored: the panel goes up and the screen is never written — which is
+     * what `pauseFlow.enter()` as a bare statement did when the flow returned the new
+     * screen and `main.ts` was expected to assign it. Resume then refuses, because the
+     * screen does not say `paused`, and the player is sealed behind the overlay.
+     */
+    name: 'entering the pause screen never writes the screen',
+    file: 'src/ui/screens.ts',
+    from: "      host.showPanel()\n      state.screen = 'paused'",
+    to: '      host.showPanel()',
+  },
+  {
+    name: 'leaving the pause screen never writes the screen',
+    file: 'src/ui/screens.ts',
+    from: "      host.grabPointer()\n      state.screen = 'flight'",
+    to: '      host.grabPointer()',
+  },
+  {
+    name: 'the pause screen is entered from any screen at all',
+    file: 'src/ui/screens.ts',
+    from: "      if (state.screen !== 'flight') return",
+    to: '      if (false) return',
+  },
+  {
+    name: 'the pause screen is left from any screen at all',
+    file: 'src/ui/screens.ts',
+    from: "      if (state.screen !== 'paused') return",
+    to: '      if (false) return',
+  },
+  {
+    name: 'Escape toggles the wrong way',
+    file: 'src/ui/screens.ts',
+    from: "      if (state.screen === 'paused') flow.exit()\n      else flow.enter()",
+    to: "      if (state.screen === 'paused') flow.enter()\n      else flow.exit()",
   },
   {
     name: 'leaving the pause screen restarts the sim before hiding the panel',
-    file: 'src/ui/pause-flow.ts',
+    file: 'src/ui/screens.ts',
     from: '      host.hidePanel()\n      host.resume()',
     to: '      host.resume()\n      host.hidePanel()',
   },
@@ -321,7 +353,7 @@ console.log('NEON ORBIT — mutation runs against scripts/simcheck.ts\n')
  * If you added or removed checks on purpose, bump this in the same commit. If you did
  * not, something stopped running.
  */
-const EXPECTED_ASSERTIONS = 379
+const EXPECTED_ASSERTIONS = 389
 const PASS_SUMMARY = 'All checks passed.'
 
 /**

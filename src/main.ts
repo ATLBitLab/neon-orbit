@@ -21,10 +21,8 @@ import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
 import { createHangar } from './ui/hangar'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
-import { createPauseFlow } from './ui/pause-flow'
+import { createPauseFlow, type ScreenState } from './ui/screens'
 import { buildEnvironment } from './world/environment'
-
-type Screen = 'hangar' | 'flight' | 'paused' | 'debrief'
 
 /**
  * Longest frame the simulation will accept, so a tab-switch cannot teleport
@@ -66,7 +64,15 @@ function boot() {
   const audio = createAudio()
   const hud = createHud(overlay)
 
-  let screen: Screen = 'hangar'
+  /*
+   * The screen, in a holder shared with `src/ui/screens.ts` rather than a local.
+   *
+   * The pause transition writes it from in there, where a test can execute it. That is
+   * the third attempt at protecting that transition: the first two left the write here,
+   * and both times the exact regression was reintroducible with every CI gate green —
+   * most recently by dropping the assignment entirely, which is valid TypeScript.
+   */
+  const state: ScreenState = { screen: 'hangar' }
   let pendingResult: RunResult | null = null
 
   /* ---- Screens ---------------------------------------------------------- */
@@ -81,7 +87,7 @@ function boot() {
 
   const pause = createPausePanel({
     parent: overlay,
-    onResume: () => resumeRun(),
+    onResume: () => pauseFlow.exit(),
     onAbort: () => {
       game.abandon()
       openHangar()
@@ -120,7 +126,7 @@ function boot() {
   /* ---- Transitions ------------------------------------------------------ */
 
   function openHangar() {
-    screen = 'hangar'
+    state.screen = 'hangar'
     pause.hide()
     debrief.hide()
     hud.hide()
@@ -135,7 +141,7 @@ function boot() {
     pause.hide()
     debrief.hide()
     rememberShip(id)
-    screen = 'flight'
+    state.screen = 'flight'
     audio.setMusic('combat')
     // Back to launch throttle. The pilot outlives any one run, so a fresh
     // launch has to say so rather than inheriting the last run's last command.
@@ -148,15 +154,11 @@ function boot() {
   }
 
   /*
-   * The pause transition, in `src/ui/pause-flow.ts` rather than here.
-   *
-   * Not a tidy-up: this function is where a real regression lived, and the reason it
-   * could be reintroduced with every check green is that nothing headless can call
-   * `boot()`. Moving the decision behind a DOM-free seam is what puts it inside reach
-   * of the suite and of a mutation. It hands back the screen it left you on, so there
-   * is no boolean here to forget to honour — which is exactly what went wrong.
+   * The pause transition owns its own preconditions and its own screen write, so there
+   * is nothing left here to get wrong or to forget. This is plumbing: five one-line
+   * adapters and no decision.
    */
-  const pauseFlow = createPauseFlow({
+  const pauseFlow = createPauseFlow(state, {
     pause: () => game.pause(),
     resume: () => game.resume(),
     showPanel: () => pause.show(input.invertPitch, audio.muted),
@@ -164,21 +166,11 @@ function boot() {
     grabPointer: () => input.requestPointerLock(),
   })
 
-  function pauseRun() {
-    if (screen !== 'flight') return
-    screen = pauseFlow.enter()
-  }
-
-  function resumeRun() {
-    if (screen !== 'paused') return
-    screen = pauseFlow.exit()
-  }
-
   function finishRun(result: RunResult) {
     pendingResult = result
     const previous = bestFor(result.ship)?.score ?? 0
     const isRecord = recordRun(result)
-    screen = 'debrief'
+    state.screen = 'debrief'
     hud.setLockPrompt(false)
     // These are full-length tracks rather than stings, so they loop like any
     // other screen music. Nobody reads a debrief for a minute and a quarter.
@@ -188,20 +180,16 @@ function boot() {
 
   /* ---- Global keys and pointer lock ------------------------------------- */
 
-  input.onKey('Escape', () => {
-    if (screen === 'flight') pauseRun()
-    else if (screen === 'paused') resumeRun()
-  })
-  input.onKey('KeyP', () => {
-    if (screen === 'flight') pauseRun()
-    else if (screen === 'paused') resumeRun()
-  })
+  // Straight to the flow: it knows which screen it is allowed to act from, so there is
+  // no screen test to duplicate here and get out of step with it.
+  input.onKey('Escape', () => pauseFlow.toggle())
+  input.onKey('KeyP', () => pauseFlow.toggle())
   input.onKey('KeyM', () => audio.toggleMute())
   input.onKey('Tab', () => {
-    if (screen === 'flight') game.cycleTarget()
+    if (state.screen === 'flight') game.cycleTarget()
   })
   input.onKey('KeyT', () => {
-    if (screen === 'flight') game.cycleTarget()
+    if (state.screen === 'flight') game.cycleTarget()
   })
   input.onKey('KeyI', () => {
     input.invertPitch = !input.invertPitch
@@ -209,13 +197,11 @@ function boot() {
 
   // Losing pointer lock mid-fight (usually Escape) should pause, not silently
   // strand the player with a dead mouse.
-  input.onPointerLockLost(() => {
-    if (screen === 'flight') pauseRun()
-  })
+  input.onPointerLockLost(() => pauseFlow.enter())
 
   canvas.addEventListener('click', () => {
     audio.resume()
-    if (screen === 'flight' && !input.pointerLocked) input.requestPointerLock()
+    if (state.screen === 'flight' && !input.pointerLocked) input.requestPointerLock()
   })
 
   /* ---- Dev console hook -------------------------------------------------- */
@@ -257,7 +243,7 @@ function boot() {
   function frame() {
     const { ticks, frameSeconds, alpha } = stepClock.advance(clock.getDelta())
 
-    if (screen === 'hangar') {
+    if (state.screen === 'hangar') {
       // The hangar has no simulation to keep honest — it is a turntable and a
       // set of cards — so it runs straight off the frame.
       environment.update(frameSeconds, stage.camera)
