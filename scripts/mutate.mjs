@@ -12,7 +12,12 @@
  * Each entry breaks the code in one named way and asserts that the suite reports it.
  * The verdicts are deliberately three, not two:
  *
- * - **CAUGHT** — `FAIL > 0`. A named assertion said which property broke.
+ * - **CAUGHT** — `FAIL > 0`, the suite reached its own summary, **and every expected
+ *   assertion ran**. That last clause is not pedantry: a mutant reporting 365 ok + 35
+ *   FAIL against an expected 414 has hidden fourteen checks, and it called itself
+ *   cleanly caught until the count was part of the verdict.
+ * - **CAUGHT-THEN-ABORTED** — named its failures but did not finish the run. Still a
+ *   gap: whatever came after is unmeasured.
  * - **CRASH-ONLY** — non-zero exit with `FAIL = 0`. The mutant is still stopped, but
  *   the diagnostic is "39 of 201 ran" rather than the name of the thing that broke.
  *   Treated as a gap in the suite, not a pass. This repo has produced it twice.
@@ -117,6 +122,18 @@ const MUTATIONS = [
     file: 'src/game/game.ts',
     from: '    if (!matchStillRunning()) finish(pendingResult ?? sealResult(false))',
     to: '    if (!anySeatFlying()) finish(pendingResult ?? sealResult(false))',
+  },
+  {
+    /*
+     * A teammate's win overwrites the drawn seat's sealed loss. Found in review, not by
+     * a check: the existing win-over-wreck rig deliberately drew the *survivor*, so the
+     * opposite viewpoint — the one where a dead participant is handed the squadron clear
+     * — was never played.
+     */
+    name: "a teammate's win overwrites the drawn seat's sealed loss",
+    file: 'src/game/game.ts',
+    from: '      finish(pendingResult ?? sealResult(true))',
+    to: '      finish(sealResult(true))',
   },
   {
     name: 'a win is reported over a wreck',
@@ -407,7 +424,7 @@ console.log('NEON ORBIT — mutation runs against scripts/simcheck.ts\n')
  * If you added or removed checks on purpose, bump this in the same commit. If you did
  * not, something stopped running.
  */
-const EXPECTED_ASSERTIONS = 405
+const EXPECTED_ASSERTIONS = 414
 const PASS_SUMMARY = 'All checks passed.'
 
 /**
@@ -483,6 +500,58 @@ const SELF_TEST_ANCHOR = '\ntestTwoScorersKeepSeparateStreaks()\n'
 }
 
 /*
+ * Second self-test: the *verdict* rule, not the control rule.
+ *
+ * The control guard above only ever inspects the unmutated run. Each mutant got its own,
+ * weaker test — "did it name failures and reach a summary" — and that accepted a run of
+ * 400 of 405 as cleanly caught, hiding five assertions. So this proves the verdict rule
+ * rejects a run that *fails loudly and is still short*, which is the exact shape that
+ * slipped through: a real mutation plus a removed test invocation, which is failing and
+ * short at once.
+ */
+{
+  const source = readFileSync(SELF_TEST_FILE, 'utf8')
+  const gameSource = readFileSync('src/game/game.ts', 'utf8')
+  const BREAK = "      if (!host.pause()) return\n      host.showPanel()"
+  if (gameSource.includes(BREAK)) {
+    console.error('Refusing to run: the verdict self-test patched the wrong file.')
+    process.exit(2)
+  }
+  const screensPath = 'src/ui/screens.ts'
+  const screens = readFileSync(screensPath, 'utf8')
+  if (screens.split(BREAK).length - 1 !== 1) {
+    console.error(`Refusing to run: the verdict self-test anchor is not in ${screensPath} once.`)
+    process.exit(2)
+  }
+  writeFileSync(SELF_TEST_FILE, source.split(SELF_TEST_ANCHOR).join('\n'))
+  writeFileSync(screensPath, screens.split(BREAK).join('      host.pause()\n      host.showPanel()'))
+  let both
+  try {
+    both = runSuite()
+  } finally {
+    writeFileSync(SELF_TEST_FILE, source)
+    writeFileSync(screensPath, screens)
+  }
+  const complete = both.ok + both.fail === EXPECTED_ASSERTIONS
+  console.log(
+    `self-test (failing *and* short): exit=${both.code} ok=${both.ok} FAIL=${both.fail} ` +
+      `(${both.ok + both.fail}/${EXPECTED_ASSERTIONS} ran)`,
+  )
+  if (both.fail === 0) {
+    console.error('\nRefusing to run: that combination was supposed to fail loudly and did not.')
+    process.exit(2)
+  }
+  if (complete) {
+    console.error(
+      '\nRefusing to run: a run missing a whole test invocation still counted as complete, ' +
+        'so the per-mutant verdict cannot tell a full run from a short one.',
+    )
+    process.exit(2)
+  }
+  console.log('  (loud, short, and it would be judged CAUGHT-THEN-ABORTED — the verdict bites)\n')
+}
+
+/*
  * The control run, and it is not ceremony.
  *
  * Every verdict below is "did the suite report a failure", which is only evidence that
@@ -534,7 +603,9 @@ for (const [i, m] of MUTATIONS.entries()) {
    * 341 and stopped — so it is a gap in the harness rather than a clean catch. The
    * summary line is the tell: a finished run ends with its own count.
    */
-  const finished = /check\(s\) failed\.$|All checks passed\.$/.test(result.last)
+  const finished =
+    /check\(s\) failed\.$|All checks passed\.$/.test(result.last) &&
+    result.ok + result.fail === EXPECTED_ASSERTIONS
   const verdict =
     result.fail > 0
       ? finished
@@ -549,7 +620,8 @@ for (const [i, m] of MUTATIONS.entries()) {
 
   console.log(`[${i}] ${m.name}`)
   console.log(
-    `     exit=${result.code} ok=${result.ok} FAIL=${result.fail} last=${JSON.stringify(result.last)} -> ${verdict}`,
+    `     exit=${result.code} ok=${result.ok} FAIL=${result.fail} ` +
+      `(${result.ok + result.fail}/${EXPECTED_ASSERTIONS} ran) last=${JSON.stringify(result.last)} -> ${verdict}`,
   )
   for (const name of result.named.slice(0, 6)) console.log(`       - ${name}`)
   if (result.named.length > 6) console.log(`       ... and ${result.named.length - 6} more`)

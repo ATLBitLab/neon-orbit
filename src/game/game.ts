@@ -1487,8 +1487,21 @@ export function createGame(deps: GameDeps): Game {
        was unreachable rather than handled: the cutscene returned early, so the win
        branch could not run while anybody was dying. */
     if (queue.length === 0 && pilots.length === 0 && anySeatFlying() && !anySeatWrecked()) {
-      hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
-      finish(sealResult(true))
+      /*
+       * A sealed result outranks a fresh one, and the case is not hypothetical.
+       *
+       * In a two-seat match without respawn, the drawn seat can be eliminated — sealing
+       * its loss — and a surviving participant can then clear the squadron. Reporting
+       * `sealResult(true)` there hands a dead participant the win: their own run ended
+       * at their death, and a teammate finishing the job afterwards is not their
+       * victory. It also computes the win bonuses off a hull that is at zero.
+       *
+       * `pendingResult` is only ever set by the local seat's death in a match without
+       * respawn, so preferring it changes nothing for the single-seat game — where the
+       * only way to reach this branch is to still be alive, and `pendingResult` is null.
+       */
+      if (!pendingResult) hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
+      finish(pendingResult ?? sealResult(true))
     }
   }
 

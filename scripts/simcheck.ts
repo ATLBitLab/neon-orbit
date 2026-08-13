@@ -3352,8 +3352,9 @@ function testAWinWaitsForEveryExplosion(): void {
       ended = r
     },
   })
-  // Drawing the survivor, so the reported result is a clean win rather than a loss
-  // sealed earlier by the seat that died.
+  // Drawing the survivor. The mirror — drawing the seat that dies — is
+  // `testAnEliminatedSeatDoesNotInheritTheWin`, and it is a different claim: this one is
+  // about the cutscene not being cut short, that one about whose result gets reported.
   game.start({ ships: ['hornet', 'hornet'], seed: 0x5eed, local: 1 })
 
   const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
@@ -3453,6 +3454,171 @@ function testAWinWaitsForEveryExplosion(): void {
     SHIPS.hornet.maxHull === original.hornetHull &&
       SHIPS.wasp.damage === original.waspDamage &&
       SHIPS.wasp.radius === original.waspRadius,
+  )
+}
+
+/**
+ * An eliminated participant does not inherit a teammate's win.
+ *
+ * The mirror of `testAWinWaitsForEveryExplosion`, and it was missing for a reason worth
+ * recording: that check deliberately draws the *survivor*, and its comment says so — to
+ * keep the reported result a clean win rather than a loss sealed earlier. Choosing the
+ * convenient viewpoint is how the other one goes untested. Same match, same seed, same
+ * mine; only which seat is drawn changes.
+ *
+ * The defect: the drawn seat is eliminated, sealing its loss, and the surviving
+ * participant then clears the squadron. `finish(sealResult(true))` reported `won: true`
+ * for a participant who had been dead for seconds — and computed the win bonuses off a
+ * hull sitting at zero. Their run ended at their death; a teammate finishing the job
+ * afterwards is not their victory.
+ */
+function testAnEliminatedSeatDoesNotInheritTheWin(): void {
+  section('An eliminated participant does not inherit a teammate’s win')
+
+  const original = {
+    hornetHull: SHIPS.hornet.maxHull,
+    waspHull: SHIPS.wasp.maxHull,
+    droneHull: SHIPS.drone.maxHull,
+    waspDamage: SHIPS.wasp.damage,
+    droneDamage: SHIPS.drone.damage,
+    waspRadius: SHIPS.wasp.radius,
+    droneRadius: SHIPS.drone.radius,
+  }
+  SHIPS.hornet.maxHull = 40
+  SHIPS.wasp.maxHull = 30
+  SHIPS.drone.maxHull = 30
+  SHIPS.wasp.damage = 0
+  SHIPS.drone.damage = 0
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
+  const SENTINEL = 350
+
+  /**
+   * Runs the whole thing from one viewpoint: drain the queue, kill seat 0 with a one-shot
+   * mine (roster order picks it), then clear the remaining hostiles while its cutscene
+   * plays. Returns what the drawn seat's debrief was told.
+   */
+  function playFrom(localSeat: number): {
+    result: RunResult | null
+    deaths: number
+    wrecked: boolean
+    scoreAtDeath: number
+    scoreAtEnd: number
+  } {
+    const field = aimedMinefield()
+    let ended: RunResult | null = null
+    const game = newMatch({
+      environment: { ...stubEnvironment(), minefield: field },
+      onEnd: (r) => {
+        ended = r
+      },
+    })
+    game.start({ ships: ['hornet', 'hornet'], seed: 0x5eed, local: localSeat })
+    const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+    const sequence = Math.round(DEATH_SEQUENCE / STEP)
+
+    field.aim((r) => r === SENTINEL)
+    for (let i = 0; i < Math.ceil(40 / STEP); i++) {
+      if (!game.snapshot(0)) break
+      field.arm()
+      game.step(hands)
+      if ((game.snapshot(0)?.enemiesQueued ?? 1) === 0) break
+    }
+    field.aim(() => false)
+
+    field.aim((r) => r !== SENTINEL)
+    field.arm()
+    let wrecked = false
+    let deaths = 0
+    let scoreAtDeath = -1
+    for (let i = 0; i < 60; i++) {
+      const view = game.snapshot(0)
+      if (!view) break
+      deaths = Math.max(deaths, view.deaths)
+      if (view.phase === 'wrecked') {
+        wrecked = true
+        // Read on the first tick the wreck is visible, which is the tick after the seal.
+        scoreAtDeath = view.score
+        break
+      }
+      game.step(hands)
+    }
+
+    field.aim((r) => r === SENTINEL)
+    let scoreAtEnd = scoreAtDeath
+    for (let i = 0; i < sequence + 240 && (ended as RunResult | null) === null; i++) {
+      const view = game.snapshot(0)
+      if (!view) break
+      deaths = Math.max(deaths, view.deaths)
+      scoreAtEnd = view.score
+      field.arm()
+      game.step(hands)
+    }
+
+    game.dispose()
+    return { result: ended as RunResult | null, deaths, wrecked, scoreAtDeath, scoreAtEnd }
+  }
+
+  const asVictim = playFrom(0)
+  const asSurvivor = playFrom(1)
+
+  SHIPS.hornet.maxHull = original.hornetHull
+  SHIPS.wasp.maxHull = original.waspHull
+  SHIPS.drone.maxHull = original.droneHull
+  SHIPS.wasp.damage = original.waspDamage
+  SHIPS.drone.damage = original.droneDamage
+  SHIPS.wasp.radius = original.waspRadius
+  SHIPS.drone.radius = original.droneRadius
+
+  /* The premises, so neither verdict below can pass on a match that did something else. */
+  check('the drawn seat was killed in the first run', asVictim.wrecked && asVictim.deaths === 1,
+    `wrecked=${asVictim.wrecked} deaths=${asVictim.deaths}`)
+  check('both runs resolved', asVictim.result !== null && asSurvivor.result !== null,
+    `victim ${asVictim.result === null ? 'none' : 'ok'}, survivor ${asSurvivor.result === null ? 'none' : 'ok'}`)
+
+  /* The finding. */
+  check(
+    'the eliminated participant is told it lost',
+    asVictim.result?.won === false,
+    `won=${asVictim.result?.won} — a dead participant was handed the squadron clear`,
+  )
+  /*
+   * Exactly the score it had when it died, and the assertion is the *equality* rather
+   * than a bound. A threshold was the first attempt and it was a bad proxy: this seat
+   * legitimately earned 1813 points, because unattributable kills fall back to seat 0
+   * and the mine clearing the squadron produced a lot of them — so "the score is small"
+   * says nothing about whether a bonus was added.
+   *
+   * The freeze is load-bearing here, which the second check establishes: the seat keeps
+   * being credited after it is dead, for exactly the reason `sealResult` exists — "long
+   * enough for a hostile to fly into the star and post a bounty to a pilot who is
+   * already dead".
+   */
+  check(
+    'and its result is the scoreline it died with',
+    asVictim.result?.score === asVictim.scoreAtDeath,
+    `reported ${asVictim.result?.score}, had ${asVictim.scoreAtDeath} at death`,
+  )
+  check(
+    'which is not the same as its scoreline at the end — the seal is doing work',
+    asVictim.scoreAtEnd > asVictim.scoreAtDeath,
+    `${asVictim.scoreAtDeath} at death, ${asVictim.scoreAtEnd} when the match ended`,
+  )
+  /* The other viewpoint, from the same match: the survivor really did win, so the check
+     above is about *whose* result is reported rather than about the match's outcome. */
+  check(
+    'the surviving participant is told it won',
+    asSurvivor.result?.won === true,
+    `won=${asSurvivor.result?.won}`,
+  )
+  check(
+    'so the two viewpoints report different results from one match',
+    asVictim.result?.won !== asSurvivor.result?.won,
+    `both reported won=${asVictim.result?.won}`,
+  )
+  check(
+    'the specs were restored',
+    SHIPS.hornet.maxHull === original.hornetHull && SHIPS.wasp.damage === original.waspDamage,
   )
 }
 
@@ -3875,18 +4041,18 @@ function testTheScreenMachineCanBeLeftAgain(): void {
     if (!game.snapshot(1)) break
     game.step(hands)
   }
-  if (game.snapshot(1)) {
-    live.screens.togglePause()
-    check('once every explosion has finished the same press pauses',
-      live.screens.screen === 'paused' && game.paused,
-      `screen ${live.screens.screen}, paused=${game.paused}`)
-    live.screens.togglePause()
-    check('and the next one resumes the real game',
-      live.screens.screen === 'flight' && !game.paused,
-      `screen ${live.screens.screen}, paused=${game.paused}`)
-  } else {
-    check('the match survived to be paused', false, 'it resolved first')
-  }
+  /* Unconditional, so the count does not move with behaviour — the mutation harness
+     needs it constant. `survived` carries the premise instead of a branch. */
+  const survived = game.snapshot(1) !== null
+  check('the match survived to be paused', survived, 'it resolved first')
+  if (survived) live.screens.togglePause()
+  check('once every explosion has finished the same press pauses',
+    survived && live.screens.screen === 'paused' && game.paused,
+    survived ? `screen ${live.screens.screen}, paused=${game.paused}` : 'the match resolved first')
+  if (survived) live.screens.togglePause()
+  check('and the next one resumes the real game',
+    survived && live.screens.screen === 'flight' && !game.paused,
+    survived ? `screen ${live.screens.screen}, paused=${game.paused}` : 'the match resolved first')
 
   game.dispose()
   SHIPS.wasp.maxHull = originalHull
@@ -3933,9 +4099,16 @@ function testTheDevHookReadsTheRunningGame(): void {
     start: (ship) => launched.push(ship),
   }))
 
-  const hook = host.__neon
-  check('the hook is installed under its documented name', hook !== undefined)
-  if (!hook) return
+  /* No early return: a missing hook must fail the eight checks below by name rather than
+     silently removing them from the run. The harness requires a constant assertion count,
+     and "the hook was never installed" is exactly the case where the rest matter most. */
+  const hook = host.__neon ?? createDevHook({
+    screens,
+    game,
+    input: device,
+    start: () => {},
+  })
+  check('the hook is installed under its documented name', host.__neon !== undefined)
 
   /* ---- The screen, across every documented value -------------------------- */
 
@@ -5047,29 +5220,53 @@ function testOneFrameDepictsOneInstant(): void {
   }
 
   check('the run reached the death cutscene', reachedDying)
+
+  /*
+   * The five checks below run whether or not the cutscene was reached, and that is a
+   * change from `if (reachedDying) { ... }`.
+   *
+   * Skipping them was defensible — their meaning depends on a wreck existing — but it
+   * made the suite's *assertion count* a function of behaviour, and the mutation harness
+   * needs that count to be a constant: a mutant that runs 400 of 405 checks has hidden
+   * five, and it reported itself cleanly caught. Exactly that happened with the "respawn
+   * fires on the frame of death" mutant, which leaves no cutscene to inspect.
+   *
+   * Made unconditional rather than allowlisted, because there is a version that is both
+   * complete and non-vacuous: every measurement is `null` when there was no cutscene, and
+   * every check reads "no cutscene was reached" and fails. Six named failures instead of
+   * one, and 405 either way.
+   */
+  let cutscene: ReturnType<typeof midpointCheck> | null = null
+  let wreckCam: ReturnType<typeof cameraTracksAlpha> | null = null
   if (reachedDying) {
     // One more tick so the wreck has drift to interpolate across, and so this
     // lands inside `WRECK_TUMBLE` while the hull is still on screen and the
     // camera is still locked to it.
     dyingGame.step([dyingPilot.advance(dyingInput.state, STEP)])
-    const cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
+    cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
+    wreckCam = cameraTracksAlpha(dyingCamera, (alpha, dt) => dyingGame.render(alpha, dt))
+  }
+
+  const noCutscene = 'no cutscene was reached'
+  {
     /* As above, this is the detector rather than a sanity check: a wreck pinned
        to the raw tick pose never moves between 0 and 1, so the midpoint below
        would pass on an empty comparison. This is what actually fails. */
-    check('the wreck is moving to compare', cutscene.moved >= 1, `${cutscene.moved} moved`)
-    check('the wreck is drawn at one instant', cutscene.disagreed === '', cutscene.disagreed)
+    check('the wreck is moving to compare', (cutscene?.moved ?? 0) >= 1,
+      cutscene ? `${cutscene.moved} moved` : noCutscene)
+    check('the wreck is drawn at one instant', cutscene !== null && cutscene.disagreed === '',
+      cutscene ? cutscene.disagreed : noCutscene)
 
     // And the other half of the pairing the wreck check is named for.
-    const wreckCam = cameraTracksAlpha(dyingCamera, (alpha, dt) => dyingGame.render(alpha, dt))
     check(
       'the camera following the wreck tracks alpha too',
-      wreckCam.travel > 1e-6,
-      `travelled ${wreckCam.travel}`,
+      (wreckCam?.travel ?? 0) > 1e-6,
+      wreckCam ? `travelled ${wreckCam.travel}` : noCutscene,
     )
     check(
       'the camera following the wreck sits on the interpolation',
-      wreckCam.deviation < wreckCam.travel * CAMERA_CURVATURE,
-      `off by ${wreckCam.deviation} over ${wreckCam.travel}`,
+      wreckCam !== null && wreckCam.deviation < wreckCam.travel * CAMERA_CURVATURE,
+      wreckCam ? `off by ${wreckCam.deviation} over ${wreckCam.travel}` : noCutscene,
     )
     /* Deliberately no rotation check on the cutscene camera, and the reason is
        worth writing down rather than leaving as a gap.
@@ -5085,8 +5282,10 @@ function testOneFrameDepictsOneInstant(): void {
        where it actually varies. */
     check(
       'the cutscene camera does not rotate with the tumbling wreck',
-      wreckCam.sweep < 1e-9,
-      `swept ${wreckCam.sweep} rad — the camera is following the mesh, not the hull`,
+      wreckCam !== null && wreckCam.sweep < 1e-9,
+      wreckCam
+        ? `swept ${wreckCam.sweep} rad — the camera is following the mesh, not the hull`
+        : noCutscene,
     )
   }
 
@@ -5123,6 +5322,7 @@ testEliminationEndsWhenTheArenaEmpties()
 testAnEliminatedSeatStaysEliminated()
 testStaggeredWrecksEachGetTheirWholeCutscene()
 testAWinWaitsForEveryExplosion()
+testAnEliminatedSeatDoesNotInheritTheWin()
 testASeatRespawnsWhileTheOthersKeepFlying()
 testARespawnPointReplaysFromItsSeed()
 testPauseIsMirroredAcrossSeats()
