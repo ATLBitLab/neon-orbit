@@ -53,6 +53,8 @@ import {
   createSeats,
   creditHit,
   creditKill,
+  ELIMINATED,
+  FLYING,
   isParticipant,
   launchPoint,
   recordControls,
@@ -286,12 +288,29 @@ export interface RunSnapshot {
   /** Which seat this view is of, and how many there are. */
   seat: number
   seats: number
-  /** True while this seat's hull is dead and tumbling. */
-  wrecked: boolean
+  /**
+   * Where this seat is in its life: flying, mid-explosion, or out.
+   *
+   * Three states rather than a `wrecked` boolean, because "not wrecked" was
+   * ambiguous between the two ends of a seat's life and reading it as "flying" is
+   * exactly the bug `SeatPhase` exists to make unrepresentable.
+   */
+  phase: 'flying' | 'wrecked' | 'eliminated'
   /** Times this seat has been killed. Zero in a match without respawn. */
   deaths: number
   score: number
   kills: number
+  /**
+   * This seat's streak bonus and its landed-hit count — the two halves of a
+   * scoreline that a `score` total alone cannot separate.
+   *
+   * Both are per-seat state and both were unobservable, which meant "scoring is
+   * per participant" could only be checked through the one number they feed. `hits`
+   * is the accuracy numerator; `multiplier` is what makes a streak personal rather
+   * than shared.
+   */
+  multiplier: number
+  hits: number
   shotsFired: number
   /**
    * This seat's hull and speed. Named for the seat rather than for "the player",
@@ -455,6 +474,28 @@ export function createGame(deps: GameDeps): Game {
   /* ------------------------------------------------------------------------ */
   /* The roster                                                              */
   /* ------------------------------------------------------------------------ */
+
+  /**
+   * Which seat to draw, given what the caller asked for.
+   *
+   * Clamped rather than trusted, because `local` is an index into a roster the
+   * caller did not build and an out-of-range one would leave every presentation
+   * call reading `undefined` for a whole match. Presentation, so a wrong-but-legal
+   * answer is the right failure mode — unlike a faction, where there is no stand-in
+   * and `humanFaction` throws instead.
+   *
+   * The not-a-number case is separate and is why this is a function. `Math.min` and
+   * `Math.max` propagate `NaN` rather than clamping it, so the obvious one-liner
+   * produced `seats[NaN]`, `undefined`, and a `TypeError` on the next line — a
+   * comment claiming "clamped, not fatal" over code that threw. Same trap and same
+   * fix as `clamp` in `ship.ts`, and deliberately not `Number.isFinite`: `Infinity`
+   * is a perfectly clampable request for "the last seat".
+   */
+  function drawnSeatIndex(requested: number | undefined, count: number): number {
+    if (typeof requested !== 'number' || Number.isNaN(requested)) return 0
+    const asked = Math.trunc(requested)
+    return asked < 0 ? 0 : asked > count - 1 ? count - 1 : asked
+  }
 
   /**
    * The seat this machine is drawing, or `null` between matches.
@@ -976,7 +1017,7 @@ export function createGame(deps: GameDeps): Game {
     // other. Order is stable so the markers do not swap places between frames.
     const watcher = local()
     for (const seat of seats) {
-      if (seat === watcher || !seat.ship.alive || seat.wreck) continue
+      if (seat === watcher || !seat.ship.alive || seat.phase.kind !== 'flying') continue
       contactBuffer.push({
         position: seat.ship.visual.group.position,
         hullFraction: seat.ship.hullFraction,
@@ -1008,12 +1049,13 @@ export function createGame(deps: GameDeps): Game {
    * to their own machine.
    */
   function beginDeathSequence(seat: Participant): void {
-    if (seat.wreck) return
+    if (seat.phase.kind !== 'flying') return
     const ship = seat.ship
 
     seat.deaths++
     seat.lockedTarget = null
-    seat.wreck = {
+    seat.phase = {
+      kind: 'wrecked',
       timer: 0,
       nextBlast: 0,
       emissive: ship.visual.hullMat.emissive.clone(),
@@ -1071,7 +1113,7 @@ export function createGame(deps: GameDeps): Game {
    * match.
    */
   function respawnSeat(seat: Participant): void {
-    seat.wreck = null
+    seat.phase = FLYING
     seat.lockedTarget = null
     pickRespawnPoint(seat, _spawnPos)
     fightCentre(_anchor)
@@ -1159,8 +1201,8 @@ export function createGame(deps: GameDeps): Game {
    * may not see the wreck in different places.
    */
   function stepWreck(seat: Participant, dt: number): void {
-    const wreck = seat.wreck
-    if (!wreck) return
+    const wreck = seat.phase
+    if (wreck.kind !== 'wrecked') return
     const ship = seat.ship
     const watching = seat === local()
     wreck.timer += dt
@@ -1236,20 +1278,26 @@ export function createGame(deps: GameDeps): Game {
       return
     }
 
-    // Elimination. The wreck is dropped rather than left standing, so the tick
-    // stops animating a corpse and `snapshot` stops calling the seat "wrecked"
-    // forever — it is dead, which is a different thing and the one that is true.
-    seat.wreck = null
+    // Elimination, and it is its own phase rather than an absent wreck. Reusing
+    // `null` for "never died" and "died, cutscene over" is what let the tick
+    // restart an eliminated seat's cutscene every 2.4 seconds — see `SeatPhase`.
+    seat.phase = ELIMINATED
     seat.ship.visual.group.visible = false
 
-    // The run is over when nobody is left flying — *not* when the seat being
-    // drawn dies, which is the reading that first suggests itself and is wrong.
-    // With one seat the two are the same sentence. With more than one, tying it
-    // to `local` would mean two machines watching one match resolved it at
-    // different moments, which is presentation deciding an outcome. What the
-    // local seat still decides is what the *report* says, because `RunResult` is
-    // one participant's run; when it ends is the match's business.
-    if (!anySeatFlying()) finish(pendingResult ?? sealResult(false))
+    // The run is over when every seat is out — *not* when the seat being drawn
+    // dies, which is the reading that first suggests itself and is wrong. With one
+    // seat the two are the same sentence. With more than one, tying it to `local`
+    // would mean two machines watching one match resolved it at different moments,
+    // which is presentation deciding an outcome. What the local seat still decides
+    // is what the *report* says, because `RunResult` is one participant's run; when
+    // it ends is the match's business.
+    //
+    // "Every seat is out" and not "nobody is flying", which is the weaker test this
+    // replaces: a seat still mid-cutscene is neither flying nor finished, so the
+    // first wreck to resolve used to call `finish` — and `clearArena` with it —
+    // straight through a second wreck that was 85 ticks into its own 144. The
+    // match waits for every cutscene it started.
+    if (!matchStillRunning()) finish(pendingResult ?? sealResult(false))
   }
 
   /* ------------------------------------------------------------------------ */
@@ -1272,15 +1320,25 @@ export function createGame(deps: GameDeps): Game {
    * critical-hull alarm beat faster on a better monitor.
    */
   function step(intents: readonly Controls[]): void {
-    environment.step(STEP)
+    const live = active && !paused && seats.length > 0
 
-    if (!active || paused || seats.length === 0) return
-
-    if (intents.length !== seats.length) {
+    /*
+     * Refused before anything moves, including the environment.
+     *
+     * The check used to sit after `environment.step`, so a rejected tick still
+     * advanced the world clock — mine and pod respawn timers among it. A caller
+     * that caught the error and retried with the right array therefore advanced the
+     * environment twice for one tick of simulation. A call that throws must cost
+     * nothing.
+     */
+    if (live && intents.length !== seats.length) {
       throw new RangeError(
         `step needs one intent per seat: got ${intents.length} for ${seats.length} seat(s)`,
       )
     }
+
+    environment.step(STEP)
+    if (!live) return
 
     elapsed += STEP
 
@@ -1295,11 +1353,11 @@ export function createGame(deps: GameDeps): Game {
        intent supplied for their seat, whoever supplied it. */
     for (let i = 0; i < seats.length; i++) {
       const seat = seats[i]
-      if (seat.wreck) {
+      if (seat.phase.kind === 'wrecked') {
         stepWreck(seat, STEP)
         continue
       }
-      if (!seat.ship.alive) continue
+      if (seat.phase.kind === 'eliminated' || !seat.ship.alive) continue
       recordControls(seat, intents[i])
       seat.ship.step(intents[i], STEP, ctx)
     }
@@ -1390,34 +1448,56 @@ export function createGame(deps: GameDeps): Game {
        death costs the full `DEATH_SEQUENCE`: checking the timer first would let a
        seat that died this very tick resolve on the same tick it started. */
     for (const seat of seats) {
-      if (!seat.ship.alive && !seat.wreck) beginDeathSequence(seat)
+      if (seat.phase.kind === 'flying' && !seat.ship.alive) beginDeathSequence(seat)
     }
     for (const seat of seats) {
-      if (seat.wreck && seat.wreck.timer >= DEATH_SEQUENCE) resolveWreck(seat)
+      if (seat.phase.kind === 'wrecked' && seat.phase.timer >= DEATH_SEQUENCE) resolveWreck(seat)
       if (!active) return
     }
 
     /* A cleared squadron is still the win, and still the only one. What it means
        with more than one seat in the arena — shared, first past a post, highest
-       score — is a match rule, and match rules are milestone 8. */
-    if (queue.length === 0 && pilots.length === 0 && anySeatFlying()) {
+       score — is a match rule, and match rules are milestone 8.
+
+       Gated on nobody being mid-cutscene as well as somebody being alive, and both
+       halves are load-bearing. The squadron can empty on the very tick a seat dies
+       — one mine takes the last hostile and a participant together — and a win
+       reported over a wreck both hands a loss a victory banner and truncates the
+       explosion, because `finish` clears the arena. Before the tick was merged this
+       was unreachable rather than handled: the cutscene returned early, so the win
+       branch could not run while anybody was dying. */
+    if (queue.length === 0 && pilots.length === 0 && anySeatFlying() && !anySeatWrecked()) {
       hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
       finish(sealResult(true))
     }
   }
 
-  /**
-   * True when at least one seat is alive and not mid-cutscene.
-   *
-   * The win check needs it because the squadron can empty while the local seat is
-   * exploding — a mine takes the last hostile and the player on the same tick —
-   * and reporting a win on top of a wreck would hand a loss a victory banner.
-   * Before the merge this could not happen: the cutscene returned early and the
-   * win branch was unreachable while dying.
-   */
+  /** At least one seat is alive and not mid-cutscene. */
   function anySeatFlying(): boolean {
     for (const seat of seats) {
-      if (seat.ship.alive && !seat.wreck) return true
+      if (seat.phase.kind === 'flying' && seat.ship.alive) return true
+    }
+    return false
+  }
+
+  /** At least one seat's explosion is still playing. */
+  function anySeatWrecked(): boolean {
+    for (const seat of seats) {
+      if (seat.phase.kind === 'wrecked') return true
+    }
+    return false
+  }
+
+  /**
+   * At least one seat is not finished with the match.
+   *
+   * Deliberately not "somebody is flying": a seat mid-cutscene is neither flying
+   * nor done, and treating it as done is what let one wreck's resolution clear
+   * another wreck out from under itself.
+   */
+  function matchStillRunning(): boolean {
+    for (const seat of seats) {
+      if (seat.phase.kind !== 'eliminated') return true
     }
     return false
   }
@@ -1461,7 +1541,7 @@ export function createGame(deps: GameDeps): Game {
        whole frame is in, and the invariant is the same either way: everything
        drawn in one frame depicts one instant. */
     for (const seat of seats) {
-      if (seat.wreck) {
+      if (seat.phase.kind === 'wrecked') {
         seat.ship.visual.group.position.lerpVectors(
           seat.ship.prevPosition,
           seat.ship.position,
@@ -1484,7 +1564,7 @@ export function createGame(deps: GameDeps): Game {
     /* The instruments stay frozen where `beginDeathSequence` left them while the
        local seat's wreck is on screen. Everything above still runs, because the
        arena is still moving and the camera is still following the wreck. */
-    if (watcher.wreck) {
+    if (watcher.phase.kind === 'wrecked') {
       hud.updateContacts(contactBuffer, camera)
       hud.tick(frameDt)
       return
@@ -1568,7 +1648,7 @@ export function createGame(deps: GameDeps): Game {
       return paused
     },
     get dying() {
-      return local()?.wreck != null
+      return local()?.phase.kind === 'wrecked'
     },
 
     get seatCount() {
@@ -1576,27 +1656,35 @@ export function createGame(deps: GameDeps): Game {
     },
 
     start(setup) {
+      /*
+       * Everything that can refuse the setup happens before anything is torn down.
+       *
+       * `clearArena` used to run first, so a refused roster left the previous match
+       * disposed and replaced by nothing: `active` still true, `seatCount` zero, a
+       * blank zombie that `step` silently skipped forever. A call that throws has to
+       * leave the running match exactly as it found it.
+       */
+      const specs = setup.ships.map((id) => SHIPS[id])
+      for (let i = 0; i < specs.length; i++) {
+        if (!specs[i]) throw new RangeError(`seat ${i} asks for an unknown hull: ${setup.ships[i]}`)
+      }
+      const seed = (setup.seed ?? ((Math.random() * 0xffffffff) >>> 0)) >>> 0
+      // Built before the teardown for the same reason — `createSeats` refuses an
+      // empty roster, and that refusal must not cost the caller their match.
+      const built = createSeats(specs, seed)
+
       clearArena()
 
-      const seed = setup.seed ?? ((Math.random() * 0xffffffff) >>> 0)
       // Every stream this match draws from hangs off the seed, and must be built
       // before anything draws — `shuffled` below is the first customer.
-      runSeed = seed >>> 0
+      runSeed = seed
       pilotsSpawned = 0
       spawnRng = subRng(runSeed, STREAM.spawn)
       respawnRng = subRng(runSeed, STREAM.respawn)
 
       respawns = setup.respawn ?? false
-      seats = createSeats(
-        setup.ships.map((id) => SHIPS[id]),
-        runSeed,
-      )
-      // Clamped rather than trusted: `local` is an index into a roster the caller
-      // did not build, and an out-of-range one would leave every presentation call
-      // reading `undefined` for the whole match. Presentation, so a wrong-but-legal
-      // answer is the right failure mode — unlike a faction, where there is no
-      // stand-in and `humanFaction` throws instead.
-      localIndex = Math.min(Math.max(0, Math.trunc(setup.local ?? 0)), seats.length - 1)
+      seats = built
+      localIndex = drawnSeatIndex(setup.local, seats.length)
       ctx.localFaction = seats[localIndex].faction
 
       for (const seat of seats) {
@@ -1630,13 +1718,24 @@ export function createGame(deps: GameDeps): Game {
 
       const localSpec = seats[localIndex].ship.spec
 
-      // The squadron is drawn from the hulls the *drawn* seat is not flying, which
-      // is the shape single-player has always had — you never fight your own
-      // airframe. With more than one seat that is not expressible as one rule, and
-      // it stays the drawn seat's for now rather than becoming something invented
-      // here; who the arena fills with is a lobby decision, milestone 9.
+      /*
+       * The squadron is drawn from the hulls **seat 0** is not flying.
+       *
+       * Single-player has always fought the two airframes it did not pick, and with
+       * one seat this is exactly that. The rule cannot generalise as written — with
+       * three seats flying three hulls there is nothing left to fill the arena with
+       * — and who the arena fills with is a lobby decision, milestone 9.
+       *
+       * What matters is that it is keyed on a *roster* position and not on the drawn
+       * one. It was `otherShips(localSpec.id)`, which made the enemy hulls a
+       * function of who was watching: same roster, same seed, same intents, and a
+       * different squadron on each machine. Reproduced across seven seeds — six
+       * diverged, and the one my presentation check happened to use was the one that
+       * did not. Seat 0 is arbitrary in the same way `bountyGoesTo`'s fallback is
+       * arbitrary, and deterministic in the way that matters.
+       */
       const squad: ShipId[] = []
-      for (const id of otherShips(localSpec.id)) {
+      for (const id of otherShips(seats[0].ship.spec.id)) {
         for (let i = 0; i < PER_ENEMY_TYPE; i++) squad.push(id)
       }
       queue = shuffled(squad)
@@ -1670,9 +1769,17 @@ export function createGame(deps: GameDeps): Game {
     render,
 
     pause() {
-      // Never mid-death: freezing here strands the player in a paused explosion,
-      // with a debrief queued behind it or a respawn that never comes.
-      if (!active || local()?.wreck) return
+      /*
+       * Never mid-death: freezing here strands the player in a paused explosion,
+       * with a debrief queued behind it or a respawn that never comes.
+       *
+       * Asked of the *roster* rather than of the drawn seat, which is the third
+       * outcome `local` was reaching. `paused` stops the whole simulation, so a
+       * guard that consulted the drawn seat meant the same match in the same state
+       * — one wreck, one hull still flying — could be frozen from one machine and
+       * not from another. With one seat the two readings are the same sentence.
+       */
+      if (!active || anySeatWrecked()) return
       paused = true
       input.reset()
       input.releasePointerLock()
@@ -1726,10 +1833,12 @@ export function createGame(deps: GameDeps): Game {
         seed: runSeed,
         seat: seat.index,
         seats: seats.length,
-        wrecked: seat.wreck != null,
+        phase: seat.phase.kind,
         deaths: seat.deaths,
         score: seat.score,
         kills: seat.kills,
+        multiplier: seat.multiplier,
+        hits: seat.hits,
         shotsFired: self.shotsFired,
         hull: self.hull,
         speed: self.velocity.length(),

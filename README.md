@@ -135,7 +135,15 @@ src/
   ui/       hangar, pause and debrief screens
 scripts/
   simcheck.ts   headless simulation checks
+  balance.ts    the balance contract
+  mutate.mjs    mutation runs against simcheck — `npm run check:mutants`
 ```
+
+`mutate.mjs` breaks the code in one named way per entry and asserts the suite *reports* it. It
+exists because every "would catch this" claim in this repo's review history was a run pasted from
+someone's terminal, which is the same weakness the recorded baseline in `simcheck.ts` was added to
+fix. Note its third and fourth verdicts: a mutant caught only by a crash, or one that names its
+assertion and then aborts, has hidden every check after it and counts as a gap rather than a pass.
 
 A few decisions worth knowing before changing things:
 
@@ -161,12 +169,20 @@ lookup (`seatOf`). Never `humanFaction(seats.indexOf(x))`: `indexOf` returns -1 
 them unable to shoot the filler and the filler unable to shoot back. A miss has to mean "nobody",
 which is a real answer, rather than a faction picked for it.
 
-**Death is a per-seat state, and respawn is a match policy.** `MatchSetup.respawn` decides whether
-a finished cutscene returns the seat to the arena or leaves it out; the shipped single-player game
-leaves it off, because a run that cannot be lost has no debrief to reach. Either way one
-participant's death does not stop the arena — the squadron keeps flying and the wreck tumbles
-inside the ordinary tick. Elimination resolves the run when nobody is left flying, deliberately
-not when the drawn seat dies.
+**Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
+`eliminated` — one field with three shapes, because the version that used a nullable wreck meant
+"never died" and "died, cutscene over" with the same value and so restarted an eliminated seat's
+explosion every 2.4 seconds. `MatchSetup.respawn` decides whether a finished cutscene returns the
+seat to the arena or leaves it out; the shipped single-player game leaves it off, because a run
+that cannot be lost has no debrief to reach. Either way one participant's death does not stop the
+arena — the squadron keeps flying and the wreck tumbles inside the ordinary tick.
+
+**The match waits for every explosion it started.** It resolves when every seat is `eliminated`,
+not when nobody is left *flying*: a seat mid-cutscene is neither, and treating it as finished let
+one wreck's resolution clear another out from under it 85 ticks into its 144. A win is gated the
+same way, because the squadron can empty on the very tick somebody dies. And it resolves on the
+roster's state rather than the drawn seat's, or two machines watching one match would end it at
+different moments.
 
 **The simulation runs on a fixed step; rendering runs on the frame.** `Game.step()` advances
 exactly 1/60s and takes no delta — there is deliberately no argument for a caller to vary.

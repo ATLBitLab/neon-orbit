@@ -24,22 +24,39 @@ import { LAUNCH_THROTTLE } from './controls'
 import { Ship, type Controls } from './ship'
 
 /**
- * A hull that is dead but still on screen.
+ * Where a seat is in its life, as one field with three shapes.
  *
- * Death is a per-seat state rather than a mode the whole game enters. That is
- * the substantive change here, not a tidy-up: the previous version returned
- * early from the tick and ran a second, parallel copy of the arena loop inside
- * the cutscene, which works for exactly one dying participant and cannot be made
- * to work for two.
+ * Death is a per-seat state rather than a mode the whole game enters. That is the
+ * substantive change here, not a tidy-up: the previous version returned early from
+ * the tick and ran a second, parallel copy of the arena loop inside the cutscene,
+ * which works for exactly one dying participant and cannot be made to work for two.
+ *
+ * **One field rather than a nullable wreck**, and that is a bug fix rather than a
+ * preference. The first version of this carried `wreck: Wreck | null` and used
+ * `null` for two different things — "flying" and "cutscene finished, staying
+ * dead" — so a seat that had been eliminated was indistinguishable from one that
+ * had never died. The tick's own "this hull is dead and has no wreck, start its
+ * cutscene" rule then fired again on the very next tick, and an eliminated seat
+ * re-entered its own death sequence every 2.4 seconds: `deaths` climbing 1, 2, 3
+ * while the participant sat there dead, re-sealing the local result each time.
+ * Reproduced before the fix, and it is now unrepresentable rather than guarded
+ * against — `eliminated` is not `flying`, so nothing can read it as one.
  */
-export interface Wreck {
-  /** Seconds since the fatal hit. */
-  timer: number
-  /** Index of the next entry in the detonation timeline still to fire. */
-  nextBlast: number
-  /** Hull emissive at the moment of death, cooked toward white from there. */
-  readonly emissive: THREE.Color
-}
+export type SeatPhase =
+  | { readonly kind: 'flying' }
+  | {
+      readonly kind: 'wrecked'
+      /** Seconds since the fatal hit. */
+      timer: number
+      /** Index of the next entry in the detonation timeline still to fire. */
+      nextBlast: number
+      /** Hull emissive at the moment of death, cooked toward white from there. */
+      readonly emissive: THREE.Color
+    }
+  | { readonly kind: 'eliminated' }
+
+export const FLYING: SeatPhase = { kind: 'flying' }
+export const ELIMINATED: SeatPhase = { kind: 'eliminated' }
 
 export interface Participant {
   /**
@@ -75,8 +92,7 @@ export interface Participant {
    */
   lockedTarget: Ship | null
 
-  /** Non-null while this seat's hull is tumbling. */
-  wreck: Wreck | null
+  phase: SeatPhase
 
   /**
    * A *copy* of the controls this seat last flew on.
@@ -189,7 +205,7 @@ export function createSeats(specs: readonly ShipSpec[], runSeed: number): Partic
       hits: 0,
       deaths: 0,
       lockedTarget: null,
-      wreck: null,
+      phase: FLYING,
       lastControls: freshControls(),
     }
   })
