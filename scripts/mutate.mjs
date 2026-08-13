@@ -199,6 +199,30 @@ const MUTATIONS = [
 
   /* ---- Atomicity: a refused call must cost nothing ----------------------- */
   {
+    /*
+     * The caller-boundary mutant: the exact regression that shipped, restored. It
+     * shows the panel and changes screen without honouring the refusal, which is what
+     * `main.ts` used to do — and what stayed invisible while 367 checks and 31
+     * mutants were green, because nothing executed the transition.
+     */
+    name: 'the pause transition ignores a refused pause',
+    file: 'src/ui/pause-flow.ts',
+    from: "      if (!host.pause()) return 'flight'\n      host.showPanel()",
+    to: "      host.pause()\n      host.showPanel()",
+  },
+  {
+    name: 'the pause transition shows the panel before asking',
+    file: 'src/ui/pause-flow.ts',
+    from: "      if (!host.pause()) return 'flight'\n      host.showPanel()",
+    to: "      host.showPanel()\n      if (!host.pause()) return 'flight'",
+  },
+  {
+    name: 'leaving the pause screen restarts the sim before hiding the panel',
+    file: 'src/ui/pause-flow.ts',
+    from: '      host.hidePanel()\n      host.resume()',
+    to: '      host.resume()\n      host.hidePanel()',
+  },
+  {
     name: 'pause claims to have paused when it refused',
     file: 'src/game/game.ts',
     from: '      if (!active || anySeatWrecked()) return false',
@@ -297,7 +321,7 @@ console.log('NEON ORBIT — mutation runs against scripts/simcheck.ts\n')
  * If you added or removed checks on purpose, bump this in the same commit. If you did
  * not, something stopped running.
  */
-const EXPECTED_ASSERTIONS = 367
+const EXPECTED_ASSERTIONS = 379
 const PASS_SUMMARY = 'All checks passed.'
 
 /**

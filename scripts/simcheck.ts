@@ -21,6 +21,7 @@ import { createPilot, type Pilot } from '../src/game/controls'
 import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
+import { createPauseFlow, type PauseHost } from '../src/ui/pause-flow'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
 import {
@@ -3500,16 +3501,12 @@ function testPauseIsMirroredAcrossSeats(): void {
    * `pause()` says whether it paused, and a caller must be able to trust that
    * instead of predicting it.
    *
-   * This is the assertion standing in for a bug that lived in `src/main.ts`, which
-   * this file cannot reach: the pause *screen* was gated on `dying` — the drawn
-   * seat's explosion — while `pause()` refuses for *any* seat's. With a remote
-   * participant wrecked and the local hull flying the two disagreed, the panel went
-   * up, the pause was refused, and the frame loop kept stepping combat behind the
-   * overlay: 140 units of travel in the following second.
-   *
-   * So the property asserted is the one a caller needs: **`dying` is not the pause
-   * condition**, and the only reliable answer is the return value. A future caller
-   * that reaches for `dying` again gets caught here.
+   * These assert the *callee*: `dying` is not the pause condition, and the only
+   * reliable answer is the return value. That is worth pinning, and it is not enough
+   * on its own — the bug was in the caller, and an earlier version of this comment
+   * claimed to protect a caller this file could not execute. It certified something
+   * untrue, which is the failure it was describing. The caller now lives behind a
+   * seam and is tested for real in `testThePauseTransitionHonoursTheAnswer`.
    */
   {
     const field = disarmedArena()
@@ -3655,6 +3652,128 @@ function testARefusedCallChangesNothing(): void {
   }
   check('a valid restart is still accepted', restarted)
   running.dispose()
+}
+
+/**
+ * The pause transition, executed rather than described.
+ *
+ * The regression this guards was in the *caller*: `main.ts` showed the panel and then
+ * called `pause()` without honouring its answer, so the overlay sat over a match that
+ * kept fighting. The repair was one line. What made it worthless as a repair is that
+ * nothing could run it — `boot()` needs a canvas and an overlay — so restoring the
+ * exact old behaviour left 367 simulation checks and 31 mutants completely green. A
+ * test that certifies a callee and *claims* to protect its caller is worse than
+ * nothing, because the claim is what stops anyone writing the real one.
+ *
+ * So the decision moved into `src/ui/pause-flow.ts`, `main.ts` calls that, and this
+ * runs it — against a real `Game` in the state where the answer is no, not against a
+ * stub that returns whatever the test wants to see. The host is recorded so the checks
+ * can say what the flow *did*, not only what it returned.
+ */
+function testThePauseTransitionHonoursTheAnswer(): void {
+  section('The pause transition honours the answer it was given')
+
+  interface Recorded {
+    host: PauseHost
+    log: string[]
+  }
+
+  function recorder(pause: () => boolean): Recorded {
+    const log: string[] = []
+    return {
+      log,
+      host: {
+        pause: () => {
+          const ok = pause()
+          log.push(`pause->${ok}`)
+          return ok
+        },
+        resume: () => log.push('resume'),
+        showPanel: () => log.push('showPanel'),
+        hidePanel: () => log.push('hidePanel'),
+        grabPointer: () => log.push('grabPointer'),
+      },
+    }
+  }
+
+  /* ---- Both answers, against a host that simply says yes or no ------------ */
+
+  const accepts = recorder(() => true)
+  const entered = createPauseFlow(accepts.host).enter()
+  check('an accepted pause lands on the pause screen', entered === 'paused', entered)
+  check('and puts the panel up', accepts.log.join(',') === 'pause->true,showPanel', accepts.log.join(','))
+
+  const refuses = recorder(() => false)
+  const stayed = createPauseFlow(refuses.host).enter()
+  check('a refused pause stays in flight', stayed === 'flight', stayed)
+  /* The whole finding, in one assertion: nothing happens on a refusal. Not "the
+     screen is right but the panel is up anyway" — nothing. */
+  check(
+    'and does nothing at all — no panel over a running match',
+    refuses.log.join(',') === 'pause->false',
+    refuses.log.join(','),
+  )
+  check('it asked before it showed anything', refuses.log[0] === 'pause->false', refuses.log.join(','))
+
+  /* ---- Leaving again ------------------------------------------------------ */
+
+  const leaving = recorder(() => true)
+  const back = createPauseFlow(leaving.host).exit()
+  check('leaving returns to flight', back === 'flight', back)
+  check(
+    'and takes the panel down before the simulation restarts',
+    leaving.log.join(',') === 'hidePanel,resume,grabPointer',
+    leaving.log.join(','),
+  )
+
+  /* ---- The real thing: a real Game, in the state that refuses ------------- */
+
+  /*
+   * This is the case the shipped UI cannot construct today — it starts a one-seat
+   * match — and the case the whole finding is about. A remote seat mid-explosion, the
+   * local hull still flying, and the transition asked for a pause.
+   */
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  const field = disarmedArena()
+  const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+  game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: 1 })
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+  for (let i = 0; i < 90; i++) game.step(hands)
+  field.arm()
+  for (let i = 0; i < 5; i++) game.step(hands)
+
+  const live = recorder(() => game.pause())
+  const flow = createPauseFlow(live.host)
+
+  check(
+    'the state is a remote wreck with the drawn seat flying',
+    game.snapshot(0)?.phase === 'wrecked' && game.snapshot(1)?.phase === 'flying',
+    `remote ${game.snapshot(0)?.phase}, drawn ${game.snapshot(1)?.phase}`,
+  )
+  const outcome = flow.enter()
+  check('the transition is refused by the real game', outcome === 'flight', outcome)
+  check('no panel went up over it', !live.log.includes('showPanel'), live.log.join(','))
+  check('and the simulation was not frozen', !game.paused)
+
+  /* And the mirror, so "refuses" is not the only thing this flow can do against a
+     real game: once the cutscene is over, the same transition succeeds. */
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+  for (let i = 0; i < sequence + 30; i++) {
+    if (!game.snapshot(1)) break
+    game.step(hands)
+  }
+  const after = createPauseFlow(live.host)
+  const nowPaused = game.snapshot(1) ? after.enter() : 'flight'
+  check(
+    'once every explosion has finished the same transition succeeds',
+    nowPaused === 'paused' && game.paused,
+    `returned ${nowPaused}, paused=${game.paused}`,
+  )
+
+  game.dispose()
+  SHIPS.wasp.maxHull = originalHull
 }
 
 /**
@@ -4772,6 +4891,7 @@ testPauseIsMirroredAcrossSeats()
 testTheSquadronIsNotAFunctionOfTheWatcher()
 testTheDrawnSeatIsClampedNotTrusted()
 testARefusedCallChangesNothing()
+testThePauseTransitionHonoursTheAnswer()
 testTheLoopSurvivesTheEndOfARun()
 testScoringIsPerSeat()
 testTwoScorersKeepSeparateStreaks()

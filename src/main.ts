@@ -21,6 +21,7 @@ import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
 import { createHangar } from './ui/hangar'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
+import { createPauseFlow } from './ui/pause-flow'
 import { buildEnvironment } from './world/environment'
 
 type Screen = 'hangar' | 'flight' | 'paused' | 'debrief'
@@ -146,33 +147,31 @@ function boot() {
     input.requestPointerLock()
   }
 
+  /*
+   * The pause transition, in `src/ui/pause-flow.ts` rather than here.
+   *
+   * Not a tidy-up: this function is where a real regression lived, and the reason it
+   * could be reintroduced with every check green is that nothing headless can call
+   * `boot()`. Moving the decision behind a DOM-free seam is what puts it inside reach
+   * of the suite and of a mutation. It hands back the screen it left you on, so there
+   * is no boolean here to forget to honour — which is exactly what went wrong.
+   */
+  const pauseFlow = createPauseFlow({
+    pause: () => game.pause(),
+    resume: () => game.resume(),
+    showPanel: () => pause.show(input.invertPitch, audio.muted),
+    hidePanel: () => pause.hide(),
+    grabPointer: () => input.requestPointerLock(),
+  })
+
   function pauseRun() {
     if (screen !== 'flight') return
-    /*
-     * Ask the game, and only put a screen up if it said yes.
-     *
-     * A wreck is still burning somewhere. Escape here — or the pointer lock the
-     * browser drops when you press it — must not park a pause menu in front of an
-     * explosion with a debrief queued behind it.
-     *
-     * This used to test `game.dying` and then pause, which is two answers to one
-     * question. `dying` is the *drawn* seat's explosion; `pause()` refuses while
-     * *any* seat is exploding. With a remote participant wrecked and the local hull
-     * still flying the two disagreed: the panel went up, the pause was refused, and
-     * the frame loop kept stepping combat behind the overlay — measured at 140 units
-     * of travel in the following second.
-     */
-    if (!game.pause()) return
-    screen = 'paused'
-    pause.show(input.invertPitch, audio.muted)
+    screen = pauseFlow.enter()
   }
 
   function resumeRun() {
     if (screen !== 'paused') return
-    pause.hide()
-    screen = 'flight'
-    game.resume()
-    input.requestPointerLock()
+    screen = pauseFlow.exit()
   }
 
   function finishRun(result: RunResult) {
