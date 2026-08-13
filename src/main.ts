@@ -21,7 +21,7 @@ import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
 import { createHangar } from './ui/hangar'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
-import { createPauseFlow, type ScreenState } from './ui/screens'
+import { createScreens } from './ui/screens'
 import { buildEnvironment } from './world/environment'
 
 /**
@@ -64,15 +64,6 @@ function boot() {
   const audio = createAudio()
   const hud = createHud(overlay)
 
-  /*
-   * The screen, in a holder shared with `src/ui/screens.ts` rather than a local.
-   *
-   * The pause transition writes it from in there, where a test can execute it. That is
-   * the third attempt at protecting that transition: the first two left the write here,
-   * and both times the exact regression was reintroducible with every CI gate green —
-   * most recently by dropping the assignment entirely, which is valid TypeScript.
-   */
-  const state: ScreenState = { screen: 'hangar' }
   let pendingResult: RunResult | null = null
 
   /* ---- Screens ---------------------------------------------------------- */
@@ -87,7 +78,7 @@ function boot() {
 
   const pause = createPausePanel({
     parent: overlay,
-    onResume: () => pauseFlow.exit(),
+    onResume: () => screens.exitPause(),
     onAbort: () => {
       game.abandon()
       openHangar()
@@ -126,7 +117,7 @@ function boot() {
   /* ---- Transitions ------------------------------------------------------ */
 
   function openHangar() {
-    state.screen = 'hangar'
+    screens.moveTo('hangar')
     pause.hide()
     debrief.hide()
     hud.hide()
@@ -141,7 +132,7 @@ function boot() {
     pause.hide()
     debrief.hide()
     rememberShip(id)
-    state.screen = 'flight'
+    screens.moveTo('flight')
     audio.setMusic('combat')
     // Back to launch throttle. The pilot outlives any one run, so a fresh
     // launch has to say so rather than inheriting the last run's last command.
@@ -154,11 +145,12 @@ function boot() {
   }
 
   /*
-   * The pause transition owns its own preconditions and its own screen write, so there
-   * is nothing left here to get wrong or to forget. This is plumbing: five one-line
-   * adapters and no decision.
+   * `src/ui/screens.ts` owns the screen and every transition's precondition. There is no
+   * state to hand it and no answer to assign back — the fourth attempt at removing the
+   * part of this decision that no test could reach, and the first with nothing left for
+   * a caller to finish. What remains here is five one-line adapters and no branches.
    */
-  const pauseFlow = createPauseFlow(state, {
+  const screens = createScreens({
     pause: () => game.pause(),
     resume: () => game.resume(),
     showPanel: () => pause.show(input.invertPitch, audio.muted),
@@ -170,7 +162,7 @@ function boot() {
     pendingResult = result
     const previous = bestFor(result.ship)?.score ?? 0
     const isRecord = recordRun(result)
-    state.screen = 'debrief'
+    screens.moveTo('debrief')
     hud.setLockPrompt(false)
     // These are full-length tracks rather than stings, so they loop like any
     // other screen music. Nobody reads a debrief for a minute and a quarter.
@@ -182,14 +174,14 @@ function boot() {
 
   // Straight to the flow: it knows which screen it is allowed to act from, so there is
   // no screen test to duplicate here and get out of step with it.
-  input.onKey('Escape', () => pauseFlow.toggle())
-  input.onKey('KeyP', () => pauseFlow.toggle())
+  input.onKey('Escape', () => screens.togglePause())
+  input.onKey('KeyP', () => screens.togglePause())
   input.onKey('KeyM', () => audio.toggleMute())
   input.onKey('Tab', () => {
-    if (state.screen === 'flight') game.cycleTarget()
+    if (screens.screen === 'flight') game.cycleTarget()
   })
   input.onKey('KeyT', () => {
-    if (state.screen === 'flight') game.cycleTarget()
+    if (screens.screen === 'flight') game.cycleTarget()
   })
   input.onKey('KeyI', () => {
     input.invertPitch = !input.invertPitch
@@ -197,11 +189,11 @@ function boot() {
 
   // Losing pointer lock mid-fight (usually Escape) should pause, not silently
   // strand the player with a dead mouse.
-  input.onPointerLockLost(() => pauseFlow.enter())
+  input.onPointerLockLost(() => screens.enterPause())
 
   canvas.addEventListener('click', () => {
     audio.resume()
-    if (state.screen === 'flight' && !input.pointerLocked) input.requestPointerLock()
+    if (screens.screen === 'flight' && !input.pointerLocked) input.requestPointerLock()
   })
 
   /* ---- Dev console hook -------------------------------------------------- */
@@ -210,7 +202,11 @@ function boot() {
     Object.defineProperty(window, '__neon', {
       value: {
         get screen() {
-          return screen
+          // `screens.screen`, not a bare `screen`: the refactor that moved this state
+          // out left `return screen` compiling against the DOM global, so the dev hook
+          // started reporting the browser's `Screen` object instead of 'hangar' |
+          // 'flight' | 'paused' | 'debrief' as the README promises.
+          return screens.screen
         },
         get run() {
           return game.snapshot()
@@ -243,7 +239,7 @@ function boot() {
   function frame() {
     const { ticks, frameSeconds, alpha } = stepClock.advance(clock.getDelta())
 
-    if (state.screen === 'hangar') {
+    if (screens.screen === 'hangar') {
       // The hangar has no simulation to keep honest — it is a turntable and a
       // set of cards — so it runs straight off the frame.
       environment.update(frameSeconds, stage.camera)

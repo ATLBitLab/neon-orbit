@@ -21,7 +21,7 @@ import { createPilot, type Pilot } from '../src/game/controls'
 import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
-import { createPauseFlow, type PauseHost, type ScreenState } from '../src/ui/screens'
+import { createScreens, type PauseHost, type Screen } from '../src/ui/screens'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
 import {
@@ -3506,7 +3506,7 @@ function testPauseIsMirroredAcrossSeats(): void {
    * on its own — the bug was in the caller, and an earlier version of this comment
    * claimed to protect a caller this file could not execute. It certified something
    * untrue, which is the failure it was describing. The caller now lives behind a
-   * seam and is tested for real in `testThePauseTransitionCanBeLeftAgain`.
+   * seam and is tested for real in `testTheScreenMachineCanBeLeftAgain`.
    */
   {
     const field = disarmedArena()
@@ -3655,89 +3655,78 @@ function testARefusedCallChangesNothing(): void {
 }
 
 /**
- * The pause transition, and whether a paused game can be un-paused.
+ * The screen state machine: entering the pause screen, and getting back out.
  *
- * Three attempts at protecting this. Each moved the tested boundary one layer inward
- * and each left the shipped caller outside it, so the exact regression stayed
- * reintroducible with every gate green:
+ * Four rounds landed on this one transition, and every fix moved the tested boundary
+ * one layer inward while leaving the last step of the decision in code no test could
+ * reach — the caller's own copy of the pause condition, then an answer it had to
+ * honour, then a value it had to assign, then an object it had to pass by reference
+ * rather than by copy. Each regression stayed green across the whole suite.
  *
- * 1. `main.ts` held its own copy of the pause condition (`game.dying`) and disagreed
- *    with `Game.pause()`. Overlay over a running match.
- * 2. `Game.pause()` returned its answer and `main.ts` honoured it — but nothing
- *    headless can call `boot()`, so restoring the old caller left 367 checks green.
- * 3. The decision moved into a flow returning the new screen. I claimed a caller
- *    "cannot ignore a value it has to assign"; that is false, `flow.enter()` as a bare
- *    statement discards it, and then the panel is up while the screen still says
- *    `flight` — so Resume refuses and the player is stuck behind the overlay.
- *
- * What finally closes it is that the flow writes the screen itself, from a holder
- * `main.ts` shares by reference. So these checks assert two different things, and the
- * second is the one that matters: not only "did the flow return/do the right thing",
- * but **can the player get back out**, driven through a model of `main.ts`'s own key
- * handler rather than by calling `enter` and `exit` in the order the test prefers.
+ * So `createScreens` owns the state outright: there is nothing to hand it and nothing
+ * to assign back. These checks assert two things, and the second is the one every
+ * earlier version missed — not "did the transition return the right thing" but **can
+ * the player get back out**, driven through a model of `main.ts`'s own key handler
+ * rather than by calling enter and exit in whatever order suits the test.
  */
-function testThePauseTransitionCanBeLeftAgain(): void {
+function testTheScreenMachineCanBeLeftAgain(): void {
   section('The pause screen can be entered, and left again')
 
   interface Rig {
-    state: ScreenState
-    host: PauseHost
+    screens: ReturnType<typeof createScreens>
     log: string[]
   }
 
   /*
-   * `resume` is wired separately from `pause`, and that is not symmetry for its own
-   * sake. The first version of the live case below wired only `pause` to the real game
-   * and left `resume` as a log entry, then asserted the real game had resumed — which
-   * failed, correctly, on a host that was never connected to it. A double whose halves
-   * reach different places is a check on nothing in particular.
+   * `resume` is wired separately from `pause`, and not for symmetry. The first version
+   * of the live case below wired only `pause` to the real game and left `resume` as a
+   * log entry, then asserted the real game had resumed — which failed, correctly. A
+   * double whose halves reach different places is a check on nothing in particular.
    */
   function rig(
-    screen: ScreenState['screen'],
+    from: 'hangar' | 'flight' | 'debrief',
     pause: () => boolean,
     resume: () => void = () => {},
   ): Rig {
     const log: string[] = []
-    return {
-      state: { screen },
-      log,
-      host: {
-        pause: () => {
-          const ok = pause()
-          log.push(`pause->${ok}`)
-          return ok
-        },
-        resume: () => {
-          resume()
-          log.push('resume')
-        },
-        showPanel: () => log.push('showPanel'),
-        hidePanel: () => log.push('hidePanel'),
-        grabPointer: () => log.push('grabPointer'),
+    const host: PauseHost = {
+      pause: () => {
+        const ok = pause()
+        log.push(`pause->${ok}`)
+        return ok
       },
+      resume: () => {
+        resume()
+        log.push('resume')
+      },
+      showPanel: () => log.push('showPanel'),
+      hidePanel: () => log.push('hidePanel'),
+      grabPointer: () => log.push('grabPointer'),
     }
+    return { screens: createScreens(host, from), log }
   }
 
   /* ---- Both answers ------------------------------------------------------- */
 
   const yes = rig('flight', () => true)
-  createPauseFlow(yes.state, yes.host).enter()
-  check('an accepted pause reaches the pause screen', yes.state.screen === 'paused', yes.state.screen)
+  yes.screens.enterPause()
+  check('an accepted pause reaches the pause screen', yes.screens.screen === 'paused', yes.screens.screen)
   check('and puts the panel up, after asking', yes.log.join(',') === 'pause->true,showPanel', yes.log.join(','))
 
   const no = rig('flight', () => false)
-  createPauseFlow(no.state, no.host).enter()
-  /* The first finding, in one assertion: a refusal changes *nothing*. Not "the screen
-     is right and the panel is up anyway", which is the same bug wearing a correct
-     answer. */
-  check('a refused pause leaves the screen in flight', no.state.screen === 'flight', no.state.screen)
+  no.screens.enterPause()
+  /* A refusal changes *nothing*. Not "the screen is right and the panel is up anyway",
+     which is the same bug wearing a correct answer. */
+  check('a refused pause leaves the screen in flight', no.screens.screen === 'flight', no.screens.screen)
   check('and does nothing else at all', no.log.join(',') === 'pause->false', no.log.join(','))
 
   /* ---- Leaving ------------------------------------------------------------ */
 
-  const leaving = rig('paused', () => true)
-  createPauseFlow(leaving.state, leaving.host).exit()
-  check('leaving returns to flight', leaving.state.screen === 'flight', leaving.state.screen)
+  const leaving = rig('flight', () => true)
+  leaving.screens.enterPause()
+  leaving.log.length = 0
+  leaving.screens.exitPause()
+  check('leaving returns to flight', leaving.screens.screen === 'flight', leaving.screens.screen)
   check(
     'and takes the panel down before the simulation restarts',
     leaving.log.join(',') === 'hidePanel,resume,grabPointer',
@@ -3746,37 +3735,36 @@ function testThePauseTransitionCanBeLeftAgain(): void {
 
   /* ---- Preconditions, which used to live at the call site ---------------- */
 
-  for (const from of ['hangar', 'debrief', 'paused'] as ScreenState['screen'][]) {
+  for (const from of ['hangar', 'debrief'] as const) {
     const r = rig(from, () => true)
-    createPauseFlow(r.state, r.host).enter()
-    check(`pausing from the ${from} screen does nothing`, r.state.screen === from && r.log.length === 0,
-      `screen ${r.state.screen}, did ${r.log.join(',') || 'nothing'}`)
+    r.screens.enterPause()
+    check(`pausing from the ${from} screen does nothing`, r.screens.screen === from && r.log.length === 0,
+      `screen ${r.screens.screen}, did ${r.log.join(',') || 'nothing'}`)
+    r.screens.exitPause()
+    check(`leaving the pause screen from ${from} does nothing`, r.screens.screen === from && r.log.length === 0,
+      `screen ${r.screens.screen}, did ${r.log.join(',') || 'nothing'}`)
   }
-  for (const from of ['hangar', 'debrief', 'flight'] as ScreenState['screen'][]) {
-    const r = rig(from, () => true)
-    createPauseFlow(r.state, r.host).exit()
-    check(`leaving the pause screen from ${from} does nothing`, r.state.screen === from && r.log.length === 0,
-      `screen ${r.state.screen}, did ${r.log.join(',') || 'nothing'}`)
-  }
+  const flying = rig('flight', () => true)
+  flying.screens.exitPause()
+  check('leaving the pause screen while in flight does nothing',
+    flying.screens.screen === 'flight' && flying.log.length === 0, flying.log.join(','))
 
   /* ---- The trap: two presses of Escape, through main.ts's own handler ----- */
 
   /*
-   * `src/main.ts` binds Escape and P to `pauseFlow.toggle()` and nothing else, so this
-   * *is* the shipped handler. Driving it twice is the property the last regression
-   * broke: the panel went up, the screen stayed in flight, and Resume — which refuses
-   * unless the screen says paused — could never fire. The player was sealed in.
+   * `src/main.ts` binds Escape and P to `screens.togglePause()` and nothing else, so
+   * this *is* the shipped handler. Driving it twice is the property the last two
+   * regressions broke: the panel went up, the screen stayed in flight, and Resume —
+   * which refuses unless the screen says paused — could never fire.
    */
   const app = rig('flight', () => true)
-  const flow = createPauseFlow(app.state, app.host)
-
-  flow.toggle()
-  check('one press of Escape pauses', app.state.screen === 'paused', app.state.screen)
-  flow.toggle()
+  app.screens.togglePause()
+  check('one press of Escape pauses', app.screens.screen === 'paused', app.screens.screen)
+  app.screens.togglePause()
   check(
     'a second press gets the player back out again',
-    app.state.screen === 'flight',
-    `stuck on ${app.state.screen} — the panel is up and nothing will take it down`,
+    app.screens.screen === 'flight',
+    `stuck on ${app.screens.screen} — the panel is up and nothing will take it down`,
   )
   check(
     'and the round trip did exactly what it should, in order',
@@ -3786,17 +3774,74 @@ function testThePauseTransitionCanBeLeftAgain(): void {
 
   // Ten presses, because a toggle that only works once is still a trap.
   const many = rig('flight', () => true)
-  const repeated = createPauseFlow(many.state, many.host)
   const seen: string[] = []
   for (let i = 0; i < 10; i++) {
-    repeated.toggle()
-    seen.push(many.state.screen)
+    many.screens.togglePause()
+    seen.push(many.screens.screen)
   }
   check(
     'Escape keeps working, press after press',
     seen.join(',') === 'paused,flight,paused,flight,paused,flight,paused,flight,paused,flight',
     seen.join(','),
   )
+
+  /* ---- The transitions the app owns, and the one it may not ------------- */
+
+  /*
+   * The fourth regression was `createPauseFlow({ ...state }, host)` — a copy, so the app
+   * launched while the flow still saw `hangar` and Escape did nothing. There is no holder
+   * to copy now, and this is the property that broke: what the app moves to is what the
+   * pause transitions see.
+   */
+  const moving = rig('hangar', () => true)
+  check('it starts where it was told to', moving.screens.screen === 'hangar', moving.screens.screen)
+  moving.screens.moveTo('flight')
+  check('the app can launch', moving.screens.screen === 'flight', moving.screens.screen)
+  moving.screens.togglePause()
+  check(
+    'and pausing sees the screen the app moved to',
+    moving.screens.screen === 'paused',
+    `${moving.screens.screen} — the transitions and the reads disagree`,
+  )
+  moving.screens.togglePause()
+  moving.screens.moveTo('debrief')
+  check('and the app can reach the debrief', moving.screens.screen === 'debrief', moving.screens.screen)
+  moving.screens.moveTo('hangar')
+  check('and the hangar', moving.screens.screen === 'hangar', moving.screens.screen)
+
+  /* Every screen the dev hook documents is reachable and reported. `window.__neon.screen`
+     read a bare `screen` after the state moved out of `main.ts`, which compiles against
+     the DOM global — so it returned the browser's `Screen` object instead of any of
+     these. Caught in review, not by a check, because nothing named the four values. */
+  const reachable = new Set<Screen>()
+  const tour = rig('hangar', () => true)
+  reachable.add(tour.screens.screen)
+  tour.screens.moveTo('flight')
+  reachable.add(tour.screens.screen)
+  tour.screens.togglePause()
+  reachable.add(tour.screens.screen)
+  tour.screens.togglePause()
+  tour.screens.moveTo('debrief')
+  reachable.add(tour.screens.screen)
+  check(
+    'all four documented screens are reachable and reported by name',
+    reachable.size === 4 &&
+      ['hangar', 'flight', 'paused', 'debrief'].every((s) => reachable.has(s as Screen)),
+    [...reachable].join(','),
+  )
+
+  /* Only `enterPause` may reach the overlay. That is what makes the trap those four
+     rounds kept producing unrepresentable from outside rather than merely absent. */
+  const forbidden = rig('flight', () => true)
+  let refused = false
+  try {
+    ;(forbidden.screens.moveTo as (s: Screen) => void)('paused')
+  } catch (e) {
+    refused = e instanceof RangeError
+  }
+  check('the app cannot move itself onto the pause screen', refused)
+  check('and the attempt left it where it was', forbidden.screens.screen === 'flight',
+    forbidden.screens.screen)
 
   /* ---- Against a real Game, in the state the shipped UI cannot build ------ */
 
@@ -3812,33 +3857,32 @@ function testThePauseTransitionCanBeLeftAgain(): void {
   for (let i = 0; i < 5; i++) game.step(hands)
 
   const live = rig('flight', () => game.pause(), () => game.resume())
-  const liveFlow = createPauseFlow(live.state, live.host)
 
   check(
     'the state is a remote wreck with the drawn seat flying',
     game.snapshot(0)?.phase === 'wrecked' && game.snapshot(1)?.phase === 'flying',
     `remote ${game.snapshot(0)?.phase}, drawn ${game.snapshot(1)?.phase}`,
   )
-  liveFlow.toggle()
-  check('the real game refuses, and the screen stays in flight', live.state.screen === 'flight',
-    live.state.screen)
+  live.screens.togglePause()
+  check('the real game refuses, and the screen stays in flight', live.screens.screen === 'flight',
+    live.screens.screen)
   check('no panel went up over it', !live.log.includes('showPanel'), live.log.join(','))
   check('and the simulation was not frozen', !game.paused)
 
-  /* The mirror, so refusal is not the only outcome this flow can produce against a real
-     game — and so the round trip is exercised on the real one too. */
   const sequence = Math.round(DEATH_SEQUENCE / STEP)
   for (let i = 0; i < sequence + 30; i++) {
     if (!game.snapshot(1)) break
     game.step(hands)
   }
   if (game.snapshot(1)) {
-    liveFlow.toggle()
-    check('once every explosion has finished the same press pauses', live.state.screen === 'paused' && game.paused,
-      `screen ${live.state.screen}, paused=${game.paused}`)
-    liveFlow.toggle()
-    check('and the next one resumes the real game', live.state.screen === 'flight' && !game.paused,
-      `screen ${live.state.screen}, paused=${game.paused}`)
+    live.screens.togglePause()
+    check('once every explosion has finished the same press pauses',
+      live.screens.screen === 'paused' && game.paused,
+      `screen ${live.screens.screen}, paused=${game.paused}`)
+    live.screens.togglePause()
+    check('and the next one resumes the real game',
+      live.screens.screen === 'flight' && !game.paused,
+      `screen ${live.screens.screen}, paused=${game.paused}`)
   } else {
     check('the match survived to be paused', false, 'it resolved first')
   }
@@ -4962,7 +5006,7 @@ testPauseIsMirroredAcrossSeats()
 testTheSquadronIsNotAFunctionOfTheWatcher()
 testTheDrawnSeatIsClampedNotTrusted()
 testARefusedCallChangesNothing()
-testThePauseTransitionCanBeLeftAgain()
+testTheScreenMachineCanBeLeftAgain()
 testTheLoopSurvivesTheEndOfARun()
 testScoringIsPerSeat()
 testTwoScorersKeepSeparateStreaks()

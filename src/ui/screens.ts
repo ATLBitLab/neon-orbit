@@ -1,48 +1,54 @@
 /**
- * The screen state, and the one transition that has earned a test.
+ * Which screen the app is on, and the transitions that decide it.
  *
- * This module exists because of a bug that has now been fixed three times, each fix
- * moving the tested boundary one layer inward and each time leaving the shipped caller
- * outside it. Worth the whole history, because the history is the argument:
+ * This module owns the screen. Not a holder handed to it, not a setter it calls back
+ * into — the variable itself lives here, because four review rounds on one transition
+ * each ended with a production obligation that no test could execute:
  *
- * 1. The pause guard widened from "is the drawn seat exploding" to "is any seat
- *    exploding". Its caller in `main.ts` kept its own answer — it tested `game.dying`,
- *    showed the panel, then called `pause()` without looking. The overlay sat over a
- *    match that kept fighting: 140 units of travel in the following second.
- * 2. `Game.pause()` started returning whether it paused, and `main.ts` honoured it.
- *    But `boot()` needs a canvas, so nothing headless could run that line: restoring
- *    the old caller left 367 checks and 31 mutants green.
- * 3. The decision moved into a DOM-free flow returning the new screen, and `main.ts`
- *    assigned it. I wrote that a caller "cannot ignore a value it has to assign".
- *    **That is false.** `pauseFlow.enter()` as a bare statement is valid TypeScript
- *    that discards the result — after which the panel goes up, `screen` stays
- *    `'flight'`, and Resume refuses because it is not on the pause screen. The player
- *    is trapped behind the overlay, with every gate green. Reproduced before this
- *    rewrite.
+ * 1. `main.ts` kept its own copy of the pause condition (`game.dying`) and disagreed
+ *    with `Game.pause()`. The overlay sat over a match that kept fighting: 140 units
+ *    of travel in the following second.
+ * 2. `Game.pause()` returned its answer and `main.ts` honoured it — but `boot()` needs
+ *    a canvas, so nothing headless could run that line. Restoring the old caller left
+ *    367 checks and 31 mutants green.
+ * 3. A DOM-free flow returned the new screen for `main.ts` to assign. I claimed a
+ *    caller "cannot ignore a value it has to assign"; that is false, and
+ *    `flow.enter()` as a bare statement leaves the panel up with the screen still
+ *    `'flight'`, so Resume refuses and the player is sealed in.
+ * 4. The flow wrote a holder `main.ts` passed in. `createPauseFlow({ ...state }, host)`
+ *    is valid TypeScript that hands over a *copy*: the app launches, the flow still
+ *    sees `'hangar'`, and Escape does nothing. All 389 checks and 39 mutants green.
  *
- * So the state itself lives here rather than the answer about it. `enter` and `exit`
- * return `void` and write `state.screen` themselves, and they own their own
- * preconditions too — there is no decision left in `main.ts` to be inconsistent with,
- * and nothing for a caller to discard. The lesson generalises past pause: **a seam that
- * hands a decision back to untested code has not moved the decision.**
+ * The shape of the mistake was the same every time and it was never the mechanism —
+ * a boolean, a return value, an object reference. It was that the last step of the
+ * decision stayed in code no test could reach. So there is nothing left to pass and
+ * nothing to assign: `createScreens` takes only the things it must *do*, and the app
+ * reads `screens.screen`.
  *
- * Only the pause transition is in here. Hangar, launch and debrief still write
- * `state.screen` from `main.ts`, and they should move the day one of them earns it the
- * same way this did — by breaking.
+ * `moveTo` cannot reach `'paused'`, in the type system and again at runtime. Only
+ * `enterPause` may put the overlay up, which is what makes the trap those four rounds
+ * kept producing unrepresentable from outside rather than merely absent today.
+ *
+ * What is still not covered, stated plainly because claiming otherwise is the actual
+ * recurring defect here: `main.ts` still chooses *which* transition to call, and its
+ * five host adapters are one-line lambdas. Nothing headless executes either, because
+ * nothing headless can call `boot()`. What would close it is a browser-level test of
+ * `boot()`, and that is a real dependency rather than a refactor. The residue is now
+ * "did the app call the right method", not "did the app correctly finish a decision
+ * the module started".
  */
 
 export type Screen = 'hangar' | 'flight' | 'paused' | 'debrief'
 
 /**
- * The single screen variable, shared by reference.
+ * Every screen except the pause overlay.
  *
- * A holder rather than a setter callback, deliberately: a callback is another line of
- * untested adapter in `main.ts` that could be wired to nothing. There is one variable,
- * this module writes it, and `main.ts` reads the same one.
+ * The overlay is reachable only through `enterPause`, because it is the one screen
+ * whose transition has a precondition — the simulation has to agree to stop — and
+ * every regression in the list above came from something outside this module deciding
+ * it had.
  */
-export interface ScreenState {
-  screen: Screen
-}
+export type AppScreen = Exclude<Screen, 'paused'>
 
 export interface PauseHost {
   /**
@@ -57,47 +63,76 @@ export interface PauseHost {
   grabPointer(): void
 }
 
-export interface PauseFlow {
+export interface Screens {
+  /** The screen the app is on. The only source of truth for it. */
+  readonly screen: Screen
   /**
-   * Put the pause screen up. Does nothing unless the game is in flight *and* the
+   * Put the pause overlay up. Does nothing unless the app is in flight *and* the
    * simulation agreed to stop — a refusal leaves everything exactly as it was, which
    * is correct rather than a silent failure: a cutscene is playing and the player
    * carries on watching it.
    */
-  enter(): void
+  enterPause(): void
   /** Take it down again. Does nothing unless it is up. */
-  exit(): void
+  exitPause(): void
   /** What `Esc` and `P` do: up if down, down if up. */
-  toggle(): void
+  togglePause(): void
+  /**
+   * Go to a screen this module does not gate. Refuses `'paused'` — see `AppScreen`.
+   */
+  moveTo(screen: AppScreen): void
 }
 
-export function createPauseFlow(state: ScreenState, host: PauseHost): PauseFlow {
-  const flow: PauseFlow = {
-    enter() {
-      // Both guards live here, not at the call site. `main.ts` used to hold the first
-      // one and disagree with the second.
-      if (state.screen !== 'flight') return
+export function createScreens(host: PauseHost, start: AppScreen = 'hangar'): Screens {
+  let screen: Screen = start
+
+  const screens: Screens = {
+    get screen() {
+      return screen
+    },
+
+    enterPause() {
+      // Both guards live here. `main.ts` used to hold the first and disagree with the
+      // second.
+      if (screen !== 'flight') return
       // Ask before showing anything. Showing the panel first is the same bug with
       // better manners.
       if (!host.pause()) return
       host.showPanel()
-      state.screen = 'paused'
+      screen = 'paused'
     },
 
-    exit() {
-      if (state.screen !== 'paused') return
+    exitPause() {
+      if (screen !== 'paused') return
       // Panel down before the simulation restarts, so the first live frame is never
       // drawn behind an overlay on its way out.
       host.hidePanel()
       host.resume()
       host.grabPointer()
-      state.screen = 'flight'
+      screen = 'flight'
     },
 
-    toggle() {
-      if (state.screen === 'paused') flow.exit()
-      else flow.enter()
+    togglePause() {
+      if (screen === 'paused') screens.exitPause()
+      else screens.enterPause()
+    },
+
+    moveTo(next) {
+      /*
+       * Refused loudly rather than ignored, and the type already forbids it, so this is
+       * for the bundled JavaScript and for anyone reaching in from a console.
+       *
+       * The pause screen is the one screen with a precondition attached, and every
+       * regression this module exists to prevent came from something outside it
+       * deciding that precondition was met. A silent refusal here would leave the app
+       * on a screen the caller did not expect with no signal at all, which is the
+       * failure class rather than a smaller version of it.
+       */
+      if ((next as Screen) === 'paused') {
+        throw new RangeError('only enterPause may reach the pause screen')
+      }
+      screen = next
     },
   }
-  return flow
+  return screens
 }

@@ -198,7 +198,7 @@ const MUTATIONS = [
   },
 
   /* ---- Atomicity: a refused call must cost nothing ----------------------- */
-  /* ---- The pause transition: three rounds of regression, one per entry ---- */
+  /* ---- The screen machine: one entry per regression round ------------------ */
   {
     // Round 1, restored: show the panel without honouring the refusal.
     name: 'the pause transition ignores a refused pause',
@@ -215,38 +215,60 @@ const MUTATIONS = [
   {
     /*
      * Round 3, restored: the panel goes up and the screen is never written — which is
-     * what `pauseFlow.enter()` as a bare statement did when the flow returned the new
-     * screen and `main.ts` was expected to assign it. Resume then refuses, because the
-     * screen does not say `paused`, and the player is sealed behind the overlay.
+     * what `flow.enter()` as a bare statement did when the flow returned the new screen
+     * for the app to assign. Resume then refuses, and the player is sealed in.
      */
     name: 'entering the pause screen never writes the screen',
     file: 'src/ui/screens.ts',
-    from: "      host.showPanel()\n      state.screen = 'paused'",
+    from: "      host.showPanel()\n      screen = 'paused'",
     to: '      host.showPanel()',
   },
   {
     name: 'leaving the pause screen never writes the screen',
     file: 'src/ui/screens.ts',
-    from: "      host.grabPointer()\n      state.screen = 'flight'",
+    from: "      host.grabPointer()\n      screen = 'flight'",
     to: '      host.grabPointer()',
+  },
+  {
+    /*
+     * Round 4, restored: the pause transitions read a screen that stops tracking the one
+     * the app moves. The holder copy did this from outside; there is no holder now, so
+     * the equivalent is a getter that answers from a snapshot taken at construction.
+     */
+    name: 'the screen is reported from a stale copy',
+    file: 'src/ui/screens.ts',
+    from: '    get screen() {\n      return screen\n    },',
+    to: '    get screen() {\n      return start\n    },',
+  },
+  {
+    name: 'the app can move itself onto the pause screen',
+    file: 'src/ui/screens.ts',
+    from: "      if ((next as Screen) === 'paused') {",
+    to: '      if (false) {',
+  },
+  {
+    name: 'moving to another screen does not change the screen',
+    file: 'src/ui/screens.ts',
+    from: '      screen = next\n    },',
+    to: '    },',
   },
   {
     name: 'the pause screen is entered from any screen at all',
     file: 'src/ui/screens.ts',
-    from: "      if (state.screen !== 'flight') return",
+    from: "      if (screen !== 'flight') return",
     to: '      if (false) return',
   },
   {
     name: 'the pause screen is left from any screen at all',
     file: 'src/ui/screens.ts',
-    from: "      if (state.screen !== 'paused') return",
+    from: "      if (screen !== 'paused') return",
     to: '      if (false) return',
   },
   {
     name: 'Escape toggles the wrong way',
     file: 'src/ui/screens.ts',
-    from: "      if (state.screen === 'paused') flow.exit()\n      else flow.enter()",
-    to: "      if (state.screen === 'paused') flow.enter()\n      else flow.exit()",
+    from: "      if (screen === 'paused') screens.exitPause()\n      else screens.enterPause()",
+    to: "      if (screen === 'paused') screens.enterPause()\n      else screens.exitPause()",
   },
   {
     name: 'leaving the pause screen restarts the sim before hiding the panel',
@@ -353,7 +375,7 @@ console.log('NEON ORBIT — mutation runs against scripts/simcheck.ts\n')
  * If you added or removed checks on purpose, bump this in the same commit. If you did
  * not, something stopped running.
  */
-const EXPECTED_ASSERTIONS = 389
+const EXPECTED_ASSERTIONS = 396
 const PASS_SUMMARY = 'All checks passed.'
 
 /**
