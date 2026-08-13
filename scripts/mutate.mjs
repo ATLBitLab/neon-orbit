@@ -427,6 +427,77 @@ console.log('NEON ORBIT — mutation runs against scripts/simcheck.ts\n')
 const EXPECTED_ASSERTIONS = 414
 const PASS_SUMMARY = 'All checks passed.'
 
+const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
+
+/**
+ * What a mutation run means. **The only place that decides.**
+ *
+ * It was two places, which is the defect this replaces: the loop had one rule and the
+ * self-test meant to protect that rule computed its own equivalent. Deleting the
+ * assertion-count clause from the loop's copy left the self-test printing "the verdict
+ * bites" and all 47 mutants reported caught — a regression guard passing while the thing
+ * it guards was gone. A rule with two implementations is a rule with one untested one.
+ *
+ * Four verdicts, and only `CAUGHT` is a pass:
+ *
+ * - **CAUGHT** — the suite named failures, exited non-zero, and ran every expected
+ *   assertion. All three clauses have caught something real.
+ * - **CAUGHT-THEN-ABORTED** — named failures but did not finish the run. Whatever came
+ *   after is unmeasured, so this is a gap rather than a clean catch.
+ * - **BROKEN-GATE** — printed failures and **exited 0**. The mutation is beside the
+ *   point: `npm run check:sim` would have reported success to CI, so nothing this run
+ *   says about anything can be trusted. Reproduced by changing the suite's footer to
+ *   `process.exit(0)`, after which every mutant looked caught and the job passed.
+ * - **CRASH-ONLY** — died without naming a failure. Still stops a merge, but the
+ *   diagnostic is "39 of 201 ran" instead of the property that broke.
+ * - **SURVIVED** — green. Either the check is missing or the mutation is genuinely
+ *   unobservable; the difference has to be established, not assumed.
+ */
+function classify(result) {
+  const complete = SUMMARY.test(result.last) && result.ok + result.fail === EXPECTED_ASSERTIONS
+  // `=== 0` rather than `!== 0`, so a signal-killed run (`status === null`) is never read
+  // as a clean exit.
+  const exitedCleanly = result.code === 0
+
+  if (result.fail > 0) {
+    if (exitedCleanly) return 'BROKEN-GATE'
+    return complete ? 'CAUGHT' : 'CAUGHT-THEN-ABORTED'
+  }
+  return exitedCleanly ? 'SURVIVED' : 'CRASH-ONLY'
+}
+
+/**
+ * Apply a set of `[file, from, to]` patches, run the suite, and put everything back.
+ *
+ * Shared by the self-tests below so that each one is a fixture plus an expected verdict
+ * and nothing else. Refuses unless every pattern matches exactly once, because a
+ * self-test whose patch silently missed is a self-test that proves nothing.
+ */
+function runPatched(label, patches) {
+  const saved = patches.map(([file]) => [file, readFileSync(file, 'utf8')])
+  for (const [file, from, to] of patches) {
+    const source = saved.find(([f]) => f === file)[1]
+    const hits = source.split(from).length - 1
+    if (hits !== 1) {
+      for (const [file, text] of saved) writeFileSync(file, text)
+      console.error(
+        `Refusing to run: the ${label} self-test pattern matched ${hits} times in ${file}. ` +
+          'Its guard would go unexercised.',
+      )
+      process.exit(2)
+    }
+  }
+  // Applied in a second pass so multiple patches to one file compose.
+  for (const [file, from, to] of patches) {
+    writeFileSync(file, readFileSync(file, 'utf8').split(from).join(to))
+  }
+  try {
+    return runSuite()
+  } finally {
+    for (const [file, text] of saved) writeFileSync(file, text)
+  }
+}
+
 /**
  * Why a control run cannot be trusted, or `null` if it can.
  *
@@ -452,103 +523,107 @@ function controlProblem(r) {
 }
 
 /*
- * Self-test, before anything else: prove the control guard can *fail*.
+ * Self-tests, before anything else: prove the two deciders can *reject*.
  *
- * A guard nobody has seen reject anything is documentation. This removes one real test
- * invocation from `simcheck.ts`, confirms `controlProblem` names the shortfall, and puts
- * it back — so the thing that catches a partial suite is exercised on every run rather
- * than having been checked by hand once, by the person who wrote it, in a commit nobody
- * can replay.
+ * A guard nobody has watched refuse anything is documentation, and the first version of
+ * this section was worse than that — it built its own copy of the verdict rule, so it kept
+ * passing after the real rule lost its assertion-count clause. Each fixture below is now
+ * checked against the *production* function, `controlProblem` or `classify`, and the
+ * expected answer is written out. There is no second implementation to drift.
  */
 const SELF_TEST_FILE = 'scripts/simcheck.ts'
 const SELF_TEST_ANCHOR = '\ntestTwoScorersKeepSeparateStreaks()\n'
-{
-  const source = readFileSync(SELF_TEST_FILE, 'utf8')
-  if (source.split(SELF_TEST_ANCHOR).length - 1 !== 1) {
-    console.error(
-      `Refusing to run: the self-test anchor ${JSON.stringify(SELF_TEST_ANCHOR.trim())} is not in ` +
-        `${SELF_TEST_FILE} exactly once. The control guard would go unexercised.`,
-    )
-    process.exit(2)
-  }
-  writeFileSync(SELF_TEST_FILE, source.split(SELF_TEST_ANCHOR).join('\n'))
-  let partial
-  try {
-    partial = runSuite()
-  } finally {
-    writeFileSync(SELF_TEST_FILE, source)
-  }
-  const complaint = controlProblem(partial)
-  console.log(
-    `self-test (one test invocation removed): exit=${partial.code} ok=${partial.ok} ` +
-      `FAIL=${partial.fail} -> ${complaint ?? 'ACCEPTED'}`,
-  )
-  if (!complaint) {
-    console.error(
-      '\nRefusing to run: the control guard accepted a suite with a whole test missing.',
-    )
-    process.exit(2)
-  }
-  if (partial.fail !== 0 || partial.code !== 0) {
-    console.error(
-      '\nRefusing to run: removing that invocation made the suite fail, so this proves nothing ' +
-        'about a green-but-short run. Pick an anchor whose absence leaves the suite passing.',
-    )
-    process.exit(2)
-  }
-  console.log('  (green, short, and correctly refused — the guard bites)\n')
-}
+/** A real mutation, so a fixture can be made to fail loudly on demand. */
+const BREAK_PAUSE = [
+  'src/ui/screens.ts',
+  '      if (!host.pause()) return\n      host.showPanel()',
+  '      host.pause()\n      host.showPanel()',
+]
+/** The suite's own exit contract. */
+const BREAK_EXIT = [
+  SELF_TEST_FILE,
+  'process.exit(failures === 0 ? 0 : 1)',
+  'process.exit(0)',
+]
+const DROP_A_TEST = [SELF_TEST_FILE, SELF_TEST_ANCHOR, '\n']
 
-/*
- * Second self-test: the *verdict* rule, not the control rule.
- *
- * The control guard above only ever inspects the unmutated run. Each mutant got its own,
- * weaker test — "did it name failures and reach a summary" — and that accepted a run of
- * 400 of 405 as cleanly caught, hiding five assertions. So this proves the verdict rule
- * rejects a run that *fails loudly and is still short*, which is the exact shape that
- * slipped through: a real mutation plus a removed test invocation, which is failing and
- * short at once.
- */
 {
-  const source = readFileSync(SELF_TEST_FILE, 'utf8')
-  const gameSource = readFileSync('src/game/game.ts', 'utf8')
-  const BREAK = "      if (!host.pause()) return\n      host.showPanel()"
-  if (gameSource.includes(BREAK)) {
-    console.error('Refusing to run: the verdict self-test patched the wrong file.')
-    process.exit(2)
-  }
-  const screensPath = 'src/ui/screens.ts'
-  const screens = readFileSync(screensPath, 'utf8')
-  if (screens.split(BREAK).length - 1 !== 1) {
-    console.error(`Refusing to run: the verdict self-test anchor is not in ${screensPath} once.`)
-    process.exit(2)
-  }
-  writeFileSync(SELF_TEST_FILE, source.split(SELF_TEST_ANCHOR).join('\n'))
-  writeFileSync(screensPath, screens.split(BREAK).join('      host.pause()\n      host.showPanel()'))
-  let both
-  try {
-    both = runSuite()
-  } finally {
-    writeFileSync(SELF_TEST_FILE, source)
-    writeFileSync(screensPath, screens)
-  }
-  const complete = both.ok + both.fail === EXPECTED_ASSERTIONS
+  /*
+   * Ordered by dependency, not by narrative. The exit contract comes first because if the
+   * suite cannot tell its caller it failed, no verdict about anything else can mean
+   * anything — and the first version of this ran the completeness fixture first, so a
+   * broken exit contract was reported as a completeness problem.
+   */
+
+  /* 1. Loud, complete — and exiting zero. The gate itself is broken: `npm run check:sim`
+        would report success to CI while printing failures, so no mutation verdict from
+        such a run is worth reading, however many appear to be caught. */
+  const loudButPassing = runPatched('zero-exit', [BREAK_EXIT, BREAK_PAUSE])
+  const gateVerdict = classify(loudButPassing)
   console.log(
-    `self-test (failing *and* short): exit=${both.code} ok=${both.ok} FAIL=${both.fail} ` +
-      `(${both.ok + both.fail}/${EXPECTED_ASSERTIONS} ran)`,
+    `self-test 1 — loud, exits zero:   exit=${loudButPassing.code} ok=${loudButPassing.ok} ` +
+      `FAIL=${loudButPassing.fail} (${loudButPassing.ok + loudButPassing.fail}/${EXPECTED_ASSERTIONS}) ` +
+      `-> ${gateVerdict}`,
   )
-  if (both.fail === 0) {
-    console.error('\nRefusing to run: that combination was supposed to fail loudly and did not.')
-    process.exit(2)
-  }
-  if (complete) {
+  if (loudButPassing.fail === 0 || loudButPassing.code !== 0) {
     console.error(
-      '\nRefusing to run: a run missing a whole test invocation still counted as complete, ' +
-        'so the per-mutant verdict cannot tell a full run from a short one.',
+      '\nRefusing to run: that fixture was supposed to print failures and exit 0, and did not, ' +
+        `so it proves nothing about a broken gate (exit=${loudButPassing.code}, FAIL=${loudButPassing.fail}).`,
     )
     process.exit(2)
   }
-  console.log('  (loud, short, and it would be judged CAUGHT-THEN-ABORTED — the verdict bites)\n')
+  if (gateVerdict !== 'BROKEN-GATE') {
+    console.error(
+      `\nRefusing to run: classify() called a zero-exit failing run ${gateVerdict}. ` +
+        'A suite that reports failures and tells CI it passed is not a caught mutation.',
+    )
+    process.exit(2)
+  }
+
+  /* 2. Green but short. The *control* guard owns this one: a suite missing a whole test
+        still passes, so nothing downstream can tell it from a complete run. */
+  const short = runPatched('short-control', [DROP_A_TEST])
+  const complaint = controlProblem(short)
+  console.log(
+    `self-test 2 — green but short:    exit=${short.code} ok=${short.ok} FAIL=${short.fail} ` +
+      `-> ${complaint ?? 'ACCEPTED'}`,
+  )
+  if (short.fail !== 0 || short.code !== 0) {
+    console.error(
+      '\nRefusing to run: that fixture was supposed to stay green, so it proves nothing about ' +
+        'a green-but-short run. Pick an anchor whose absence leaves the suite passing.',
+    )
+    process.exit(2)
+  }
+  if (!complaint) {
+    console.error('\nRefusing to run: the control guard accepted a suite with a whole test missing.')
+    process.exit(2)
+  }
+
+  /* 3. Loud but short — the per-mutant verdict, through `classify` itself. */
+  const loudShort = runPatched('short-mutant', [DROP_A_TEST, BREAK_PAUSE])
+  const shortVerdict = classify(loudShort)
+  console.log(
+    `self-test 3 — loud but short:     exit=${loudShort.code} ok=${loudShort.ok} ` +
+      `FAIL=${loudShort.fail} (${loudShort.ok + loudShort.fail}/${EXPECTED_ASSERTIONS}) ` +
+      `-> ${shortVerdict}`,
+  )
+  if (loudShort.fail === 0 || loudShort.code === 0) {
+    console.error(
+      '\nRefusing to run: that fixture was supposed to fail loudly *and* exit non-zero ' +
+        `(got exit=${loudShort.code}, FAIL=${loudShort.fail}), so it cannot test completeness.`,
+    )
+    process.exit(2)
+  }
+  if (shortVerdict !== 'CAUGHT-THEN-ABORTED') {
+    console.error(
+      `\nRefusing to run: classify() called an incomplete failing run ${shortVerdict}. ` +
+        'A mutant that hides assertions must not read as cleanly caught.',
+    )
+    process.exit(2)
+  }
+
+  console.log('  (all three refused by the functions the loop itself uses)\n')
 }
 
 /*
@@ -572,7 +647,8 @@ if (problem) {
 }
 
 let caught = 0
-let crashOnly = 0
+/** Caught-then-aborted, crash-only, or a broken gate. Not a pass, whatever the reason. */
+let notClean = 0
 let survived = 0
 let unapplied = 0
 
@@ -597,26 +673,11 @@ for (const [i, m] of MUTATIONS.entries()) {
     writeFileSync(m.file, source)
   }
 
-  /*
-   * Four verdicts, not three. A mutant that names its assertion and *then* takes the
-   * process down has still hidden every check after it — the suite reported 289 of
-   * 341 and stopped — so it is a gap in the harness rather than a clean catch. The
-   * summary line is the tell: a finished run ends with its own count.
-   */
-  const finished =
-    /check\(s\) failed\.$|All checks passed\.$/.test(result.last) &&
-    result.ok + result.fail === EXPECTED_ASSERTIONS
-  const verdict =
-    result.fail > 0
-      ? finished
-        ? 'CAUGHT'
-        : 'CAUGHT-THEN-ABORTED'
-      : result.code !== 0
-        ? 'CRASH-ONLY'
-        : 'SURVIVED'
+  // The same function the self-tests above are checked against. One decision, one place.
+  const verdict = classify(result)
   if (verdict === 'CAUGHT') caught++
-  else if (verdict === 'CRASH-ONLY' || verdict === 'CAUGHT-THEN-ABORTED') crashOnly++
-  else survived++
+  else if (verdict === 'SURVIVED') survived++
+  else notClean++
 
   console.log(`[${i}] ${m.name}`)
   console.log(
@@ -628,7 +689,8 @@ for (const [i, m] of MUTATIONS.entries()) {
 }
 
 console.log(
-  `\n${caught} caught cleanly, ${crashOnly} caught but the run did not finish, ${survived} survived, ${unapplied} not testable`,
+  `\n${caught} caught cleanly, ${notClean} not cleanly caught, ${survived} survived, ` +
+    `${unapplied} not testable`,
 )
 
 /*
@@ -648,7 +710,7 @@ console.log(
  * set, inside the tool built to catch exactly that. Found by pointing it at a name
  * that does not exist, which is the first thing anybody attacking it would try.
  */
-const ran = caught + crashOnly + survived + unapplied
+const ran = caught + notClean + survived + unapplied
 if (ran === 0) {
   console.error(
     only === undefined
@@ -660,8 +722,11 @@ if (ran === 0) {
 if (only !== undefined && ran < MUTATIONS.length) {
   console.log(`\nFiltered run: ${ran} of ${MUTATIONS.length} mutations. Not a full verdict.`)
 }
-if (crashOnly > 0 || survived > 0 || unapplied > 0) {
-  console.log('\nA surviving, crash-only or unapplied mutation is a gap in the suite, not a pass.')
+if (notClean > 0 || survived > 0 || unapplied > 0) {
+  console.log(
+    '\nOnly CAUGHT is a pass. A mutation that survived, aborted, crashed without naming a\n' +
+      'failure, exited zero while printing failures, or no longer applies is a gap in the suite.',
+  )
   process.exit(1)
 }
 console.log(`\nAll ${ran} mutations were caught by a named assertion.`)
