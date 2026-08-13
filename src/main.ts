@@ -17,6 +17,7 @@ import { createStage } from './core/stage'
 import { createPilot } from './game/controls'
 import { createGame, STEP } from './game/game'
 import { createHud } from './game/hud'
+import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
 import { createHangar } from './ui/hangar'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
@@ -138,7 +139,10 @@ function boot() {
     // Back to launch throttle. The pilot outlives any one run, so a fresh
     // launch has to say so rather than inheriting the last run's last command.
     pilot.reset()
-    game.start(id)
+    // One seat, and elimination rather than respawn — the shipped game is a match
+    // of one, and its lose condition is the run ending. `MatchSetup.respawn` in
+    // `game/game.ts` says why that is a policy rather than the roster size.
+    game.start({ ships: [id] })
     input.requestPointerLock()
   }
 
@@ -231,6 +235,16 @@ function boot() {
   const stepClock = createStepClock(STEP, MAX_FRAME)
   let splashCleared = false
 
+  /**
+   * The intent handed to the simulation each tick, one slot per seat.
+   *
+   * Reused rather than rebuilt, because this runs sixty times a second and the
+   * simulation copies what it is handed rather than retaining it. One slot today:
+   * this machine drives one seat, and the remaining slots are what a host fills
+   * from arriving packets and a client leaves to the host.
+   */
+  const intents: Controls[] = [pilot.advance(input.state, STEP)]
+
   function frame() {
     const { ticks, frameSeconds, alpha } = stepClock.advance(clock.getDelta())
 
@@ -248,8 +262,10 @@ function boot() {
         // Reading the device and running the simulation are two steps now, and
         // this is the seam multiplayer opens: a host would send these controls
         // as well as flying on them, and a client would fly on controls that
-        // arrived rather than ones it produced.
-        game.step(pilot.advance(input.state, STEP))
+        // arrived rather than ones it produced. The simulation is handed one
+        // intent per seat and never asks which of those a device produced.
+        intents[0] = pilot.advance(input.state, STEP)
+        game.step(intents)
       }
       game.render(alpha, frameSeconds)
     }
