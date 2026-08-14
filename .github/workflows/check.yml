@@ -1,0 +1,46 @@
+# Runs the checks a reviewer would otherwise have to take on trust.
+#
+# There was no CI job for `npm run check` until now: every "294 green" in this
+# repo's review history was a number someone pasted from their own terminal, and
+# the same argument that put the recorded baseline into `simcheck.ts` applies to
+# the run itself. A green claim nobody else can reproduce is weak evidence.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` rather than `npm install`, deliberately. npm 10 strips the `libc`
+      # selectors from this lockfile — see the commit that restored the ten it
+      # dropped — and `ci` installs from the lockfile without rewriting it.
+      - run: npm ci
+
+      # typecheck + simulation checks + balance contract.
+      - run: npm run check
+
+      - run: npm run build
+
+  # Separate job: it runs the whole simulation suite once per mutation, so it is
+  # minutes rather than seconds and should not hold up the signal above.
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run check:mutants

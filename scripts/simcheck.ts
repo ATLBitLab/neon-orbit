@@ -17,9 +17,12 @@ import type { Input, InputState } from '../src/core/input'
 import type { RunResult } from '../src/core/scores'
 import { createBolts, FACTION_AI, FACTION_PLAYER, humanFaction } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
-import { createPilot } from '../src/game/controls'
-import { createGame, DEATH_SEQUENCE, type RunSnapshot } from '../src/game/game'
+import { createPilot, type Pilot } from '../src/game/controls'
+import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
+import { createSeats, isParticipant, seatOf } from '../src/game/roster'
+import { createDevHook, installDevHook, type DevHook } from '../src/core/dev-hook'
+import { createScreens, type PauseHost, type Screen } from '../src/ui/screens'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import { SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
 import {
@@ -1106,7 +1109,7 @@ function testARunCanBeWon(): void {
     },
   })
 
-  game.start('hornet', WIN_SEED)
+  game.start({ ships: ['hornet'], seed: WIN_SEED })
 
   const budget = Math.ceil(240 / STEP)
   let frames = 0
@@ -1136,7 +1139,7 @@ function testARunCanBeWon(): void {
       input.write.throttleDown = false
     }
 
-    game.step(pilot.advance(input.state, STEP))
+    game.step([pilot.advance(input.state, STEP)])
   }
 
   SHIPS.wasp.maxHull = originalHulls.wasp
@@ -1236,7 +1239,7 @@ function testDeathPlaysBeforeTheDebrief(): void {
     },
   })
 
-  game.start('wasp')
+  game.start({ ships: ['wasp'] })
 
   let deathFrame = -1
   let resultFrame = -1
@@ -1246,9 +1249,9 @@ function testDeathPlaysBeforeTheDebrief(): void {
   const budget = Math.ceil(20 / STEP)
   let frames = 0
   for (; frames < budget && resultFrame < 0; frames++) {
-    game.step(pilot.advance(input.state, STEP))
+    game.step([pilot.advance(input.state, STEP)])
 
-    if (deathFrame < 0 && (game.snapshot()?.playerHull ?? 1) <= 0) deathFrame = frames
+    if (deathFrame < 0 && (game.snapshot()?.hull ?? 1) <= 0) deathFrame = frames
     if (game.dying) {
       dyingFrames++
       // Escape mid-explosion must not strand the player in a paused fireball
@@ -1778,8 +1781,8 @@ function testASeededRunReproduces(): void {
       run.score,
       run.kills,
       run.shotsFired,
-      run.playerHull,
-      run.playerSpeed,
+      run.hull,
+      run.speed,
       run.enemiesAirborne,
       run.enemiesQueued,
       run.solarExposure,
@@ -1803,7 +1806,7 @@ function testASeededRunReproduces(): void {
       onEnd: () => {},
     })
 
-    game.start(ship, seed)
+    game.start({ ships: [ship], seed })
 
     const marks: string[] = []
     for (let i = 0; i < ticks; i++) {
@@ -1821,7 +1824,7 @@ function testASeededRunReproduces(): void {
         input.write.throttleUp = true
         input.write.throttleDown = false
       }
-      game.step(pilot.advance(input.state, STEP))
+      game.step([pilot.advance(input.state, STEP)])
       // Sampled along the way, not just at the end: two runs that diverge and
       // then happen to land on the same score would slip past a single check.
       if (i % 90 === 0) marks.push(fingerprint(game.snapshot()))
@@ -2040,11 +2043,11 @@ function testStepDoesNotRetainCallerControls(): void {
     onEnd: () => {},
   })
 
-  game.start('hornet', 0xa11a5)
+  game.start({ ships: ['hornet'], seed: 0xa11a5 })
 
   // One mutable struct, reused — exactly what `Pilot` hands over.
   const shared = controls({ throttle: 0.9 })
-  game.step(shared)
+  game.step([shared])
 
   // The producer moves on, as a pilot does every single tick.
   shared.throttle = 0.1
@@ -2056,6 +2059,2569 @@ function testStepDoesNotRetainCallerControls(): void {
     reported === 0.9,
     `reported ${reported}`,
   )
+
+  /*
+   * And the same rule for a seat nobody is drawing, which is where it gets
+   * dangerous rather than merely wrong.
+   *
+   * The check above can only see the local seat, because the HUD is the only thing
+   * that reads the recorded copy. A host holding a seat per participant and
+   * retaining the struct each one handed it would collect N aliases and replay the
+   * last tick for everybody — and with one seat and one HUD, exactly none of that
+   * is observable. So both seats are handed *the same object*, which is the worst
+   * case a wire produces: one decode buffer reused for every packet.
+   */
+  const shared2 = createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input: stubInput(),
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+  shared2.start({ ships: ['hornet', 'wasp'], seed: 0xa11a5 })
+
+  const one = controls({ throttle: 0.35 })
+  const two = controls({ throttle: 0.85 })
+  shared2.step([one, two])
+
+  const flownBefore = [shared2.snapshot(0)?.throttle, shared2.snapshot(1)?.throttle]
+
+  // Every producer moves on at once, and the array itself is recycled.
+  one.throttle = 0.02
+  two.throttle = 0.02
+  const recycled = [one, two]
+  recycled.length = 0
+
+  check(
+    'each seat kept its own flown throttle, not its producer',
+    flownBefore[0] === 0.35 && flownBefore[1] === 0.85,
+    `seat 0 ${flownBefore[0]}, seat 1 ${flownBefore[1]}`,
+  )
+  check(
+    'and still does after every producer has been overwritten',
+    shared2.snapshot(0)?.throttle === 0.35 && shared2.snapshot(1)?.throttle === 0.85,
+    `seat 0 ${shared2.snapshot(0)?.throttle}, seat 1 ${shared2.snapshot(1)?.throttle}`,
+  )
+  // Guards both: two seats that shared one record would agree with each other,
+  // and would satisfy either check above if the value they agreed on happened to
+  // be the one being tested for.
+  check(
+    'the two seats do not share one record',
+    shared2.snapshot(0)?.throttle !== shared2.snapshot(1)?.throttle,
+    `both read ${shared2.snapshot(0)?.throttle}`,
+  )
+
+  shared2.dispose()
+}
+
+/* -------------------------------------------------------------------------- */
+/* The roster                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Drives a seat from its own snapshot: the same proportional autopilot the
+ * single-seat checks use, one per seat.
+ *
+ * Per seat rather than shared, because a `Pilot` integrates throttle across
+ * ticks — sharing one would make both seats fly the same commanded throttle and
+ * quietly hide a game that wired every seat to the same intent.
+ */
+interface SeatPilot {
+  device: Input & { write: InputState }
+  pilot: Pilot
+}
+
+function seatPilots(count: number): SeatPilot[] {
+  return Array.from({ length: count }, () => ({ device: stubInput(), pilot: createPilot() }))
+}
+
+/** One tick: aim every seat at its own locked target, then step them together. */
+function flyAll(game: Game, crew: SeatPilot[], intents: Controls[]): void {
+  for (let i = 0; i < crew.length; i++) {
+    const { device } = crew[i]
+    const t = game.snapshot(i)?.target ?? null
+    if (t) {
+      device.write.pitch = clampTo(t.pitch * 3, -1, 1)
+      device.write.yaw = clampTo(t.yaw * 3, -1, 1)
+      device.write.fire = Math.abs(t.pitch) < 0.35 && Math.abs(t.yaw) < 0.35
+      device.write.throttleUp = t.range > 260
+      device.write.throttleDown = t.range < 170
+    } else {
+      device.write.pitch = 0
+      device.write.yaw = 0
+      device.write.fire = false
+      device.write.throttleUp = true
+      device.write.throttleDown = false
+    }
+    intents[i] = crew[i].pilot.advance(device.state, STEP)
+  }
+  game.step(intents)
+}
+
+function newMatch(deps: Partial<GameDeps> = {}): Game {
+  return createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input: stubInput(),
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+    ...deps,
+  })
+}
+
+/**
+ * Everything a seat's simulation owns, as one comparable string.
+ *
+ * `position` is in here for a reason worth keeping: without it, two runs can agree
+ * on every outcome — hull, score, kills, speed — while flying entirely different
+ * fights, because a hull that has not been hit reads the same wherever it is. A
+ * mutation that pointed the whole squadron at the drawn seat instead of the
+ * nearest one survived this fingerprint until position was part of it.
+ */
+function seatPrint(game: Game, at: number): string {
+  const r = game.snapshot(at)
+  if (!r) return 'none'
+  return [
+    r.seat,
+    r.score,
+    r.kills,
+    r.shotsFired,
+    r.hull,
+    r.speed,
+    r.deaths,
+    r.phase,
+    r.enemiesAirborne,
+    r.position.x,
+    r.position.y,
+    r.position.z,
+  ].join('/')
+}
+
+function matchPrint(game: Game): string {
+  const lines: string[] = []
+  for (let i = 0; i < game.seatCount; i++) lines.push(seatPrint(game, i))
+  return lines.join(' | ')
+}
+
+/**
+ * Fly a match and return the last print taken while it still had seats.
+ *
+ * The guard is `finish`, which calls `clearArena` — so the tick that resolves a
+ * match is also the tick `snapshot` starts returning null and `seatCount` drops to
+ * zero. Reading after the loop therefore compares either a crash or an *empty
+ * string*, and two empty strings are equal, which is the whole trap: a check that
+ * two matches agree passes perfectly on two matches that both vanished.
+ *
+ * This has now bitten three of the checks in this file, twice as a `TypeError`
+ * that took the suite down at ok=247 of 280 and once as a mutant that stopped
+ * being caught by an assertion and started being caught by a crash. So: sample
+ * every tick, keep the last live one, and report how many ticks it survived so a
+ * caller can put a floor under the comparison.
+ */
+interface Flown {
+  /** The last print taken while the match still had seats. */
+  print: string
+  /** How many ticks ran before it resolved, or the full budget. */
+  ticks: number
+  /** Whether both seats shot at something and somebody's hull came down. */
+  fought: boolean
+  /** True if the match resolved before the budget ran out. */
+  resolved: boolean
+}
+
+function flyMatch(game: Game, crew: SeatPilot[], ticks: number, hulls: number[]): Flown {
+  const intents: Controls[] = []
+  let print = ''
+  let fought = false
+  let ran = 0
+  let resolved = false
+  for (let i = 0; i < ticks; i++) {
+    const views = crew.map((_, at) => game.snapshot(at))
+    if (views.some((v) => v === null)) {
+      resolved = true
+      break
+    }
+    print = matchPrint(game)
+    fought =
+      fought ||
+      (views.every((v) => v!.shotsFired > 0) && views.some((v, at) => v!.hull < hulls[at]))
+    flyAll(game, crew, intents)
+    ran = i + 1
+  }
+  return { print, ticks: ran, fought, resolved }
+}
+
+/**
+ * Two humans in one arena, deterministic from one seed.
+ *
+ * This is the milestone's stated headless requirement, and the assertion that
+ * earns its keep is the *crossed* one rather than any of the "both ships flew"
+ * checks. A simulation that flew every seat on `intents[0]`, or on the local
+ * seat's intent, or on `intents[i + 1]`, passes "both hulls moved" and "both hulls
+ * fired" without complaint — every seat is flying *something*. Only swapping the
+ * two intent streams and demanding the two outcomes swap with them says that a
+ * seat is flying its own.
+ */
+function testTwoSeatsFlyOneArena(): void {
+  section('Two seats fly one arena from one seed')
+
+  const SEED = 0x2f00d
+
+  /* ---- The roster exists, and only as far as it was asked to --------------- */
+
+  const game = newMatch()
+  game.start({ ships: ['hornet', 'wasp'], seed: SEED, respawn: true })
+
+  check('the match reports its seat count', game.seatCount === 2, `${game.seatCount}`)
+  check('seat 0 has a view', game.snapshot(0)?.seat === 0)
+  check('seat 1 has a view', game.snapshot(1)?.seat === 1)
+  check('a seat nobody sat in has none', game.snapshot(2) === null)
+  check(
+    'every view agrees how many seats there are',
+    game.snapshot(0)?.seats === 2 && game.snapshot(1)?.seats === 2,
+  )
+  check(
+    'the two seats fly the hulls they were dealt',
+    game.snapshot(0)?.hull === SHIPS.hornet.maxHull &&
+      game.snapshot(1)?.hull === SHIPS.wasp.maxHull,
+    `${game.snapshot(0)?.hull} / ${game.snapshot(1)?.hull}`,
+  )
+
+  /* Launched apart, which the single-seat game never had to say. `PLAYER_SPAWN` is
+     one point, and handing it to every seat puts two hulls inside each other at
+     t=0 — mutually point-blank, indistinguishable on screen, and a collision the
+     flight model does not model. Asserted at more than the sum of the two radii so
+     it is about being *placed apart* rather than about not quite overlapping. */
+  const zeroAt = game.snapshot(0)!.position
+  const oneAt = game.snapshot(1)!.position
+  const apartBy = Math.hypot(zeroAt.x - oneAt.x, zeroAt.y - oneAt.y, zeroAt.z - oneAt.z)
+  check(
+    'the two seats launch apart rather than inside each other',
+    apartBy > SHIPS.hornet.radius + SHIPS.wasp.radius + 100,
+    `${apartBy.toFixed(0)} units apart`,
+  )
+
+  const crew = seatPilots(2)
+  const HULLS = [SHIPS.hornet.maxHull, SHIPS.wasp.maxHull]
+  flyMatch(game, crew, Math.ceil(12 / STEP), HULLS)
+
+  const first = game.snapshot(0)
+  const second = game.snapshot(1)
+  check('the match was still running to be measured', first !== null && second !== null,
+    'it resolved before anything could be read')
+  check('both seats fired', (first?.shotsFired ?? 0) > 0 && (second?.shotsFired ?? 0) > 0,
+    `${first?.shotsFired} / ${second?.shotsFired}`)
+  check('both seats are flying', (first?.speed ?? 0) > 0 && (second?.speed ?? 0) > 0,
+    `${first?.speed.toFixed(0)} / ${second?.speed.toFixed(0)}`)
+  check(
+    'the two seats are not one seat drawn twice',
+    seatPrint(game, 0) !== 'none' && seatPrint(game, 0) !== seatPrint(game, 1),
+    seatPrint(game, 0),
+  )
+  game.dispose()
+
+  /* ---- Determinism -------------------------------------------------------- */
+
+  function fly(seed: number, throttles: [boolean, boolean]): string {
+    const g = newMatch()
+    g.start({ ships: ['hornet', 'wasp'], seed, respawn: true })
+    const hands = throttles.map((up) => controls({ throttle: up ? 1 : 0 }))
+    let print = ''
+    for (let i = 0; i < Math.ceil(6 / STEP); i++) {
+      if (!g.snapshot(0)) break
+      print = matchPrint(g)
+      g.step(hands)
+    }
+    g.dispose()
+    return print
+  }
+
+  const a = fly(SEED, [true, false])
+  const b = fly(SEED, [true, false])
+  /* The length floor is the point rather than the padding: a resolved match has no
+     seats, so `matchPrint` returns the empty string and two vanished matches
+     compare equal. "Equal" must not be able to mean "both gone". */
+  check('the same seed and the same intents give the same match', a.length > 0 && a === b,
+    `${a}  vs  ${b}`)
+
+  /* ---- The crossed check -------------------------------------------------- */
+
+  /*
+   * Seat 0 at full throttle and seat 1 at rest, then the other way round. Speeds
+   * are the observable because throttle reaches `speed` and nothing else in the
+   * tick does.
+   *
+   * A game that wired every seat to one intent gives the two seats equal speeds,
+   * which fails the first check. A game that wired them to the *wrong* seat gives
+   * unequal speeds — passing that — and then fails to swap, which is what the
+   * second check is for. Both mutations were run; see the message on this commit.
+   */
+  const forward = newMatch()
+  forward.start({ ships: ['hornet', 'hornet'], seed: SEED, respawn: true })
+  const fast = controls({ throttle: 1 })
+  const stopped = controls({ throttle: 0 })
+  let fastFirst = [-1, -1]
+  for (let i = 0; i < 240; i++) {
+    const z = forward.snapshot(0)
+    const o = forward.snapshot(1)
+    if (!z || !o) break
+    fastFirst = [z.speed, o.speed]
+    forward.step([fast, stopped])
+  }
+  forward.dispose()
+
+  const swapped = newMatch()
+  swapped.start({ ships: ['hornet', 'hornet'], seed: SEED, respawn: true })
+  let fastSecond = [-1, -1]
+  for (let i = 0; i < 240; i++) {
+    const z = swapped.snapshot(0)
+    const o = swapped.snapshot(1)
+    if (!z || !o) break
+    fastSecond = [z.speed, o.speed]
+    swapped.step([stopped, fast])
+  }
+  swapped.dispose()
+
+  check(
+    'a seat flies the intent supplied for it, not its neighbour’s',
+    fastFirst[0] > fastFirst[1] + 100,
+    `seat 0 ${fastFirst[0].toFixed(0)} u/s, seat 1 ${fastFirst[1].toFixed(0)} u/s`,
+  )
+  check(
+    'swapping the two intent streams swaps the two outcomes',
+    fastSecond[1] > fastSecond[0] + 100,
+    `seat 0 ${fastSecond[0].toFixed(0)} u/s, seat 1 ${fastSecond[1].toFixed(0)} u/s`,
+  )
+  check(
+    'and swapping them actually changed something',
+    Math.abs(fastFirst[0] - fastSecond[0]) > 100,
+    `seat 0 was ${fastFirst[0].toFixed(0)} u/s either way — the swap did nothing`,
+  )
+}
+
+/**
+ * `step` takes one intent per seat, and says so when it does not.
+ *
+ * The failure being refused is a `TypeError` several frames deep in the flight
+ * model — `controls.fire` of `undefined` — which names neither the caller nor the
+ * mismatch. A long array is the opposite mistake and just as worth hearing: a
+ * caller that thinks the match has more seats than it does has lost track of the
+ * roster, and silently ignoring the tail would let it keep believing that.
+ */
+function testStepNeedsOneIntentPerSeat(): void {
+  section('The simulation takes one intent per seat')
+
+  const game = newMatch()
+  game.start({ ships: ['hornet', 'wasp'], seed: 0x5ea75 })
+
+  function refuses(label: string, intents: Controls[]): void {
+    let threw = false
+    try {
+      game.step(intents)
+    } catch (e) {
+      threw = e instanceof RangeError
+    }
+    check(`${label} is refused`, threw)
+  }
+
+  refuses('no intent at all', [])
+  refuses('one intent for two seats', [controls()])
+  refuses('three intents for two seats', [controls(), controls(), controls()])
+
+  // The positive, wrapped, so a `step` that refused *everything* could not pass
+  // the three negatives above unnoticed. That mutation reports here rather than
+  // aborting the suite on the next line.
+  let flew = false
+  try {
+    game.step([controls({ throttle: 0.5 }), controls({ throttle: 0.5 })])
+    flew = true
+  } catch {
+    flew = false
+  }
+  check('one intent per seat is accepted', flew)
+  check(
+    'and the accepted tick actually simulated',
+    (game.snapshot(0)?.throttle ?? -1) === 0.5,
+    `flew throttle ${game.snapshot(0)?.throttle}`,
+  )
+
+  game.dispose()
+}
+
+/**
+ * Which seat is being *drawn* cannot change what happens.
+ *
+ * The whole roster split rests on this one sentence, and it is the kind of claim
+ * that is easy to assert vacuously — two runs of a simulation that ignored its
+ * intents would also match. So the same seed and the same intents are flown twice
+ * with a different seat presented, and a third run with different intents is
+ * required to *differ*. Without that third run this check would pass against a
+ * `step` that did nothing at all.
+ *
+ * It has already caught two real leaks, both found by writing it: the win bonus
+ * was added to the drawn seat's score, and elimination ended the run when the
+ * drawn seat died rather than when the arena emptied. Neither is visible with one
+ * seat, and both would have shipped.
+ */
+function testPresentationCannotChangeTheMatch(): void {
+  section('Which seat is drawn cannot change the match')
+
+  const SEED = 0x10ca1
+
+  /*
+   * Flown by the autopilot rather than on fixed intents, which is the difference
+   * between this check working and this check reading well.
+   *
+   * With both seats holding a constant throttle nobody hits anything in ten
+   * seconds, so hull, score and kills are all still at their starting values and
+   * the comparison is between two runs that barely happened. A mutation pointing
+   * the whole squadron at the drawn seat instead of the nearest one passed exactly
+   * that version. The autopilot closes the loop — each seat steers from its own
+   * bearings — so a divergence anywhere feeds back into the controls and grows
+   * rather than staying where it started.
+   */
+  const HULLS = [SHIPS.hornet.maxHull, SHIPS.wasp.maxHull]
+  const TICKS = Math.ceil(25 / STEP)
+
+  function fly(localSeat: number): Flown {
+    const g = newMatch()
+    g.start({ ships: ['hornet', 'wasp'], seed: SEED, local: localSeat, respawn: true })
+    const flown = flyMatch(g, seatPilots(2), TICKS, HULLS)
+    g.dispose()
+    return flown
+  }
+
+  const drawnFirst = fly(0)
+  const drawnSecond = fly(1)
+
+  /* Three floors under the comparison, none of them a sanity check.
+
+     Two inert runs match each other perfectly, so without `fought` this passes on
+     a match in which nothing happened — which is how the first version let a real
+     leak through. Two *resolved* runs both read as the empty string, so without
+     the length floor "equal" can mean "both gone". And a match that ended early
+     under one policy and not the other is a difference worth naming rather than
+     absorbing. */
+  check(
+    'the match being compared was a real fight',
+    drawnFirst.fought && drawnSecond.fought,
+    `seat 0 view fought=${drawnFirst.fought}, seat 1 view fought=${drawnSecond.fought}`,
+  )
+  check(
+    'and ran to the end rather than resolving out from under the comparison',
+    !drawnFirst.resolved && !drawnSecond.resolved && drawnFirst.ticks === TICKS,
+    `ran ${drawnFirst.ticks} and ${drawnSecond.ticks} of ${TICKS} ticks`,
+  )
+  check(
+    'the same match watched from either seat is the same match',
+    drawnFirst.print.length > 0 && drawnFirst.print === drawnSecond.print,
+    `${drawnFirst.print}\n         vs ${drawnSecond.print}`,
+  )
+
+  const idled = newMatch()
+  idled.start({ ships: ['hornet', 'wasp'], seed: SEED, respawn: true })
+  const still = controls({ throttle: 0 })
+  let inert = ''
+  for (let i = 0; i < TICKS; i++) {
+    if (!idled.snapshot(0)) break
+    inert = matchPrint(idled)
+    idled.step([still, still])
+  }
+  idled.dispose()
+  check(
+    'and a different set of intents is a different match',
+    inert.length > 0 && inert !== drawnFirst.print,
+    'idle intents produced the same match as a fight — nothing is being simulated',
+  )
+
+  // An out-of-range `local` is presentation, so it is clamped rather than thrown:
+  // a wrong-but-legal seat draws something, where an unbuilt one would leave every
+  // HUD read undefined for the whole match. Contrast `humanFaction`, which throws,
+  // because there is no stand-in for a participant.
+  const clamped = newMatch()
+  clamped.start({ ships: ['hornet', 'wasp'], seed: SEED, local: 9 })
+  check('an out-of-range drawn seat is clamped, not fatal', clamped.snapshot() !== null)
+  clamped.dispose()
+}
+
+/**
+ * Resolving a faction to a seat, which is the half of the guard that lives at the
+ * caller.
+ *
+ * `humanFaction` refuses anything that is not a real roster index, and that is the
+ * right call — there is no stand-in for a participant. But a guard that throws
+ * makes its caller's error handling load-bearing, and the roster is the caller.
+ * Damage arrives carrying a faction that may belong to nobody: the AI's, or the
+ * arena blaming a mine on a side it invented.
+ *
+ * So resolution goes faction → seat, by lookup, returning nothing on a miss — and
+ * never `humanFaction(seats.indexOf(...))`, which is the line that mints
+ * `FACTION_AI` from an `indexOf` miss and puts a human on the NPC side. That
+ * failure is the quiet kind: the human cannot shoot the filler and the filler
+ * cannot shoot back, and it reads as an AI bug.
+ */
+function testAFactionResolvesToASeatOrToNobody(): void {
+  section('A faction resolves to a seat, or to nobody')
+
+  const seats = createSeats([SHIPS.hornet, SHIPS.wasp, SHIPS.drone], 0x5ea7)
+
+  check('a seat per hull, in order', seats.length === 3)
+  /* The identity the whole roster rests on, asserted over every seat rather than
+     at one — the mistake this file has already recorded twice. A roster index and
+     a faction are interchangeable *because* of this, which is what lets a seat be
+     found by its faction at all. */
+  let identity = true
+  const minted: number[] = []
+  for (let i = 0; i < seats.length; i++) {
+    minted.push(seats[i].faction as unknown as number)
+    if (seats[i].index !== i) identity = false
+    if ((seats[i].faction as unknown as number) !== i) identity = false
+  }
+  check('seat i holds faction i', identity, minted.join(','))
+  check('no two seats share a faction', new Set(minted).size === minted.length, minted.join(','))
+
+  /* The lookup, both ways. */
+  let resolvesToItself = true
+  for (const seat of seats) {
+    if (seatOf(seats, seat.faction) !== seat) resolvesToItself = false
+  }
+  check('every seat is found by its own faction', resolvesToItself)
+
+  check('the AI faction belongs to nobody', seatOf(seats, FACTION_AI) === undefined)
+  check(
+    'a faction past the end of the roster belongs to nobody',
+    seatOf(seats, humanFaction(7)) === undefined,
+  )
+  check('and the miss is reported as a miss, not as seat 0', seatOf(seats, FACTION_AI) !== seats[0])
+  check('a faction inside the roster is not a miss', isParticipant(seats, humanFaction(2)))
+  check('one outside it is', !isParticipant(seats, humanFaction(3)))
+
+  /* A match with no seats has nothing to simulate, nothing to draw and no result
+     to report, so it is refused where it is built rather than producing a game
+     that is `active` and blank. Wrapped, so a `createSeats` that threw for *every*
+     roster would report here instead of taking the process down. */
+  let refusedEmpty = false
+  try {
+    createSeats([], 0)
+  } catch (e) {
+    refusedEmpty = e instanceof RangeError
+  }
+  check('a match with no seats is refused', refusedEmpty)
+
+  let builtOne = false
+  try {
+    builtOne = createSeats([SHIPS.hornet], 0).length === 1
+  } catch {
+    builtOne = false
+  }
+  check('a match with one seat is not', builtOne)
+
+  for (const seat of seats) seat.ship.dispose()
+}
+
+/**
+ * A scoreline belongs to the seat that earned it.
+ *
+ * One global `score`, `kills`, `multiplier` and `playerHits` used to hold the run,
+ * and with one human that was not a simplification — it was the truth. The failure
+ * this replaces is not subtle: every seat reading one counter means every
+ * participant shares a score, and the first PvP match would have shown four
+ * identical numbers.
+ *
+ * Asserted by *crossing* rather than by running one match, because a game that
+ * banked everything into seat 0 passes "the fighter scored" whenever the fighter
+ * happens to be seat 0. Only making seat 1 do the fighting separates "the seat
+ * that shot" from "the first seat".
+ */
+function testScoringIsPerSeat(): void {
+  section('A scoreline belongs to the seat that earned it')
+
+  const SEED = 0x5c0e
+
+  /*
+   * The fight is stacked, for the reason `testARunCanBeWon` explains at length: a
+   * proportional autopilot against full enemy hulls scores hits and takes no
+   * hostiles down — the recorded baseline shows exactly that, kills 0 across
+   * twenty seconds on all three airframes. Hits alone would only exercise
+   * `creditHit`; `creditKill` and the bounty are a separate path, and the one that
+   * carries the multiplier, so the hulls come down until kills actually happen.
+   *
+   * Nothing about attribution depends on the stacking. It only makes the thing
+   * being attributed occur.
+   */
+  const originalHulls = { wasp: SHIPS.wasp.maxHull, drone: SHIPS.drone.maxHull }
+  const originalRadii = { wasp: SHIPS.wasp.radius, drone: SHIPS.drone.radius }
+  SHIPS.wasp.maxHull = 12
+  SHIPS.drone.maxHull = 12
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
+
+  /** `fighter` flies the autopilot; the other seat holds still and never fires. */
+  function fight(fighter: number): { scores: number[]; kills: number[]; shots: number[] } {
+    const game = newMatch()
+    game.start({ ships: ['hornet', 'hornet'], seed: SEED, local: fighter, respawn: true })
+
+    const device = stubInput()
+    const pilot = createPilot()
+    const idle = controls({ throttle: 0 })
+    const hands: Controls[] = [idle, idle]
+
+    /*
+     * Sampled every tick and read from the last live sample, because the stacked
+     * fight can *finish*: a cleared squadron is still the win condition, and
+     * `finish` empties the roster, so reading the scoreline after the loop found
+     * `snapshot(0)` null and took the whole suite down — ok=247 of 280 and a
+     * `TypeError` where the summary should have been. The numbers being asserted
+     * are the ones the seats ended the fight holding.
+     */
+    let scores: number[] = [0, 0]
+    let kills: number[] = [0, 0]
+    let shots: number[] = [0, 0]
+
+    for (let i = 0; i < Math.ceil(25 / STEP); i++) {
+      const zero = game.snapshot(0)
+      const one = game.snapshot(1)
+      if (!zero || !one) break
+      scores = [zero.score, one.score]
+      kills = [zero.kills, one.kills]
+      shots = [zero.shotsFired, one.shotsFired]
+
+      const t = game.snapshot(fighter)?.target ?? null
+      if (t) {
+        device.write.pitch = clampTo(t.pitch * 3, -1, 1)
+        device.write.yaw = clampTo(t.yaw * 3, -1, 1)
+        device.write.fire = Math.abs(t.pitch) < 0.35 && Math.abs(t.yaw) < 0.35
+        device.write.throttleUp = t.range > 260
+        device.write.throttleDown = t.range < 170
+      } else {
+        device.write.pitch = 0
+        device.write.yaw = 0
+        device.write.fire = false
+        device.write.throttleUp = true
+        device.write.throttleDown = false
+      }
+      hands[fighter] = pilot.advance(device.state, STEP)
+      hands[1 - fighter] = idle
+      game.step(hands)
+    }
+
+    game.dispose()
+    return { scores, kills, shots }
+  }
+
+  const bySeatZero = fight(0)
+  const bySeatOne = fight(1)
+
+  SHIPS.wasp.maxHull = originalHulls.wasp
+  SHIPS.drone.maxHull = originalHulls.drone
+  SHIPS.wasp.radius = originalRadii.wasp
+  SHIPS.drone.radius = originalRadii.drone
+
+  check(
+    'seat 0 doing the shooting scores for seat 0',
+    bySeatZero.scores[0] > 0 && bySeatZero.shots[0] > 0,
+    `score ${bySeatZero.scores[0]}, shots ${bySeatZero.shots[0]}`,
+  )
+  check(
+    'and leaves seat 1 with nothing',
+    bySeatZero.scores[1] === 0 && bySeatZero.kills[1] === 0 && bySeatZero.shots[1] === 0,
+    `score ${bySeatZero.scores[1]}, kills ${bySeatZero.kills[1]}, shots ${bySeatZero.shots[1]}`,
+  )
+  check(
+    'seat 1 doing the shooting scores for seat 1',
+    bySeatOne.scores[1] > 0 && bySeatOne.shots[1] > 0,
+    `score ${bySeatOne.scores[1]}, shots ${bySeatOne.shots[1]}`,
+  )
+  /* The discriminating one. A game that credited every hit to seat 0 — the old
+     global wearing a seat's name — passes all three checks above and fails this. */
+  check(
+    'and leaves seat 0 with nothing',
+    bySeatOne.scores[0] === 0 && bySeatOne.shots[0] === 0,
+    `score ${bySeatOne.scores[0]}, kills ${bySeatOne.kills[0]}, shots ${bySeatOne.shots[0]}`,
+  )
+  check(
+    'a kill is credited to whoever made it',
+    bySeatZero.kills[0] > 0 && bySeatOne.kills[1] > 0,
+    `seat 0 got ${bySeatZero.kills[0]}, seat 1 got ${bySeatOne.kills[1]}`,
+  )
+  check(
+    'the enemy specs were restored',
+    SHIPS.wasp.maxHull === originalHulls.wasp && SHIPS.wasp.radius === originalRadii.wasp,
+  )
+}
+
+/**
+ * A seat comes back while the rest of the arena carries on without pausing for it.
+ *
+ * The single-seat respawn check cannot see this: with one participant there is
+ * nothing left flying to be interrupted, so "the match kept running" and "the seat
+ * came back" are the same observation. Here the survivor is watched across the whole
+ * of the other seat's cutscene, which is where the old global `dying` mode would
+ * have frozen it.
+ */
+function testASeatRespawnsWhileTheOthersKeepFlying(): void {
+  section('A seat respawns while the rest of the arena keeps flying')
+
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  const field = disarmedArena()
+  let ended: RunResult | null = null
+  const game = newMatch({
+    environment: { ...stubEnvironment(), minefield: field },
+    onEnd: (r) => {
+      ended = r
+    },
+  })
+  game.start({ ships: ['wasp', 'wasp'], seed: 0x5a1d, local: 1, respawn: true })
+
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.7 })]
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+  for (let i = 0; i < 90; i++) game.step(hands)
+  field.arm()
+
+  let survivorMoved = 0
+  let survivorStalled = 0
+  let deadSeatWrecked = 0
+  let cameBack = false
+  let survivorPosition = game.snapshot(1)!.position
+  for (let i = 0; i < sequence + 120; i++) {
+    const dead = game.snapshot(0)
+    const alive = game.snapshot(1)
+    if (!dead || !alive) break
+    if (dead.phase === 'wrecked') {
+      deadSeatWrecked++
+      // The survivor has to still be advancing during the other seat's cutscene.
+      const moved = Math.hypot(
+        alive.position.x - survivorPosition.x,
+        alive.position.y - survivorPosition.y,
+        alive.position.z - survivorPosition.z,
+      )
+      if (moved > 0) survivorMoved++
+      else survivorStalled++
+    }
+    if (deadSeatWrecked > 0 && dead.phase === 'flying') cameBack = true
+    survivorPosition = alive.position
+    game.step(hands)
+  }
+
+  check('the other seat was wrecked for its whole cutscene', deadSeatWrecked >= sequence,
+    `${deadSeatWrecked} of ${sequence} ticks`)
+  check('the survivor kept flying throughout it', survivorStalled === 0 && survivorMoved >= sequence,
+    `${survivorMoved} ticks moving, ${survivorStalled} stalled`)
+  check('the dead seat came back', cameBack, 'it never returned to flying')
+  check('and the match never resolved', (ended as RunResult | null) === null,
+    `reported won=${(ended as RunResult | null)?.won}`)
+  check('the survivor is still in the match', game.snapshot(1)?.phase === 'flying')
+
+  game.dispose()
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * Where a seat comes back is a function of the seed.
+ *
+ * The respawn point is the one gameplay draw this milestone added, and it draws from
+ * its own substream so that a match in which somebody dies still spawns the same
+ * squadron as one in which nobody does. Both halves are asserted: the same seed puts
+ * a seat back in the same place, and a different seed does not — without the second,
+ * a respawn hardcoded to one point would pass the first perfectly.
+ */
+function testARespawnPointReplaysFromItsSeed(): void {
+  section('A respawn point replays from its seed')
+
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  function respawnPlace(seed: number): string {
+    const field = disarmedArena()
+    const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+    game.start({ ships: ['wasp'], seed, respawn: true })
+    const hands = [controls({ throttle: 0.3 })]
+    for (let i = 0; i < 90; i++) game.step(hands)
+    field.arm()
+    let place = 'never respawned'
+    let wasWrecked = false
+    for (let i = 0; i < Math.round(DEATH_SEQUENCE / STEP) + 120; i++) {
+      const seat = game.snapshot(0)
+      if (!seat) break
+      if (wasWrecked && seat.phase === 'flying') {
+        const p = seat.position
+        place = `${p.x.toFixed(6)},${p.y.toFixed(6)},${p.z.toFixed(6)}`
+        break
+      }
+      if (seat.phase === 'wrecked') wasWrecked = true
+      game.step(hands)
+    }
+    game.dispose()
+    return place
+  }
+
+  const a = respawnPlace(0xbeef)
+  const b = respawnPlace(0xbeef)
+  const c = respawnPlace(0xfade)
+
+  check('the seat did respawn somewhere', a !== 'never respawned', a)
+  check('the same seed puts it back in the same place', a === b, `${a}  vs  ${b}`)
+  check('a different seed does not', c !== 'never respawned' && a !== c, `${a}  vs  ${c}`)
+
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * Two scoring participants keep separate streaks and separate accuracy.
+ *
+ * `score` alone cannot show this — one shared counter split two ways looks the same
+ * as two counters until you look at what feeds them. So the multiplier and the hit
+ * count are asserted directly, and the multiplier is checked against *this seat's*
+ * kills rather than merely being non-zero: a shared streak would give both seats the
+ * same number while each had a different kill count.
+ */
+function testTwoScorersKeepSeparateStreaks(): void {
+  section('Two scoring seats keep separate streaks and accuracy')
+
+  const originalHulls = { wasp: SHIPS.wasp.maxHull, drone: SHIPS.drone.maxHull }
+  const originalRadii = { wasp: SHIPS.wasp.radius, drone: SHIPS.drone.radius }
+  SHIPS.wasp.maxHull = 12
+  SHIPS.drone.maxHull = 12
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
+
+  const game = newMatch()
+  game.start({ ships: ['hornet', 'hornet'], seed: 0x7ea, respawn: true })
+  const crew = seatPilots(2)
+  const intents: Controls[] = []
+
+  let last: RunSnapshot[] = []
+  for (let i = 0; i < Math.ceil(25 / STEP); i++) {
+    const views = [game.snapshot(0), game.snapshot(1)]
+    if (views.some((v) => v === null)) break
+    last = views as RunSnapshot[]
+    flyAll(game, crew, intents)
+  }
+  game.dispose()
+
+  SHIPS.wasp.maxHull = originalHulls.wasp
+  SHIPS.drone.maxHull = originalHulls.drone
+  SHIPS.wasp.radius = originalRadii.wasp
+  SHIPS.drone.radius = originalRadii.drone
+
+  const [zero, one] = last
+  check('both seats were still in the match to be read', last.length === 2, `${last.length} views`)
+  check('both seats fired', (zero?.shotsFired ?? 0) > 0 && (one?.shotsFired ?? 0) > 0,
+    `${zero?.shotsFired} / ${one?.shotsFired}`)
+  check('both seats landed hits', (zero?.hits ?? 0) > 0 && (one?.hits ?? 0) > 0,
+    `${zero?.hits} / ${one?.hits}`)
+  check('both seats took kills', (zero?.kills ?? 0) > 0 && (one?.kills ?? 0) > 0,
+    `${zero?.kills} / ${one?.kills}`)
+
+  /* The streak is derived from *this* seat's kills. A shared multiplier gives both
+     seats the same value, which fails here whenever their kill counts differ. */
+  const expected = (kills: number) => Math.min(3, 1 + kills * 0.25)
+  check(
+    'each streak is built from its own seat’s kills',
+    zero !== undefined &&
+      one !== undefined &&
+      zero.multiplier === expected(zero.kills) &&
+      one.multiplier === expected(one.kills),
+    `seat 0 ${zero?.multiplier} for ${zero?.kills} kills, seat 1 ${one?.multiplier} for ${one?.kills} kills`,
+  )
+  /* And the two scorelines are genuinely two. Guards the checks above against a
+     game that credited everything to both seats. */
+  check(
+    'the two scorelines are not one scoreline read twice',
+    zero !== undefined && one !== undefined &&
+      (zero.hits !== one.hits || zero.score !== one.score || zero.shotsFired !== one.shotsFired),
+    `seat 0 ${zero?.hits}/${zero?.score}/${zero?.shotsFired}, seat 1 ${one?.hits}/${one?.score}/${one?.shotsFired}`,
+  )
+  check(
+    'accuracy is each seat’s own hits over its own shots',
+    zero !== undefined && one !== undefined &&
+      zero.hits <= zero.shotsFired && one.hits <= one.shotsFired,
+    `seat 0 ${zero?.hits}/${zero?.shotsFired}, seat 1 ${one?.hits}/${one?.shotsFired}`,
+  )
+}
+
+/**
+ * What a participant shooting another participant is worth: nothing, yet.
+ *
+ * This pins a *gap*, deliberately, so that closing it is a decision rather than an
+ * accident. Hits and bounties are credited against the AI squadron only — the
+ * enemy ships are where `onDamaged` and `onDeath` do the crediting — so a bolt
+ * that lands on another seat does damage and pays no points.
+ *
+ * That is milestone 8's to settle and not this one's, because the answer is a
+ * number rather than a mechanism: `PLANS/NEON_ORBIT_PHASE_B.md` still has "AI kills
+ * count for less than human kills" as an open question, and a human hull has no
+ * bounty on its spec sheet to borrow. Inventing one here would be a balance
+ * decision wearing a refactor's clothes.
+ *
+ * When milestone 8 does settle it, this check fails. That is the intent: it is a
+ * note that has to be read, not a wall.
+ */
+function testShootingAParticipantScoresNothingYet(): void {
+  section('Shooting another participant scores nothing yet — milestone 8')
+
+  const bolts = createBolts()
+  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
+
+  const seats = createSeats([SHIPS.hornet, SHIPS.wasp], 0x5c0e2)
+  const [alice, bob] = seats
+  alice.ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  bob.ship.spawn(new THREE.Vector3(0, 0, -300), new THREE.Vector3(0, 0, -2000))
+  settle([alice.ship, bob.ship], ctx)
+
+  const line = [alice.ship, bob.ship]
+  const before = bob.ship.hull
+  for (let i = 0; i < 400 && bob.ship.hull === before; i++) {
+    alice.ship.position.set(0, 0, 0)
+    alice.ship.velocity.set(0, 0, 0)
+    bob.ship.position.set(0, 0, -300)
+    bob.ship.velocity.set(0, 0, 0)
+    alice.ship.step(controls({ fire: true }), STEP, ctx)
+    bolts.update(STEP, line, [])
+  }
+
+  check('a seat can shoot another seat', bob.ship.hull < before, `hull ${bob.ship.hull}/${before}`)
+  check('the shooter fired', alice.ship.shotsFired > 0)
+  check(
+    'and the hit paid nothing — milestone 8 decides what a participant is worth',
+    alice.score === 0 && alice.hits === 0,
+    `score ${alice.score}, hits ${alice.hits}`,
+  )
+
+  bolts.dispose()
+  for (const seat of seats) seat.ship.dispose()
+}
+
+/**
+ * A HUD stub that records what the squadron looks like, not just where it is.
+ *
+ * `HudContact.accent` is the airframe's own colour, so the multiset of accents on
+ * screen names *which hulls* are in the arena. That makes enemy identity directly
+ * observable, which the outcome fingerprint only ever caught by luck: the squadron
+ * being a function of the drawn seat diverged on six of seven seeds and was
+ * invisible on the seventh, which is the one the check happened to use.
+ */
+function accentRecordingHud(): Hud & { accents: number[] } {
+  const hud = stubHud() as Hud & { accents: number[] }
+  hud.accents = []
+  hud.updateContacts = (contacts) => {
+    hud.accents = contacts.map((c) => c.accent).sort((a, b) => a - b)
+  }
+  return hud
+}
+
+/**
+ * The squadron's accents, with the one participant contact removed.
+ *
+ * A contact is "anything airborne that is not me", so the *other seat* is on the
+ * list too — and which seat that is depends on which one is drawn, by design. The
+ * first version of the comparison below did not account for that and reported a
+ * mismatch of exactly one entry on all eight seeds: the drawn seat's neighbour. That
+ * was the check being wrong rather than the game, and the three squadron accents
+ * underneath it were already identical, which is the fix working.
+ *
+ * Dropping one known accent rather than filtering all of them, because a seat may
+ * legitimately fly the same hull an enemy flies and the count is what matters.
+ */
+function squadronAccents(accents: number[], participantAccent: number): number[] {
+  const out = accents.slice()
+  const at = out.indexOf(participantAccent)
+  if (at >= 0) out.splice(at, 1)
+  return out
+}
+
+/**
+ * The squadron cannot be a function of who is watching.
+ *
+ * This is the leak BOLTy found in the claim this milestone is built on, and it is
+ * worth being precise about how it survived: the check that was supposed to catch
+ * it existed, compared the right things, and ran on **one seed** — which turned out
+ * to be the single masking case out of seven. A hand-picked sample of a universal
+ * property leaves gaps by construction, and the gap sits wherever the next mistake
+ * lands. That sentence is already written down twice in this file, from PR #17.
+ *
+ * So: a contiguous range of seeds, and two independent observables. The accents say
+ * *which hulls* the arena filled with, directly. The fingerprint says the fight
+ * those hulls produced. Either alone has a hole — a squadron of the right hulls can
+ * still fly a different fight, and a fingerprint can agree while the hulls differ,
+ * which is exactly what happened at seed 0x10ca1.
+ */
+function testTheSquadronIsNotAFunctionOfTheWatcher(): void {
+  section('The squadron is the same whoever is watching')
+
+  // Two different hulls on purpose: with both seats on the same airframe,
+  // `otherShips(drawn)` and `otherShips(seat 0)` are the same expression and the
+  // bug this check exists for cannot appear at all.
+  const ROSTER: ShipId[] = ['hornet', 'wasp']
+  const NEIGHBOUR = [SHIPS.wasp.accent, SHIPS.hornet.accent]
+
+  function arena(localSeat: number, seed: number): { accents: number[]; print: string } {
+    const hud = accentRecordingHud()
+    const g = newMatch({ hud })
+    g.start({ ships: ROSTER.slice(), seed, local: localSeat, respawn: true })
+    const hands = [controls({ throttle: 1, fire: true }), controls({ throttle: 0.4, fire: true })]
+    let print = ''
+    let accents: number[] = []
+    for (let i = 0; i < Math.ceil(12 / STEP); i++) {
+      if (!g.snapshot(0)) break
+      print = matchPrint(g)
+      g.step(hands)
+      g.render(1, STEP)
+      const squadron = squadronAccents(hud.accents, NEIGHBOUR[localSeat])
+      if (squadron.length > accents.length) accents = squadron
+    }
+    g.dispose()
+    return { accents, print }
+  }
+
+  const mismatchedHulls: string[] = []
+  const mismatchedFights: string[] = []
+  let sawHostiles = 0
+  const SEEDS = 8
+  for (let seed = 0; seed < SEEDS; seed++) {
+    const a = arena(0, seed)
+    const b = arena(1, seed)
+    if (a.accents.length > 0) sawHostiles++
+    if (a.accents.join(',') !== b.accents.join(',')) {
+      mismatchedHulls.push(`0x${seed.toString(16)}: [${a.accents}] vs [${b.accents}]`)
+    }
+    if (a.print !== b.print || a.print.length === 0) {
+      mismatchedFights.push(`0x${seed.toString(16)}`)
+    }
+  }
+
+  /* The floor. Accents come from contacts, so a match in which no hostile ever
+     appeared records none and every comparison above passes on two empty lists. */
+  check(
+    'hostiles actually reached the arena to be compared',
+    sawHostiles === SEEDS,
+    `hulls seen on ${sawHostiles} of ${SEEDS} seeds`,
+  )
+  check(
+    `the arena fills with the same hulls from either seat, across ${SEEDS} seeds`,
+    mismatchedHulls.length === 0,
+    mismatchedHulls.join(' | '),
+  )
+  check(
+    `and the fight those hulls produce is the same, across ${SEEDS} seeds`,
+    mismatchedFights.length === 0,
+    `diverged on ${mismatchedFights.join(', ')}`,
+  )
+}
+
+/**
+ * An eliminated seat is out, and stays out.
+ *
+ * The tick's rule is "a flying hull that is not alive starts its cutscene". When
+ * elimination was represented by *clearing* the wreck, an eliminated seat matched
+ * that rule again on the very next tick: `deaths` climbed 1, 2, 3 every 2.4 seconds
+ * while the participant sat there dead, re-sealing the local result each time.
+ * Reproduced at `deaths=3` before the fix.
+ *
+ * The reason it went unnoticed is worth more than the bug: the check that walked
+ * exactly this state asserted the *survivor* was still flying and that no result
+ * had been reported. It never looked at the corpse.
+ */
+function testAnEliminatedSeatStaysEliminated(): void {
+  section('An eliminated seat is out, and stays out')
+
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  const field = disarmedArena()
+  const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+  game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: 0 })
+
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+  for (let i = 0; i < 90; i++) game.step(hands)
+  field.arm()
+
+  /*
+   * Watched past the elimination rather than for three cutscenes.
+   *
+   * The bug reached `deaths=3` given eight seconds, but *detecting* it needs one
+   * tick: with `null` standing for both ends of a seat's life, the tick after
+   * elimination immediately matched "dead hull, no wreck" and started again. Eight
+   * seconds is also long enough for the 40-hull survivor to be shot down, which
+   * resolves the match and makes the corpse unobservable — the first version of this
+   * check failed on exactly that rather than on the property.
+   *
+   * `watchedAfter` is the floor. Without it, "never restarted" passes on a window
+   * that ended the tick elimination happened.
+   */
+  let wreckedTicks = 0
+  let maxDeaths = 0
+  let sawEliminated = false
+  let restarted = false
+  let watchedAfter = 0
+  for (let i = 0; i < sequence + 90; i++) {
+    const seat = game.snapshot(0)
+    if (!seat) break
+    if (seat.phase === 'wrecked') {
+      wreckedTicks++
+      if (sawEliminated) restarted = true
+    }
+    if (seat.phase === 'eliminated') sawEliminated = true
+    if (sawEliminated) watchedAfter++
+    maxDeaths = Math.max(maxDeaths, seat.deaths)
+    game.step(hands)
+  }
+
+  check('the seat was killed and its cutscene ran', wreckedTicks > 0, `${wreckedTicks} ticks wrecked`)
+  check('the cutscene ended in elimination', sawEliminated, 'it never reached the eliminated phase')
+  check(
+    'the corpse was watched long enough for a restart to show',
+    watchedAfter >= 30,
+    `only ${watchedAfter} ticks after elimination`,
+  )
+  check(
+    'and the cutscene never restarted',
+    !restarted,
+    'an eliminated seat re-entered its own death sequence',
+  )
+  check('one death is counted once', maxDeaths === 1, `deaths reached ${maxDeaths}`)
+
+  game.dispose()
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * Every cutscene the match starts, the match finishes.
+ *
+ * With staggered deaths the first wreck to resolve used to call `finish` — and
+ * `clearArena` with it — as soon as nobody was left *flying*, which a second seat
+ * still mid-explosion satisfies. Reproduced: the later wreck held 85 of its 144
+ * ticks and then vanished. The same shape applies to a win: clearing the last
+ * hostile while somebody is exploding truncates the explosion.
+ */
+function testStaggeredWrecksEachGetTheirWholeCutscene(): void {
+  section('Every cutscene the match starts, the match finishes')
+
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  const field = disarmedArena()
+  let ended: RunResult | null = null
+  const game = newMatch({
+    environment: { ...stubEnvironment(), minefield: field },
+    onEnd: (r) => {
+      ended = r
+    },
+  })
+  game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: 0 })
+
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+
+  for (let i = 0; i < 90; i++) game.step(hands)
+  field.arm() // seat 0
+  let firstWrecked = 0
+  for (let i = 0; i < 60; i++) {
+    if (game.snapshot(0)?.phase === 'wrecked') firstWrecked++
+    game.step(hands)
+  }
+  field.arm() // seat 1, a second later
+
+  let secondWrecked = 0
+  for (let i = 0; i < sequence * 2 + 120; i++) {
+    const one = game.snapshot(1)
+    if (!one) break
+    if (one.phase === 'wrecked') secondWrecked++
+    game.step(hands)
+  }
+
+  check('the first seat died first', firstWrecked > 0, `${firstWrecked} ticks`)
+  check(
+    'the later wreck got its whole cutscene rather than being cleared',
+    secondWrecked >= sequence,
+    `held ${secondWrecked} of ${sequence} ticks`,
+  )
+  check('and the match did resolve afterwards', (ended as RunResult | null) !== null, 'never resolved')
+
+  game.dispose()
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * A minefield the test aims, tick by tick.
+ *
+ * `findContact(position, radius)` is everything the arena tells a minefield about who
+ * is asking, and the radius alone is enough once the squadron is given a sentinel
+ * value. Singling out *one seat* needs the other half: the field is spent on contact
+ * and `resolveMines` walks the seats in roster order, so a single arming aimed at the
+ * seats' radius takes seat 0 and leaves seat 1 alone.
+ *
+ * Position was the obvious discriminator and does not work: both seats launch facing
+ * the arena centre, so fourteen seconds later they are 141 units apart and a mine
+ * aimed at one is aimed at both. Measured, after it killed the survivor.
+ *
+ * This exists to build one state no other check reaches — squadron empty, one seat
+ * mid-explosion, another still flying — which is where a win reported over a wreck
+ * both steals a loss's banner and truncates the explosion. It is elaborate because
+ * the state is: it cannot happen with one seat, and it cannot be reached by flying
+ * two seats and hoping.
+ */
+interface AimedMinefield extends Minefield {
+  /** Which hulls this mine is willing to touch, by the two facts it is given. */
+  aim(at: (radius: number) => boolean): void
+  /** Make it live again. It is spent on contact, like the real one. */
+  arm(): void
+}
+
+function aimedMinefield(): AimedMinefield {
+  const mine: Mine = { position: new THREE.Vector3(), live: false }
+  let hits: (radius: number) => boolean = () => false
+  return {
+    group: new THREE.Group(),
+    mines: [mine],
+    avoidance: [],
+    findContact: (_position, radius) => (mine.live && hits(radius) ? mine : null),
+    // Spent on contact, exactly like the real field — which is what makes it able
+    // to single out *one* hull: `resolveMines` walks the seats in roster order, so
+    // a one-shot mine aimed at the seats' radius takes seat 0 and nobody else.
+    detonate: (m) => {
+      m.live = false
+    },
+    reset: () => {
+      mine.live = false
+      hits = () => false
+    },
+    aim: (at) => {
+      hits = at
+    },
+    arm: () => {
+      mine.live = true
+    },
+    update() {},
+    dispose() {},
+  } as AimedMinefield
+}
+
+/**
+ * A win waits for every explosion it interrupted.
+ *
+ * `finish` clears the arena, so reporting a cleared squadron while somebody is still
+ * coming apart ends their cutscene mid-blast — and in a match where one seat has just
+ * died and another is alive, it hands the survivor a victory banner over a wreck that
+ * had 60 ticks left to run.
+ *
+ * The state is constructed rather than waited for. The squadron cannot hurt the seats
+ * (zero damage), one seat is singled out by position and killed by a mine, and the
+ * remaining hostiles are then killed in a single tick by the same mine aimed at their
+ * sentinel radius. Both seats fly the same hull deliberately: the squadron is "the two
+ * airframes seat 0 is not flying", so any other roster puts an enemy and a participant
+ * on one spec sheet and the levers stop being separable.
+ */
+function testAWinWaitsForEveryExplosion(): void {
+  section('A win waits for the explosions it would interrupt')
+
+  const original = {
+    hornetHull: SHIPS.hornet.maxHull,
+    waspHull: SHIPS.wasp.maxHull,
+    droneHull: SHIPS.drone.maxHull,
+    waspDamage: SHIPS.wasp.damage,
+    droneDamage: SHIPS.drone.damage,
+    waspRadius: SHIPS.wasp.radius,
+    droneRadius: SHIPS.drone.radius,
+  }
+  // Seats die to one mine (45 flat) and to nothing else; hostiles die to one mine and
+  // cannot shoot back, so the only deaths in this match are the ones the test causes.
+  SHIPS.hornet.maxHull = 40
+  SHIPS.wasp.maxHull = 30
+  SHIPS.drone.maxHull = 30
+  SHIPS.wasp.damage = 0
+  SHIPS.drone.damage = 0
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
+
+  const SENTINEL = 350
+  const field = aimedMinefield()
+  let ended: RunResult | null = null
+  const game = newMatch({
+    environment: { ...stubEnvironment(), minefield: field },
+    onEnd: (r) => {
+      ended = r
+    },
+  })
+  // Drawing the survivor. The mirror — drawing the seat that dies — is
+  // `testAnEliminatedSeatDoesNotInheritTheWin`, and it is a different claim: this one is
+  // about the cutscene not being cut short, that one about whose result gets reported.
+  game.start({ ships: ['hornet', 'hornet'], seed: 0x5eed, local: 1 })
+
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+
+  /*
+   * Phase 1: drain the arrival queue.
+   *
+   * The mine has to be killing hostiles for this to happen at all — only three are
+   * airborne at once, so with nothing dying the queue sits at three forever, which is
+   * what the first version of this waited 30 seconds for. So the squadron is aimed at
+   * from the start and disarmed the moment the queue empties, which leaves whatever is
+   * mid-warp alive as the hostile to clear later.
+   */
+  field.aim((r) => r === SENTINEL)
+  let ticks = 0
+  for (; ticks < Math.ceil(40 / STEP); ticks++) {
+    const view = game.snapshot(0)
+    if (!view) break
+    field.arm()
+    game.step(hands)
+    if ((game.snapshot(0)?.enemiesQueued ?? 1) === 0) break
+  }
+  field.aim(() => false)
+  const queued = game.snapshot(0)?.enemiesQueued
+  const airborne = game.snapshot(0)?.enemiesAirborne
+  check('the arrival queue emptied with a hostile still airborne', queued === 0 && (airborne ?? 0) > 0,
+    `queued=${queued} airborne=${airborne}`)
+
+  /* Phase 2: one arming aimed at the seats, which the roster order spends on seat 0. */
+  field.aim((r) => r !== SENTINEL)
+  field.arm()
+  for (let i = 0; i < 60; i++) {
+    const view = game.snapshot(0)
+    if (!view || view.phase === 'wrecked') break
+    game.step(hands)
+  }
+  check('seat 0 was singled out and killed', game.snapshot(0)?.phase === 'wrecked',
+    `phase ${game.snapshot(0)?.phase}`)
+  check('seat 1 was not touched', game.snapshot(1)?.hull === SHIPS.hornet.maxHull,
+    `hull ${game.snapshot(1)?.hull}/${SHIPS.hornet.maxHull}`)
+
+  /* Phase 3: clear the squadron while that cutscene is running. */
+  field.aim((r) => r === SENTINEL)
+
+  let wreckedTicks = 0
+  let squadronEmptyDuringCutscene = false
+  let resultDuringCutscene = false
+  for (let i = 0; i < sequence + 180; i++) {
+    const zero = game.snapshot(0)
+    if (!zero) break
+    if (zero.phase === 'wrecked') {
+      wreckedTicks++
+      if (zero.enemiesQueued === 0 && zero.enemiesAirborne === 0) squadronEmptyDuringCutscene = true
+      if ((ended as RunResult | null) !== null) resultDuringCutscene = true
+    }
+    field.arm()
+    game.step(hands)
+  }
+
+  /* The floor. Without this the two checks below pass on a match where the squadron
+     never emptied while anybody was exploding — which is to say, on nothing. */
+  /* The floor, and its message has to stay honest under the mutation it guards
+     against: with the win ungated, `finish` clears the arena on the very tick the
+     squadron empties, so this floor fails *because the state was destroyed as it was
+     created* rather than because it never happened. Saying "never reached" there would
+     be a diagnostic asserting something untrue. */
+  check(
+    'the squadron did empty while a seat was still exploding',
+    squadronEmptyDuringCutscene,
+    'never observed — either it did not happen, or the match resolved before it could be sampled',
+  )
+  check(
+    'no result is reported over a wreck',
+    !resultDuringCutscene,
+    'the match resolved while a seat was mid-explosion',
+  )
+  check(
+    'the wreck got its whole cutscene even so',
+    wreckedTicks >= sequence,
+    `held ${wreckedTicks} of ${sequence} ticks`,
+  )
+  const final = ended as RunResult | null
+  check('and the cleared squadron is reported afterwards', final !== null, 'never resolved')
+  check('as a win, to the seat still flying', final?.won === true, `won=${final?.won}`)
+
+  game.dispose()
+  SHIPS.hornet.maxHull = original.hornetHull
+  SHIPS.wasp.maxHull = original.waspHull
+  SHIPS.drone.maxHull = original.droneHull
+  SHIPS.wasp.damage = original.waspDamage
+  SHIPS.drone.damage = original.droneDamage
+  SHIPS.wasp.radius = original.waspRadius
+  SHIPS.drone.radius = original.droneRadius
+  check(
+    'the specs were restored',
+    SHIPS.hornet.maxHull === original.hornetHull &&
+      SHIPS.wasp.damage === original.waspDamage &&
+      SHIPS.wasp.radius === original.waspRadius,
+  )
+}
+
+/**
+ * An eliminated participant does not inherit a teammate's win.
+ *
+ * The mirror of `testAWinWaitsForEveryExplosion`, and it was missing for a reason worth
+ * recording: that check deliberately draws the *survivor*, and its comment says so — to
+ * keep the reported result a clean win rather than a loss sealed earlier. Choosing the
+ * convenient viewpoint is how the other one goes untested. Same match, same seed, same
+ * mine; only which seat is drawn changes.
+ *
+ * The defect: the drawn seat is eliminated, sealing its loss, and the surviving
+ * participant then clears the squadron. `finish(sealResult(true))` reported `won: true`
+ * for a participant who had been dead for seconds — and computed the win bonuses off a
+ * hull sitting at zero. Their run ended at their death; a teammate finishing the job
+ * afterwards is not their victory.
+ */
+function testAnEliminatedSeatDoesNotInheritTheWin(): void {
+  section('An eliminated participant does not inherit a teammate’s win')
+
+  const original = {
+    hornetHull: SHIPS.hornet.maxHull,
+    waspHull: SHIPS.wasp.maxHull,
+    droneHull: SHIPS.drone.maxHull,
+    waspDamage: SHIPS.wasp.damage,
+    droneDamage: SHIPS.drone.damage,
+    waspRadius: SHIPS.wasp.radius,
+    droneRadius: SHIPS.drone.radius,
+  }
+  SHIPS.hornet.maxHull = 40
+  SHIPS.wasp.maxHull = 30
+  SHIPS.drone.maxHull = 30
+  SHIPS.wasp.damage = 0
+  SHIPS.drone.damage = 0
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
+  const SENTINEL = 350
+
+  /**
+   * Runs the whole thing from one viewpoint: drain the queue, kill seat 0 with a one-shot
+   * mine (roster order picks it), then clear the remaining hostiles while its cutscene
+   * plays. Returns what the drawn seat's debrief was told.
+   */
+  function playFrom(localSeat: number): {
+    result: RunResult | null
+    deaths: number
+    wrecked: boolean
+    scoreAtDeath: number
+    scoreAtEnd: number
+  } {
+    const field = aimedMinefield()
+    let ended: RunResult | null = null
+    const game = newMatch({
+      environment: { ...stubEnvironment(), minefield: field },
+      onEnd: (r) => {
+        ended = r
+      },
+    })
+    game.start({ ships: ['hornet', 'hornet'], seed: 0x5eed, local: localSeat })
+    const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+    const sequence = Math.round(DEATH_SEQUENCE / STEP)
+
+    field.aim((r) => r === SENTINEL)
+    for (let i = 0; i < Math.ceil(40 / STEP); i++) {
+      if (!game.snapshot(0)) break
+      field.arm()
+      game.step(hands)
+      if ((game.snapshot(0)?.enemiesQueued ?? 1) === 0) break
+    }
+    field.aim(() => false)
+
+    field.aim((r) => r !== SENTINEL)
+    field.arm()
+    let wrecked = false
+    let deaths = 0
+    let scoreAtDeath = -1
+    for (let i = 0; i < 60; i++) {
+      const view = game.snapshot(0)
+      if (!view) break
+      deaths = Math.max(deaths, view.deaths)
+      if (view.phase === 'wrecked') {
+        wrecked = true
+        // Read on the first tick the wreck is visible, which is the tick after the seal.
+        scoreAtDeath = view.score
+        break
+      }
+      game.step(hands)
+    }
+
+    field.aim((r) => r === SENTINEL)
+    let scoreAtEnd = scoreAtDeath
+    for (let i = 0; i < sequence + 240 && (ended as RunResult | null) === null; i++) {
+      const view = game.snapshot(0)
+      if (!view) break
+      deaths = Math.max(deaths, view.deaths)
+      scoreAtEnd = view.score
+      field.arm()
+      game.step(hands)
+    }
+
+    game.dispose()
+    return { result: ended as RunResult | null, deaths, wrecked, scoreAtDeath, scoreAtEnd }
+  }
+
+  const asVictim = playFrom(0)
+  const asSurvivor = playFrom(1)
+
+  SHIPS.hornet.maxHull = original.hornetHull
+  SHIPS.wasp.maxHull = original.waspHull
+  SHIPS.drone.maxHull = original.droneHull
+  SHIPS.wasp.damage = original.waspDamage
+  SHIPS.drone.damage = original.droneDamage
+  SHIPS.wasp.radius = original.waspRadius
+  SHIPS.drone.radius = original.droneRadius
+
+  /* The premises, so neither verdict below can pass on a match that did something else. */
+  check('the drawn seat was killed in the first run', asVictim.wrecked && asVictim.deaths === 1,
+    `wrecked=${asVictim.wrecked} deaths=${asVictim.deaths}`)
+  check('both runs resolved', asVictim.result !== null && asSurvivor.result !== null,
+    `victim ${asVictim.result === null ? 'none' : 'ok'}, survivor ${asSurvivor.result === null ? 'none' : 'ok'}`)
+
+  /* The finding. */
+  check(
+    'the eliminated participant is told it lost',
+    asVictim.result?.won === false,
+    `won=${asVictim.result?.won} — a dead participant was handed the squadron clear`,
+  )
+  /*
+   * Exactly the score it had when it died, and the assertion is the *equality* rather
+   * than a bound. A threshold was the first attempt and it was a bad proxy: this seat
+   * legitimately earned 1813 points, because unattributable kills fall back to seat 0
+   * and the mine clearing the squadron produced a lot of them — so "the score is small"
+   * says nothing about whether a bonus was added.
+   *
+   * The freeze is load-bearing here, which the second check establishes: the seat keeps
+   * being credited after it is dead, for exactly the reason `sealResult` exists — "long
+   * enough for a hostile to fly into the star and post a bounty to a pilot who is
+   * already dead".
+   */
+  check(
+    'and its result is the scoreline it died with',
+    asVictim.result?.score === asVictim.scoreAtDeath,
+    `reported ${asVictim.result?.score}, had ${asVictim.scoreAtDeath} at death`,
+  )
+  check(
+    'which is not the same as its scoreline at the end — the seal is doing work',
+    asVictim.scoreAtEnd > asVictim.scoreAtDeath,
+    `${asVictim.scoreAtDeath} at death, ${asVictim.scoreAtEnd} when the match ended`,
+  )
+  /* The other viewpoint, from the same match: the survivor really did win, so the check
+     above is about *whose* result is reported rather than about the match's outcome. */
+  check(
+    'the surviving participant is told it won',
+    asSurvivor.result?.won === true,
+    `won=${asSurvivor.result?.won}`,
+  )
+  check(
+    'so the two viewpoints report different results from one match',
+    asVictim.result?.won !== asSurvivor.result?.won,
+    `both reported won=${asVictim.result?.won}`,
+  )
+  check(
+    'the specs were restored',
+    SHIPS.hornet.maxHull === original.hornetHull && SHIPS.wasp.damage === original.waspDamage,
+  )
+}
+
+/**
+ * Pause is the roster's answer, not the drawn seat's.
+ *
+ * `paused` stops the whole simulation, so a guard that consulted `local` meant the
+ * same match in the same state — one wreck, one hull still flying — could be frozen
+ * from one machine and not from another. Reproduced: `local: 0` refused the pause
+ * and `local: 1` accepted it.
+ */
+function testPauseIsMirroredAcrossSeats(): void {
+  section('Pause answers to the roster, not to the drawn seat')
+
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  function pausedInOneWreckState(localSeat: number): boolean {
+    const field = disarmedArena()
+    const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+    game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: localSeat })
+    const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+    for (let i = 0; i < 90; i++) game.step(hands)
+    field.arm()
+    for (let i = 0; i < 5; i++) game.step(hands)
+    const wrecked = game.snapshot(0)?.phase === 'wrecked'
+    const flying = game.snapshot(1)?.phase === 'flying'
+    game.pause()
+    const paused = game.paused
+    game.dispose()
+    // Guards the comparison: if the state was not "one wreck, one flying" then the
+    // two runs are not being asked the same question.
+    return wrecked && flying ? paused : true
+  }
+
+  const fromWreck = pausedInOneWreckState(0)
+  const fromSurvivor = pausedInOneWreckState(1)
+  check(
+    'the same state answers pause the same way from either seat',
+    fromWreck === fromSurvivor,
+    `drawing the wreck gave paused=${fromWreck}, drawing the survivor gave paused=${fromSurvivor}`,
+  )
+  check('and a cutscene anywhere refuses the pause', fromWreck === false && fromSurvivor === false,
+    'a wreck mid-explosion was frozen')
+
+  /*
+   * `pause()` says whether it paused, and a caller must be able to trust that
+   * instead of predicting it.
+   *
+   * These assert the *callee*: `dying` is not the pause condition, and the only
+   * reliable answer is the return value. That is worth pinning, and it is not enough
+   * on its own — the bug was in the caller, and an earlier version of this comment
+   * claimed to protect a caller this file could not execute. It certified something
+   * untrue, which is the failure it was describing. The caller now lives behind a
+   * seam and is tested for real in `testTheScreenMachineCanBeLeftAgain`.
+   */
+  {
+    const field = disarmedArena()
+    const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+    game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: 1 })
+    const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+    for (let i = 0; i < 90; i++) game.step(hands)
+    field.arm()
+    for (let i = 0; i < 5; i++) game.step(hands)
+
+    const remoteWrecked = game.snapshot(0)?.phase === 'wrecked'
+    const localFlying = game.snapshot(1)?.phase === 'flying'
+    check('the state is a remote wreck with the drawn seat still flying',
+      remoteWrecked && localFlying,
+      `remote ${game.snapshot(0)?.phase}, drawn ${game.snapshot(1)?.phase}`)
+
+    const saidDying = game.dying
+    const accepted = game.pause()
+    check('`dying` is false here — it is the drawn seat only', saidDying === false, `dying=${saidDying}`)
+    check('pause refuses anyway, and says so', accepted === false, `pause() returned ${accepted}`)
+    check('its answer matches what actually happened', accepted === game.paused,
+      `returned ${accepted}, paused=${game.paused}`)
+
+    // And the simulation really is still advancing, which is what made the overlay a
+    // lie rather than a cosmetic slip.
+    const before = game.snapshot(1)!.position
+    for (let i = 0; i < 60; i++) game.step(hands)
+    const after = game.snapshot(1)!.position
+    const travelled = Math.hypot(after.x - before.x, after.y - before.y, after.z - before.z)
+    check('a refused pause leaves the match running, as it must', travelled > 1,
+      `${travelled.toFixed(1)} units`)
+    game.dispose()
+  }
+
+  /* The mirror: a pause that *is* accepted stops everything, the environment
+     included. `environment.step` used to run before the not-live return, so a paused
+     game kept its pod respawn clocks ticking — pre-existing, and fixed with the pause
+     path rather than left next to it. */
+  {
+    let envTicks = 0
+    const counted: Environment = { ...stubEnvironment(), step: () => { envTicks++ } }
+    const game = newMatch({ environment: counted })
+    game.start({ ships: ['hornet'], seed: 0x9a05e })
+    const hands = [controls({ throttle: 0.6 })]
+    for (let i = 0; i < 30; i++) game.step(hands)
+    const ranBefore = envTicks
+    const accepted = game.pause()
+    const at = game.snapshot(0)!.position
+    for (let i = 0; i < 120; i++) game.step(hands)
+    const still = game.snapshot(0)!.position
+
+    check('a healthy match accepts the pause', accepted === true && game.paused)
+    check('the environment advanced while the match was running', ranBefore === 30, `${ranBefore} ticks`)
+    check('and advances not at all while it is paused', envTicks === ranBefore,
+      `${envTicks - ranBefore} tick(s) during the pause`)
+    check('nor does the hull move', at.x === still.x && at.y === still.y && at.z === still.z,
+      `moved to ${still.z}`)
+
+    game.resume()
+    for (let i = 0; i < 10; i++) game.step(hands)
+    check('and both start again on resume', envTicks === ranBefore + 10 &&
+      game.snapshot(0)!.position.z !== still.z, `${envTicks - ranBefore} env ticks after resume`)
+    game.dispose()
+  }
+
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * A call that throws costs nothing.
+ *
+ * Two separate versions of the same mistake: validate, then mutate. `step` advanced
+ * the environment before checking the intent count, so a rejected tick still moved
+ * the world clock and a caller that retried advanced it twice for one tick of
+ * simulation. And `start` tore the arena down before finding out whether the setup
+ * was buildable, so a refused roster left `active` true with no seats — a blank
+ * zombie in place of the match the caller already had.
+ */
+function testARefusedCallChangesNothing(): void {
+  section('A refused call leaves the match exactly as it found it')
+
+  /* ---- step ------------------------------------------------------------- */
+
+  let envTicks = 0
+  const counted: Environment = { ...stubEnvironment(), step: () => { envTicks++ } }
+  const game = newMatch({ environment: counted })
+  game.start({ ships: ['hornet', 'wasp'], seed: 0x5afe })
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      game.step([controls()])
+    } catch {
+      /* expected */
+    }
+  }
+  const afterRejects = envTicks
+  game.step([controls(), controls()])
+
+  check('three refused ticks advanced the environment not at all', afterRejects === 0, `${afterRejects} tick(s)`)
+  check('and the valid tick advanced it exactly once', envTicks === 1, `${envTicks} tick(s)`)
+  game.dispose()
+
+  /* ---- start ------------------------------------------------------------ */
+
+  const running = newMatch()
+  running.start({ ships: ['hornet'], seed: 0x5afe })
+  running.step([controls({ throttle: 0.5 })])
+  const before = running.snapshot()
+
+  function refuses(label: string, setup: () => void): void {
+    let threw = false
+    try {
+      setup()
+    } catch (e) {
+      threw = e instanceof RangeError
+    }
+    check(`${label} is refused`, threw)
+  }
+
+  refuses('a match with no seats', () => running.start({ ships: [] }))
+  refuses('a seat asking for a hull that does not exist', () =>
+    running.start({ ships: ['hornet', 'zephyr' as ShipId] }))
+
+  const after = running.snapshot()
+  check(
+    'the running match survived both refusals',
+    running.active && running.seatCount === 1 && after !== null,
+    `active=${running.active} seatCount=${running.seatCount} snapshot=${after === null ? 'null' : 'present'}`,
+  )
+  check(
+    'and survived them unchanged',
+    before !== null && after !== null && before.throttle === after.throttle && before.hull === after.hull,
+    `${before?.hull}/${before?.throttle} -> ${after?.hull}/${after?.throttle}`,
+  )
+  /* The positive, so a `start` that refused everything could not pass the two
+     negatives above. Wrapped, so that mutant reports instead of aborting. */
+  let restarted = false
+  try {
+    running.start({ ships: ['wasp'], seed: 1 })
+    restarted = running.seatCount === 1
+  } catch {
+    restarted = false
+  }
+  check('a valid restart is still accepted', restarted)
+  running.dispose()
+}
+
+/**
+ * The screen state machine: entering the pause screen, and getting back out.
+ *
+ * Four rounds landed on this one transition, and every fix moved the tested boundary
+ * one layer inward while leaving the last step of the decision in code no test could
+ * reach — the caller's own copy of the pause condition, then an answer it had to
+ * honour, then a value it had to assign, then an object it had to pass by reference
+ * rather than by copy. Each regression stayed green across the whole suite.
+ *
+ * So `createScreens` owns the state outright: there is nothing to hand it and nothing
+ * to assign back. These checks assert two things, and the second is the one every
+ * earlier version missed — not "did the transition return the right thing" but **can
+ * the player get back out**, driven through a model of `main.ts`'s own key handler
+ * rather than by calling enter and exit in whatever order suits the test.
+ */
+function testTheScreenMachineCanBeLeftAgain(): void {
+  section('The pause screen can be entered, and left again')
+
+  interface Rig {
+    screens: ReturnType<typeof createScreens>
+    log: string[]
+  }
+
+  /*
+   * `resume` is wired separately from `pause`, and not for symmetry. The first version
+   * of the live case below wired only `pause` to the real game and left `resume` as a
+   * log entry, then asserted the real game had resumed — which failed, correctly. A
+   * double whose halves reach different places is a check on nothing in particular.
+   */
+  function rig(
+    from: 'hangar' | 'flight' | 'debrief',
+    pause: () => boolean,
+    resume: () => void = () => {},
+  ): Rig {
+    const log: string[] = []
+    const host: PauseHost = {
+      pause: () => {
+        const ok = pause()
+        log.push(`pause->${ok}`)
+        return ok
+      },
+      resume: () => {
+        resume()
+        log.push('resume')
+      },
+      showPanel: () => log.push('showPanel'),
+      hidePanel: () => log.push('hidePanel'),
+      grabPointer: () => log.push('grabPointer'),
+    }
+    return { screens: createScreens(host, from), log }
+  }
+
+  /* ---- Both answers ------------------------------------------------------- */
+
+  const yes = rig('flight', () => true)
+  yes.screens.enterPause()
+  check('an accepted pause reaches the pause screen', yes.screens.screen === 'paused', yes.screens.screen)
+  check('and puts the panel up, after asking', yes.log.join(',') === 'pause->true,showPanel', yes.log.join(','))
+
+  const no = rig('flight', () => false)
+  no.screens.enterPause()
+  /* A refusal changes *nothing*. Not "the screen is right and the panel is up anyway",
+     which is the same bug wearing a correct answer. */
+  check('a refused pause leaves the screen in flight', no.screens.screen === 'flight', no.screens.screen)
+  check('and does nothing else at all', no.log.join(',') === 'pause->false', no.log.join(','))
+
+  /* ---- Leaving ------------------------------------------------------------ */
+
+  const leaving = rig('flight', () => true)
+  leaving.screens.enterPause()
+  leaving.log.length = 0
+  leaving.screens.exitPause()
+  check('leaving returns to flight', leaving.screens.screen === 'flight', leaving.screens.screen)
+  check(
+    'and takes the panel down before the simulation restarts',
+    leaving.log.join(',') === 'hidePanel,resume,grabPointer',
+    leaving.log.join(','),
+  )
+
+  /* ---- Preconditions, which used to live at the call site ---------------- */
+
+  for (const from of ['hangar', 'debrief'] as const) {
+    const r = rig(from, () => true)
+    r.screens.enterPause()
+    check(`pausing from the ${from} screen does nothing`, r.screens.screen === from && r.log.length === 0,
+      `screen ${r.screens.screen}, did ${r.log.join(',') || 'nothing'}`)
+    r.screens.exitPause()
+    check(`leaving the pause screen from ${from} does nothing`, r.screens.screen === from && r.log.length === 0,
+      `screen ${r.screens.screen}, did ${r.log.join(',') || 'nothing'}`)
+  }
+  const flying = rig('flight', () => true)
+  flying.screens.exitPause()
+  check('leaving the pause screen while in flight does nothing',
+    flying.screens.screen === 'flight' && flying.log.length === 0, flying.log.join(','))
+
+  /* ---- The trap: two presses of Escape, through main.ts's own handler ----- */
+
+  /*
+   * `src/main.ts` binds Escape and P to `screens.togglePause()` and nothing else, so
+   * this *is* the shipped handler. Driving it twice is the property the last two
+   * regressions broke: the panel went up, the screen stayed in flight, and Resume —
+   * which refuses unless the screen says paused — could never fire.
+   */
+  const app = rig('flight', () => true)
+  app.screens.togglePause()
+  check('one press of Escape pauses', app.screens.screen === 'paused', app.screens.screen)
+  app.screens.togglePause()
+  check(
+    'a second press gets the player back out again',
+    app.screens.screen === 'flight',
+    `stuck on ${app.screens.screen} — the panel is up and nothing will take it down`,
+  )
+  check(
+    'and the round trip did exactly what it should, in order',
+    app.log.join(',') === 'pause->true,showPanel,hidePanel,resume,grabPointer',
+    app.log.join(','),
+  )
+
+  // Ten presses, because a toggle that only works once is still a trap.
+  const many = rig('flight', () => true)
+  const seen: string[] = []
+  for (let i = 0; i < 10; i++) {
+    many.screens.togglePause()
+    seen.push(many.screens.screen)
+  }
+  check(
+    'Escape keeps working, press after press',
+    seen.join(',') === 'paused,flight,paused,flight,paused,flight,paused,flight,paused,flight',
+    seen.join(','),
+  )
+
+  /* ---- The transitions the app owns, and the one it may not ------------- */
+
+  /*
+   * The fourth regression was `createPauseFlow({ ...state }, host)` — a copy, so the app
+   * launched while the flow still saw `hangar` and Escape did nothing. There is no holder
+   * to copy now, and this is the property that broke: what the app moves to is what the
+   * pause transitions see.
+   */
+  const moving = rig('hangar', () => true)
+  check('it starts where it was told to', moving.screens.screen === 'hangar', moving.screens.screen)
+  moving.screens.moveTo('flight')
+  check('the app can launch', moving.screens.screen === 'flight', moving.screens.screen)
+  moving.screens.togglePause()
+  check(
+    'and pausing sees the screen the app moved to',
+    moving.screens.screen === 'paused',
+    `${moving.screens.screen} — the transitions and the reads disagree`,
+  )
+  moving.screens.togglePause()
+  moving.screens.moveTo('debrief')
+  check('and the app can reach the debrief', moving.screens.screen === 'debrief', moving.screens.screen)
+  moving.screens.moveTo('hangar')
+  check('and the hangar', moving.screens.screen === 'hangar', moving.screens.screen)
+
+  /* All four documented screens are reachable. What the *dev hook* reports for them is
+     `testTheDevHookReadsTheRunningGame`, which reads them through an installed
+     `window.__neon` — this rig would have been perfectly green while the hook returned
+     the browser's `Screen` object, which is exactly what happened. */
+  const reachable = new Set<Screen>()
+  const tour = rig('hangar', () => true)
+  reachable.add(tour.screens.screen)
+  tour.screens.moveTo('flight')
+  reachable.add(tour.screens.screen)
+  tour.screens.togglePause()
+  reachable.add(tour.screens.screen)
+  tour.screens.togglePause()
+  tour.screens.moveTo('debrief')
+  reachable.add(tour.screens.screen)
+  check(
+    'all four documented screens are reachable',
+    reachable.size === 4 &&
+      ['hangar', 'flight', 'paused', 'debrief'].every((s) => reachable.has(s as Screen)),
+    [...reachable].join(','),
+  )
+
+  /* Only `enterPause` may reach the overlay. That is what makes the trap those four
+     rounds kept producing unrepresentable from outside rather than merely absent. */
+  const forbidden = rig('flight', () => true)
+  let refused = false
+  try {
+    ;(forbidden.screens.moveTo as (s: Screen) => void)('paused')
+  } catch (e) {
+    refused = e instanceof RangeError
+  }
+  check('the app cannot move itself onto the pause screen', refused)
+  check('and the attempt left it where it was', forbidden.screens.screen === 'flight',
+    forbidden.screens.screen)
+
+  /* ---- Against a real Game, in the state the shipped UI cannot build ------ */
+
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  const field = disarmedArena()
+  const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+  game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: 1 })
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+  for (let i = 0; i < 90; i++) game.step(hands)
+  field.arm()
+  for (let i = 0; i < 5; i++) game.step(hands)
+
+  const live = rig('flight', () => game.pause(), () => game.resume())
+
+  check(
+    'the state is a remote wreck with the drawn seat flying',
+    game.snapshot(0)?.phase === 'wrecked' && game.snapshot(1)?.phase === 'flying',
+    `remote ${game.snapshot(0)?.phase}, drawn ${game.snapshot(1)?.phase}`,
+  )
+  live.screens.togglePause()
+  check('the real game refuses, and the screen stays in flight', live.screens.screen === 'flight',
+    live.screens.screen)
+  check('no panel went up over it', !live.log.includes('showPanel'), live.log.join(','))
+  check('and the simulation was not frozen', !game.paused)
+
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+  for (let i = 0; i < sequence + 30; i++) {
+    if (!game.snapshot(1)) break
+    game.step(hands)
+  }
+  /* Unconditional, so the count does not move with behaviour — the mutation harness
+     needs it constant. `survived` carries the premise instead of a branch. */
+  const survived = game.snapshot(1) !== null
+  check('the match survived to be paused', survived, 'it resolved first')
+  if (survived) live.screens.togglePause()
+  check('once every explosion has finished the same press pauses',
+    survived && live.screens.screen === 'paused' && game.paused,
+    survived ? `screen ${live.screens.screen}, paused=${game.paused}` : 'the match resolved first')
+  if (survived) live.screens.togglePause()
+  check('and the next one resumes the real game',
+    survived && live.screens.screen === 'flight' && !game.paused,
+    survived ? `screen ${live.screens.screen}, paused=${game.paused}` : 'the match resolved first')
+
+  game.dispose()
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * `window.__neon`, read through an installed hook rather than described.
+ *
+ * The hook regressed once already: moving the screen state out of `main.ts` left it
+ * reading a bare `screen`, which compiles against the DOM global, so it reported the
+ * browser's `Screen` object instead of any documented value. The repair was one line —
+ * and the check written to protect it toured a local `createScreens` rig and never
+ * touched `window.__neon` at all. Restoring the exact stale read left TypeScript, 396
+ * simulation checks, 41 balance checks, 42 mutations and the build entirely green.
+ *
+ * That is the same mistake as the pause rounds, in the smallest possible form: a check
+ * that certifies the *source* and claims the *reader*. So this installs the hook on a
+ * stand-in global and reads it back — the property descriptor, the getters, and the
+ * objects behind them.
+ *
+ * The two properties that matter are liveness and provenance. A hook snapshotted at
+ * construction reports boot-time values forever, which for a debugging surface is worse
+ * than not existing; and a hook reading the wrong source is what happened.
+ */
+function testTheDevHookReadsTheRunningGame(): void {
+  section('The dev hook reads the running game')
+
+  const screens = createScreens({
+    pause: () => true,
+    resume: () => {},
+    showPanel: () => {},
+    hidePanel: () => {},
+    grabPointer: () => {},
+  })
+  const device = stubInput()
+  const game = newMatch()
+  const launched: ShipId[] = []
+
+  const host: { __neon?: DevHook } = {}
+  installDevHook(host, createDevHook({
+    screens,
+    game,
+    input: device,
+    start: (ship) => launched.push(ship),
+  }))
+
+  /* No early return: a missing hook must fail the eight checks below by name rather than
+     silently removing them from the run. The harness requires a constant assertion count,
+     and "the hook was never installed" is exactly the case where the rest matter most. */
+  const hook = host.__neon ?? createDevHook({
+    screens,
+    game,
+    input: device,
+    start: () => {},
+  })
+  check('the hook is installed under its documented name', host.__neon !== undefined)
+
+  /* ---- The screen, across every documented value -------------------------- */
+
+  const reported: string[] = []
+  reported.push(hook.screen)
+  screens.moveTo('flight')
+  reported.push(hook.screen)
+  screens.togglePause()
+  reported.push(hook.screen)
+  screens.togglePause()
+  screens.moveTo('debrief')
+  reported.push(hook.screen)
+
+  check(
+    'it reports all four documented screens, by name, as the app moves',
+    reported.join(',') === 'hangar,flight,paused,debrief',
+    reported.join(','),
+  )
+  /* The stale read this replaces returned a browser `Screen` *object*, which is not a
+     string at all — so the shape is asserted rather than only the values. */
+  check(
+    'and reports them as strings rather than whatever else is in scope',
+    reported.every((r) => typeof r === 'string'),
+    reported.map((r) => typeof r).join(','),
+  )
+
+  /* ---- Liveness: every field tracks the thing behind it ------------------- */
+
+  screens.moveTo('flight')
+  game.start({ ships: ['hornet'], seed: 0x0eb0 })
+  const atStart = hook.run
+  check('the run view arrives with the match', atStart !== null && atStart.hull > 0,
+    `${atStart === null ? 'null' : atStart.hull}`)
+
+  const intents: Controls[] = [controls({ throttle: 0.8 })]
+  for (let i = 0; i < 60; i++) game.step(intents)
+  const later = hook.run
+  check(
+    'and keeps up with it rather than reporting the moment it was built',
+    later !== null && atStart !== null && later.elapsed > atStart.elapsed,
+    `${atStart?.elapsed} -> ${later?.elapsed}`,
+  )
+
+  device.write.pitch = 0.5
+  device.write.fire = true
+  check(
+    'the input view is live too',
+    hook.input.pitch === 0.5 && hook.input.fire === true,
+    `pitch=${hook.input.pitch} fire=${hook.input.fire}`,
+  )
+  /* Read-only in the sense that matters: writing to what the console is shown must not
+     reach the device, or `__neon` becomes a cheat rather than a window. */
+  hook.input.pitch = -1
+  check('and writing to it does not reach the device', device.state.pitch === 0.5,
+    `device pitch=${device.state.pitch}`)
+
+  hook.start('wasp')
+  check('the launch command reaches the app', launched.join(',') === 'wasp', launched.join(','))
+
+  /* ---- Reinstallable, which is what `configurable` is for ---------------- */
+
+  let reinstalled = true
+  try {
+    installDevHook(host, createDevHook({
+      screens,
+      game,
+      input: device,
+      start: (ship) => launched.push(ship),
+    }))
+  } catch {
+    reinstalled = false
+  }
+  check('the hook can be replaced, as a hot reload does', reinstalled,
+    'the second install threw — a reloaded session would keep the dead one')
+
+  game.dispose()
+}
+
+/**
+ * The shipped frame loop keeps calling into a match that has ended.
+ *
+ * `src/main.ts` only skips the simulation on the hangar screen: on **paused** and on
+ * **debrief** it still runs `game.step(intents)` and `game.render(...)` every frame,
+ * with the same one-slot array it has always used. But a finished run has already been
+ * through `clearArena`, so the roster is empty and the intent array no longer matches
+ * it — and the milestone that introduced "exactly one intent per seat" introduced a
+ * throw on that mismatch.
+ *
+ * Nothing else in this file exercises that path, because nothing else in this file is
+ * the browser's loop: every other check drives `step` while a match is live and stops
+ * when it ends. Had the length check been unconditional, the game would have thrown on
+ * the first frame of every debrief — a crash on the most-travelled screen in the game,
+ * invisible to a fully green suite. This is the assertion standing in for the browser
+ * pass that a headless run cannot make.
+ */
+function testTheLoopSurvivesTheEndOfARun(): void {
+  section('The frame loop survives the end of a run')
+
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  const field = disarmedArena()
+  let ended: RunResult | null = null
+  const game = newMatch({
+    environment: { ...stubEnvironment(), minefield: field },
+    onEnd: (r) => {
+      ended = r
+    },
+  })
+  game.start({ ships: ['wasp'] })
+
+  // Exactly what `main.ts` holds: one reused slot, filled from a device each tick.
+  const device = stubInput()
+  const pilot = createPilot()
+  const intents: Controls[] = [pilot.advance(device.state, STEP)]
+
+  function frame(): void {
+    intents[0] = pilot.advance(device.state, STEP)
+    game.step(intents)
+    game.render(0.5, STEP)
+  }
+
+  for (let i = 0; i < 90; i++) frame()
+  field.arm()
+
+  let resolvedAt = -1
+  let ticks = 0
+  for (; ticks < Math.ceil(20 / STEP) && resolvedAt < 0; ticks++) {
+    frame()
+    if ((ended as RunResult | null) !== null) resolvedAt = ticks
+  }
+
+  check('the run resolved', resolvedAt >= 0, `no result in ${ticks} ticks`)
+  check('and the roster is empty afterwards', game.seatCount === 0 && game.snapshot() === null,
+    `seatCount=${game.seatCount}`)
+
+  /*
+   * The debrief. `main.ts` keeps driving the loop here for as long as the player reads
+   * the screen — a couple of seconds at 60fps is a hundred-odd frames of stepping a
+   * match that no longer exists.
+   */
+  let threw = ''
+  try {
+    for (let i = 0; i < 180; i++) frame()
+  } catch (e) {
+    threw = `${(e as Error).constructor.name}: ${(e as Error).message}`
+  }
+  check('stepping and drawing a finished match is a no-op, not a throw', threw === '', threw)
+
+  // And the same on the pause screen, which `main.ts` also keeps stepping.
+  let pausedThrew = ''
+  try {
+    game.start({ ships: ['wasp'] })
+    for (let i = 0; i < 30; i++) frame()
+    game.pause()
+    for (let i = 0; i < 120; i++) frame()
+    game.resume()
+    for (let i = 0; i < 30; i++) frame()
+  } catch (e) {
+    pausedThrew = `${(e as Error).constructor.name}: ${(e as Error).message}`
+  }
+  check('and so is stepping a paused match', pausedThrew === '', pausedThrew)
+  check('the match is still live after resuming', game.snapshot() !== null && game.active)
+
+  /* The positive, so "no throw" cannot be satisfied by a `step` that refuses nothing.
+     A live match with the wrong number of intents must still be refused. */
+  let refusedWhenLive = false
+  try {
+    game.step([])
+  } catch (e) {
+    refusedWhenLive = e instanceof RangeError
+  }
+  check('a live match still refuses the wrong number of intents', refusedWhenLive)
+
+  game.dispose()
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * A drawn-seat index that is not a number falls back rather than throwing.
+ *
+ * `Math.min`/`Math.max` propagate `NaN`, so the obvious clamp produced `seats[NaN]`
+ * and a `TypeError` one line later — under a comment that said "clamped, not
+ * fatal". A comment certifying something untrue is worse than no comment, and this
+ * file has recorded that exact shape before. Deliberately not `Number.isFinite`:
+ * `Infinity` is a clampable request for "the last seat", the same reasoning as
+ * `clamp` in `ship.ts`.
+ */
+function testTheDrawnSeatIsClampedNotTrusted(): void {
+  section('The drawn seat is clamped, including when it is not a number')
+
+  function drawsSomething(label: string, local: number | undefined): void {
+    const game = newMatch()
+    let seat = -1
+    let threw = ''
+    try {
+      game.start({ ships: ['hornet', 'wasp'], seed: 7, local })
+      seat = game.snapshot()?.seat ?? -1
+    } catch (e) {
+      threw = (e as Error).constructor.name
+    }
+    game.dispose()
+    check(`local ${label} draws a real seat`, threw === '' && seat >= 0 && seat <= 1,
+      threw ? `threw ${threw}` : `drew seat ${seat}`)
+  }
+
+  drawsSomething('undefined', undefined)
+  drawsSomething('0', 0)
+  drawsSomething('1', 1)
+  drawsSomething('9 (past the end)', 9)
+  drawsSomething('-3', -3)
+  drawsSomething('1.7', 1.7)
+  drawsSomething('NaN', Number.NaN)
+  drawsSomething('Infinity', Number.POSITIVE_INFINITY)
+  drawsSomething('-Infinity', Number.NEGATIVE_INFINITY)
+
+  /* And the two ends land where they should rather than merely landing somewhere.
+     Wrapped, like the probes above: a regressed clamp throws, and an unwrapped call
+     here reported its own failure and then took the whole suite down — 289 of 341
+     ran, which is a mutant caught by an assertion and a harness that stopped
+     talking. */
+  function draws(label: string, local: number, expected: number): void {
+    const game = newMatch()
+    let seat = -1
+    try {
+      game.start({ ships: ['hornet', 'wasp'], seed: 7, local })
+      seat = game.snapshot()?.seat ?? -1
+    } catch {
+      seat = -1
+    }
+    game.dispose()
+    check(`${label} draws seat ${expected}`, seat === expected, `drew ${seat}`)
+  }
+
+  draws('a negative index', -3, 0)
+  draws('an index past the end', 9, 1)
+  draws('a non-number', Number.NaN, 0)
+  draws('a fractional index', 1.7, 1)
+}
+
+/**
+ * A minefield the test can arm when it is ready.
+ *
+ * `armedArena` above detonates on the first contact anywhere, which kills a hull
+ * the frame its warp-in immunity expires — before it has fired a shot or scored a
+ * point. That is exactly what the death-cutscene check wants and exactly wrong
+ * here: what respawn has to preserve is a scoreline, so there has to be one first.
+ */
+function disarmedArena(): Minefield & { arm(): void } {
+  const mine: Mine = { position: new THREE.Vector3(), live: false }
+  return {
+    group: new THREE.Group(),
+    mines: [mine],
+    avoidance: [],
+    findContact: () => (mine.live ? mine : null),
+    detonate: (m) => {
+      m.live = false
+    },
+    // `start` calls this, so arming has to happen after it.
+    reset: () => {
+      mine.live = false
+    },
+    arm: () => {
+      mine.live = true
+    },
+    update() {},
+    dispose() {},
+  } as Minefield & { arm(): void }
+}
+
+/**
+ * Death returns a seat to the arena, or ends the run, and which one is a policy.
+ *
+ * The plan has milestone 3 replacing run-end with respawn outright. It cannot:
+ * single-player is a match with one seat, and a shipped game where dying neither
+ * ends the run nor reaches the debrief has no lose condition at all. So respawn is
+ * a flag, off by default, and the two branches are asserted against each other
+ * here — from the same seed, the same intents and the same fatal mine, so the only
+ * difference between the two runs is the policy.
+ *
+ * That pairing is the point. Either half alone is much weaker: "the seat came
+ * back" passes for a game that never resolves anything, and "the run ended" passes
+ * for a game that ignores the flag.
+ */
+function testDeathEitherRespawnsOrResolves(): void {
+  section('A death respawns the seat, or resolves the run')
+
+  const SEED = 0xdefea7
+
+  /**
+   * Fly until the seat has something worth preserving, arm the mine, and keep
+   * flying. Returns what the seat looked like on the last tick before it died and
+   * on the last tick of the run.
+   */
+  function flyIntoAMine(respawn: boolean) {
+    const field = disarmedArena()
+    let result: RunResult | null = null
+    const game = newMatch({
+      environment: { ...stubEnvironment(), minefield: field },
+      onEnd: (r) => {
+        result = r
+      },
+    })
+    game.start({ ships: ['hornet'], seed: SEED, respawn })
+
+    const crew = seatPilots(1)
+    const intents: Controls[] = []
+    let armed = false
+    let atDeath: RunSnapshot | null = null
+    let atRespawn: RunSnapshot | null = null
+    let deathTick = -1
+    let respawnTick = -1
+    let resolvedTick = -1
+    let ticks = 0
+
+    /*
+     * Sampled on the transition rather than at the end of the run, which is the
+     * mistake this replaces: the first version read the hull after the budget ran
+     * out and found 75 of 120, because the seat had come back on a full hull and
+     * then spent forty seconds being shot at. The claim is about the moment the
+     * seat returns, so it has to be measured at that moment.
+     */
+    const budget = Math.ceil(30 / STEP)
+    for (; ticks < budget; ticks++) {
+      const before = game.snapshot(0)
+      // Arm it once there is a scoreline to preserve, so "the score survived" is a
+      // claim about a number that was not zero.
+      if (!armed && before && before.shotsFired > 0 && before.score > 0) {
+        field.arm()
+        armed = true
+        atDeath = before
+      }
+      const wreckedBefore = before?.phase === 'wrecked'
+      flyAll(game, crew, intents)
+      /*
+       * Recorded here rather than at the top of the next pass, which is the bug
+       * this replaces. `finish` calls `clearArena`, so the tick that resolves the
+       * run is also the tick `snapshot` starts returning null — and the null check
+       * below fired first, leaving `resolvedTick` at -1 and the assertion reading
+       * "result at -1" against a run that had resolved perfectly well.
+       */
+      if (result && resolvedTick < 0) resolvedTick = ticks
+      const now = game.snapshot(0)
+      if (!now) break
+      if (deathTick < 0 && now.phase === 'wrecked' && !wreckedBefore) deathTick = ticks
+      if (respawnTick < 0 && deathTick >= 0 && wreckedBefore && now.phase !== 'wrecked') {
+        respawnTick = ticks
+        atRespawn = now
+      }
+    }
+
+    game.dispose()
+    return {
+      atDeath,
+      atRespawn,
+      deathTick,
+      respawnTick,
+      resolvedTick,
+      result: result as RunResult | null,
+      ticks,
+    }
+  }
+
+  /* ---- Respawn on: the seat comes back and the match carries on ----------- */
+
+  const back = flyIntoAMine(true)
+  check('the seat had a scoreline before it died', (back.atDeath?.score ?? 0) > 0,
+    `score ${back.atDeath?.score}, shots ${back.atDeath?.shotsFired}`)
+  check('the mine killed it', back.deathTick > 0, `never wrecked in ${back.ticks} ticks`)
+  check('a respawning match does not report a result', back.result === null,
+    `reported won=${back.result?.won}`)
+  check('the seat came back', back.respawnTick > 0 && back.atRespawn !== null,
+    `never returned in ${back.ticks} ticks`)
+  check('it came back on a full hull', back.atRespawn?.hull === SHIPS.hornet.maxHull,
+    `hull ${back.atRespawn?.hull}/${SHIPS.hornet.maxHull}`)
+  check('and came back flying rather than wrecked', back.atRespawn?.phase === 'flying')
+  check('the death was counted', back.atRespawn?.deaths === 1, `deaths ${back.atRespawn?.deaths}`)
+  /* The two halves of the accuracy stat, which is the substantive thing a respawn
+     must not reset. `Ship.spawn` deliberately leaves `shotsFired` and the score
+     alone — "resets flight state but not the score" — and this is that comment
+     asserted rather than trusted. A respawn that built a fresh hull instead would
+     zero both and still pass every check above. */
+  check(
+    'the score survived the death',
+    (back.atRespawn?.score ?? 0) >= (back.atDeath?.score ?? 0) && (back.atRespawn?.score ?? 0) > 0,
+    `${back.atDeath?.score} → ${back.atRespawn?.score}`,
+  )
+  check(
+    'and so did the shots it had fired',
+    (back.atRespawn?.shotsFired ?? 0) >= (back.atDeath?.shotsFired ?? 0) &&
+      (back.atRespawn?.shotsFired ?? 0) > 0,
+    `${back.atDeath?.shotsFired} → ${back.atRespawn?.shotsFired}`,
+  )
+  /* The wreck holds the screen for its whole sequence before the seat returns —
+     the same guarantee the debrief gets, and the reason respawn could be made a
+     policy rather than a second code path. A respawn that fired on the frame of
+     death would satisfy every other check here. */
+  const held = back.respawnTick - back.deathTick
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+  check(
+    'the wreck held the screen for the whole cutscene first',
+    back.deathTick > 0 && held >= sequence && held <= sequence + 2,
+    `held ${held} ticks, expected ${sequence}`,
+  )
+
+  /* ---- Respawn off: the same death ends the run --------------------------- */
+
+  const over = flyIntoAMine(false)
+  check('without respawn the same death resolves the run', over.result !== null,
+    `no result in ${over.ticks} ticks`)
+  check('and resolves it as a loss', over.result?.won === false, `won=${over.result?.won}`)
+  check(
+    'the debrief still waits for the whole cutscene',
+    over.deathTick > 0 && over.resolvedTick - over.deathTick >= Math.floor(DEATH_SEQUENCE / STEP),
+    `death at ${over.deathTick}, result at ${over.resolvedTick}`,
+  )
+  /* The discriminator. Everything above passes for a game that ignores the flag in
+     one direction or the other; only comparing the two says the flag is what
+     decided. */
+  check(
+    'the flag is what decided, and nothing else',
+    back.result === null && over.result !== null,
+    `respawn gave ${back.result === null ? 'no result' : 'a result'}, elimination gave ${over.result === null ? 'no result' : 'a result'}`,
+  )
+}
+
+/**
+ * Elimination ends the run when the arena empties, not when the watcher dies.
+ *
+ * The reading that suggests itself first is "the run is over when the seat being
+ * drawn is out", and with one seat it is the same sentence — which is why the
+ * difference is invisible in every other check here. With two it makes the moment
+ * a match resolves depend on which machine is watching, so two clients would
+ * disagree about when their own match ended.
+ *
+ * The drawn seat still decides what the *report* says, because `RunResult` is one
+ * participant's run. When it ends is the match's business. Both halves are asserted
+ * from the same match, so a game that resolved too early fails the first and one
+ * that never resolves fails the second.
+ *
+ * What this deliberately does not claim is that watching a teammate fly on after
+ * your own hull is gone is *good*. It is the honest generalisation of the rule
+ * that exists, and what a match should actually do with an eliminated participant
+ * is milestone 8's.
+ */
+function testEliminationEndsWhenTheArenaEmpties(): void {
+  section('Elimination ends the run when the arena empties')
+
+  // A mine is 45 damage flat, so the hull has to be under that for one to be
+  // fatal — the same lever `testDeathPlaysBeforeTheDebrief` pulls, and for the
+  // same reason: this is about what a death *resolves*, not about how much a mine
+  // hurts.
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+
+  const field = disarmedArena()
+  let ended: RunResult | null = null
+  const game = newMatch({
+    environment: { ...stubEnvironment(), minefield: field },
+    onEnd: (r) => {
+      ended = r
+    },
+  })
+  // Drawn seat 0, and seat 0 is the one that dies first — `resolveMines` walks the
+  // seats in roster order, so the single armed mine finds it before seat 1. The
+  // mine is spent on contact, so seat 1 is not touched in the same tick.
+  game.start({ ships: ['wasp', 'wasp'], seed: 0x0e11a, local: 0 })
+
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.3 })]
+  const sequence = Math.round(DEATH_SEQUENCE / STEP)
+
+  // Let both seats clear their warp-in immunity, then arm the mine for seat 0.
+  for (let i = 0; i < 90; i++) game.step(hands)
+  field.arm()
+
+  let firstDown = -1
+  for (let i = 0; i < sequence + 120 && firstDown < 0; i++) {
+    game.step(hands)
+    if (game.snapshot(0)?.phase !== 'flying' || (game.snapshot(0)?.hull ?? 1) <= 0) firstDown = i
+  }
+  check('the drawn seat was killed', firstDown >= 0, 'the mine never went off')
+
+  // Long enough for its whole cutscene plus room to spare.
+  for (let i = 0; i < sequence + 60; i++) {
+    if (!game.snapshot(1)) break
+    game.step(hands)
+  }
+  const midway = ended as RunResult | null
+  const survivor = game.snapshot(1)
+  check(
+    'the drawn seat being out does not end the run while another seat flies',
+    midway === null,
+    `reported won=${midway?.won} with seat 1 still airborne`,
+  )
+  check(
+    'the surviving seat is still flying',
+    (survivor?.hull ?? 0) > 0 && survivor?.phase === 'flying',
+    `hull ${survivor?.hull}, phase ${survivor?.phase}`,
+  )
+
+  // Now take the last seat as well.
+  field.arm()
+  for (let i = 0; i < sequence + 300 && ended === null; i++) {
+    if (!game.snapshot(1)) break
+    game.step(hands)
+  }
+  const final = ended as RunResult | null
+  check('and the last seat down does end it', final !== null, 'the arena emptied and nothing resolved')
+  check('reported as a loss', final?.won === false, `won=${final?.won}`)
+
+  game.dispose()
+  SHIPS.wasp.maxHull = originalHull
+  check('the hull spec was restored', SHIPS.wasp.maxHull === originalHull)
 }
 
 function testARunReplaysFromRecordedControls(): void {
@@ -2071,8 +4637,8 @@ function testARunReplaysFromRecordedControls(): void {
       run.score,
       run.kills,
       run.shotsFired,
-      run.playerHull,
-      run.playerSpeed,
+      run.hull,
+      run.speed,
       run.enemiesAirborne,
       t ? `${t.yaw},${t.pitch},${t.range}` : 'nolock',
     ].join(' ')
@@ -2108,7 +4674,7 @@ function testARunReplaysFromRecordedControls(): void {
   const pilot = createPilot()
   const recorded: Controls[] = []
   const recording = newGame(input)
-  recording.start('hornet', SEED)
+  recording.start({ ships: ['hornet'], seed: SEED })
 
   for (let i = 0; i < TICKS; i++) {
     const target = recording.snapshot()?.target ?? null
@@ -2129,7 +4695,7 @@ function testARunReplaysFromRecordedControls(): void {
     // Copied, not referenced: `Pilot` reuses one struct across ticks, so
     // storing it directly would record the same object sixty times a second.
     recorded.push({ ...c })
-    recording.step(c)
+    recording.step([c])
   }
 
   const live = fingerprint(recording.snapshot())
@@ -2138,8 +4704,8 @@ function testARunReplaysFromRecordedControls(): void {
 
   // A dead device: nothing ever writes to it.
   const replay = newGame(stubInput())
-  replay.start('hornet', SEED)
-  for (const c of recorded) replay.step(c)
+  replay.start({ ships: ['hornet'], seed: SEED })
+  for (const c of recorded) replay.step([c])
 
   const replayed = fingerprint(replay.snapshot())
 
@@ -2150,9 +4716,9 @@ function testARunReplaysFromRecordedControls(): void {
   /* A different stream against the same seed must diverge, or the comparison
      above would hold for a simulation that ignored its controls entirely. */
   const idle = newGame(stubInput())
-  idle.start('hornet', SEED)
+  idle.start({ ships: ['hornet'], seed: SEED })
   const neutral: Controls = { ...recorded[0], pitch: 0, yaw: 0, roll: 0, fire: false, dash: false }
-  for (let i = 0; i < TICKS; i++) idle.step(neutral)
+  for (let i = 0; i < TICKS; i++) idle.step([neutral])
   check(
     'a different control stream is a different run',
     fingerprint(idle.snapshot()) !== live,
@@ -2236,7 +4802,7 @@ function testARunMatchesItsRecordedBaseline(): void {
       bestScoreFor: () => 0,
       onEnd: () => {},
     })
-    game.start(ship, 0xfac7107)
+    game.start({ ships: [ship], seed: 0xfac7107 })
 
     const marks: string[] = []
     const ticks = Math.ceil(20 / STEP)
@@ -2255,11 +4821,11 @@ function testARunMatchesItsRecordedBaseline(): void {
         input.write.throttleUp = true
         input.write.throttleDown = false
       }
-      game.step(pilot.advance(input.state, STEP))
+      game.step([pilot.advance(input.state, STEP)])
       if (i % 300 === 0) {
         const r = game.snapshot()!
         marks.push(
-          [r.score, r.kills, r.shotsFired, r.playerHull, r.playerSpeed, r.enemiesAirborne].join('/'),
+          [r.score, r.kills, r.shotsFired, r.hull, r.speed, r.enemiesAirborne].join('/'),
         )
       }
     }
@@ -2573,12 +5139,12 @@ function testOneFrameDepictsOneInstant(): void {
     onEnd: () => {},
   })
 
-  game.start('hornet', 0x0a11ce)
+  game.start({ ships: ['hornet'], seed: 0x0a11ce })
   input.write.throttleUp = true
   input.write.pitch = 0.5
   input.write.yaw = -0.3
   input.write.fire = true
-  for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step(pilot.advance(input.state, STEP))
+  for (let i = 0; i < Math.ceil(8 / STEP); i++) game.step([pilot.advance(input.state, STEP)])
 
   const flight = midpointCheck(
     scene,
@@ -2645,38 +5211,62 @@ function testOneFrameDepictsOneInstant(): void {
     onEnd: () => {},
   })
 
-  dyingGame.start('hornet', 0xdead01)
+  dyingGame.start({ ships: ['hornet'], seed: 0xdead01 })
   dyingInput.write.throttleUp = true
   let reachedDying = false
   for (let i = 0; i < Math.ceil(30 / STEP) && !reachedDying; i++) {
-    dyingGame.step(dyingPilot.advance(dyingInput.state, STEP))
+    dyingGame.step([dyingPilot.advance(dyingInput.state, STEP)])
     reachedDying = dyingGame.dying
   }
 
   check('the run reached the death cutscene', reachedDying)
+
+  /*
+   * The five checks below run whether or not the cutscene was reached, and that is a
+   * change from `if (reachedDying) { ... }`.
+   *
+   * Skipping them was defensible — their meaning depends on a wreck existing — but it
+   * made the suite's *assertion count* a function of behaviour, and the mutation harness
+   * needs that count to be a constant: a mutant that runs 400 of 405 checks has hidden
+   * five, and it reported itself cleanly caught. Exactly that happened with the "respawn
+   * fires on the frame of death" mutant, which leaves no cutscene to inspect.
+   *
+   * Made unconditional rather than allowlisted, because there is a version that is both
+   * complete and non-vacuous: every measurement is `null` when there was no cutscene, and
+   * every check reads "no cutscene was reached" and fails. Six named failures instead of
+   * one, and 405 either way.
+   */
+  let cutscene: ReturnType<typeof midpointCheck> | null = null
+  let wreckCam: ReturnType<typeof cameraTracksAlpha> | null = null
   if (reachedDying) {
     // One more tick so the wreck has drift to interpolate across, and so this
     // lands inside `WRECK_TUMBLE` while the hull is still on screen and the
     // camera is still locked to it.
-    dyingGame.step(dyingPilot.advance(dyingInput.state, STEP))
-    const cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
+    dyingGame.step([dyingPilot.advance(dyingInput.state, STEP)])
+    cutscene = midpointCheck(dyingScene, (alpha) => dyingGame.render(alpha, 0))
+    wreckCam = cameraTracksAlpha(dyingCamera, (alpha, dt) => dyingGame.render(alpha, dt))
+  }
+
+  const noCutscene = 'no cutscene was reached'
+  {
     /* As above, this is the detector rather than a sanity check: a wreck pinned
        to the raw tick pose never moves between 0 and 1, so the midpoint below
        would pass on an empty comparison. This is what actually fails. */
-    check('the wreck is moving to compare', cutscene.moved >= 1, `${cutscene.moved} moved`)
-    check('the wreck is drawn at one instant', cutscene.disagreed === '', cutscene.disagreed)
+    check('the wreck is moving to compare', (cutscene?.moved ?? 0) >= 1,
+      cutscene ? `${cutscene.moved} moved` : noCutscene)
+    check('the wreck is drawn at one instant', cutscene !== null && cutscene.disagreed === '',
+      cutscene ? cutscene.disagreed : noCutscene)
 
     // And the other half of the pairing the wreck check is named for.
-    const wreckCam = cameraTracksAlpha(dyingCamera, (alpha, dt) => dyingGame.render(alpha, dt))
     check(
       'the camera following the wreck tracks alpha too',
-      wreckCam.travel > 1e-6,
-      `travelled ${wreckCam.travel}`,
+      (wreckCam?.travel ?? 0) > 1e-6,
+      wreckCam ? `travelled ${wreckCam.travel}` : noCutscene,
     )
     check(
       'the camera following the wreck sits on the interpolation',
-      wreckCam.deviation < wreckCam.travel * CAMERA_CURVATURE,
-      `off by ${wreckCam.deviation} over ${wreckCam.travel}`,
+      wreckCam !== null && wreckCam.deviation < wreckCam.travel * CAMERA_CURVATURE,
+      wreckCam ? `off by ${wreckCam.deviation} over ${wreckCam.travel}` : noCutscene,
     )
     /* Deliberately no rotation check on the cutscene camera, and the reason is
        worth writing down rather than leaving as a gap.
@@ -2692,8 +5282,10 @@ function testOneFrameDepictsOneInstant(): void {
        where it actually varies. */
     check(
       'the cutscene camera does not rotate with the tumbling wreck',
-      wreckCam.sweep < 1e-9,
-      `swept ${wreckCam.sweep} rad — the camera is following the mesh, not the hull`,
+      wreckCam !== null && wreckCam.sweep < 1e-9,
+      wreckCam
+        ? `swept ${wreckCam.sweep} rad — the camera is following the mesh, not the hull`
+        : noCutscene,
     )
   }
 
@@ -2721,6 +5313,28 @@ testASeededRunReproduces()
 testARunReplaysFromRecordedControls()
 testTheAirframeCannotBeAskedToExceedItself()
 testStepDoesNotRetainCallerControls()
+testAFactionResolvesToASeatOrToNobody()
+testTwoSeatsFlyOneArena()
+testStepNeedsOneIntentPerSeat()
+testPresentationCannotChangeTheMatch()
+testDeathEitherRespawnsOrResolves()
+testEliminationEndsWhenTheArenaEmpties()
+testAnEliminatedSeatStaysEliminated()
+testStaggeredWrecksEachGetTheirWholeCutscene()
+testAWinWaitsForEveryExplosion()
+testAnEliminatedSeatDoesNotInheritTheWin()
+testASeatRespawnsWhileTheOthersKeepFlying()
+testARespawnPointReplaysFromItsSeed()
+testPauseIsMirroredAcrossSeats()
+testTheSquadronIsNotAFunctionOfTheWatcher()
+testTheDrawnSeatIsClampedNotTrusted()
+testARefusedCallChangesNothing()
+testTheScreenMachineCanBeLeftAgain()
+testTheDevHookReadsTheRunningGame()
+testTheLoopSurvivesTheEndOfARun()
+testScoringIsPerSeat()
+testTwoScorersKeepSeparateStreaks()
+testShootingAParticipantScoresNothingYet()
 testTheStepClockNeverLosesTime()
 testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()
