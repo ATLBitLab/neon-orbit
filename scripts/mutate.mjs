@@ -33,23 +33,23 @@ const MUTATIONS = [
   {
     name: 'every seat flies intents[0]',
     file: 'src/game/game.ts',
-    from: '      recordControls(seat, intents[i])\n      seat.ship.step(intents[i], STEP, ctx)',
-    to: '      recordControls(seat, intents[0])\n      seat.ship.step(intents[0], STEP, ctx)',
+    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    to: '      recordControls(seat, intents[0])\n      seat.ship.step(seat.lastControls, STEP, ctx)',
   },
   {
     name: "every seat flies the drawn seat's intent",
     file: 'src/game/game.ts',
-    from: '      recordControls(seat, intents[i])\n      seat.ship.step(intents[i], STEP, ctx)',
-    to: '      recordControls(seat, intents[localIndex])\n      seat.ship.step(intents[localIndex], STEP, ctx)',
+    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    to: '      recordControls(seat, intents[localIndex])\n      seat.ship.step(seat.lastControls, STEP, ctx)',
   },
   {
     name: 'seat i flies intents[i+1], wrapped',
     file: 'src/game/game.ts',
-    from: '      recordControls(seat, intents[i])\n      seat.ship.step(intents[i], STEP, ctx)',
+    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      seat.ship.step(seat.lastControls, STEP, ctx)',
     to:
       '      const j = (i + 1) % seats.length\n' +
       '      recordControls(seat, intents[j])\n' +
-      '      seat.ship.step(intents[j], STEP, ctx)',
+      '      seat.ship.step(seat.lastControls, STEP, ctx)',
   },
   {
     name: 'step accepts any number of intents',
@@ -67,6 +67,80 @@ const MUTATIONS = [
       'const oneRecord = freshControls()\n' +
       'export function recordControls(seat: Participant, c: Controls): void {\n' +
       '  const held = oneRecord\n  void seat',
+  },
+
+  /* ---- Intent admission: the anti-cheat surface --------------------------- */
+  {
+    name: "a seat flies the caller's struct instead of the admitted record",
+    file: 'src/game/game.ts',
+    from: '      seat.ship.step(seat.lastControls, STEP, ctx)',
+    to: '      seat.ship.step(intents[i], STEP, ctx)',
+  },
+  {
+    name: 'a seat keeps its aim override',
+    file: 'src/game/roster.ts',
+    from: '  held.aim = null\n  held.spread = 0',
+    to: '  held.aim = c.aim\n  held.spread = 0',
+  },
+  {
+    name: 'a seat keeps its spread',
+    file: 'src/game/roster.ts',
+    from: '  held.aim = null\n  held.spread = 0',
+    to: '  held.aim = null\n  held.spread = c.spread',
+  },
+  {
+    name: 'the throttle ramp is skipped for a snapped request',
+    file: 'src/game/intent.ts',
+    from: '  return target > up ? up : target < down ? down : target',
+    to: '  return target',
+  },
+  {
+    name: 'the throttle ramp is symmetric',
+    file: 'src/game/intent.ts',
+    from: '  const down = held - THROTTLE_DOWN_RATE * dt',
+    to: '  const down = held - THROTTLE_UP_RATE * dt',
+  },
+  {
+    name: 'a NaN throttle stalls instead of holding',
+    file: 'src/game/intent.ts',
+    from: "  if (typeof wanted !== 'number' || Number.isNaN(wanted)) return held",
+    to: "  if (typeof wanted !== 'number' || Number.isNaN(wanted)) return 0",
+  },
+  {
+    name: 'bound rejects infinity along with NaN',
+    file: 'src/game/intent.ts',
+    from: "  if (typeof v !== 'number' || Number.isNaN(v)) return 0",
+    to: "  if (typeof v !== 'number' || !Number.isFinite(v)) return 0",
+  },
+  {
+    name: 'bound passes NaN through',
+    file: 'src/game/intent.ts',
+    from: "  if (typeof v !== 'number' || Number.isNaN(v)) return 0",
+    to: "  if (typeof v !== 'number') return 0",
+  },
+  {
+    name: 'a truthy fire is a trigger pull',
+    file: 'src/game/intent.ts',
+    from: '  out.fire = claim.fire === true',
+    to: '  out.fire = Boolean(claim.fire)',
+  },
+  {
+    name: 'a late packet keeps firing',
+    file: 'src/game/intent.ts',
+    from: '    out.fire = false\n    out.dash = false\n    out.aim = null',
+    to: '    out.fire = held.fire\n    out.dash = held.dash\n    out.aim = null',
+  },
+  {
+    name: 'a late packet stalls the throttle',
+    file: 'src/game/intent.ts',
+    from: '    out.throttle = held.throttle\n    out.fire = false',
+    to: '    out.throttle = 0\n    out.fire = false',
+  },
+  {
+    name: 'an admitted intent keeps the aim override',
+    file: 'src/game/intent.ts',
+    from: '  out.dash = claim.dash === true\n  out.aim = null',
+    to: '  out.dash = claim.dash === true\n  out.aim = claim.aim as THREE.Vector3 | null',
   },
 
   /* ---- Scoring attribution ----------------------------------------------- */
@@ -409,7 +483,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 414
+const EXPECTED_ASSERTIONS = 454
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 
@@ -792,7 +866,10 @@ const DROP_A_TEST = [SELF_TEST_FILE, SELF_TEST_ANCHOR, '\n']
    * was not the same as handling "never exited": every non-zero status was treated alike,
    * so a run killed by a signal after printing a complete failure summary read as `CAUGHT`.
    */
-  const LOUD = { ok: 408, fail: 6, last: '6 check(s) failed.' }
+  // Derived from the constant rather than written beside it: the first version
+  // said `ok: 408`, which was 414 - 6 spelled out, and it went stale the first
+  // time the suite grew.
+  const LOUD = { ok: EXPECTED_ASSERTIONS - 6, fail: 6, last: '6 check(s) failed.' }
   const statuses = [
     ['killed mid-run, complete output', { ...LOUD, code: null, signal: 'SIGKILL' }, 'KILLED'],
     ['killed with nothing to show', { ok: 30, fail: 0, last: 'Node.js v22', code: null }, 'KILLED'],

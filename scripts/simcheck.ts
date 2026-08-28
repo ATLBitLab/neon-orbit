@@ -18,6 +18,7 @@ import type { RunResult } from '../src/core/scores'
 import { createBolts, FACTION_AI, FACTION_PLAYER, humanFaction } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
 import { createPilot, type Pilot } from '../src/game/controls'
+import { admitIntent, bound, rampThrottle, THROTTLE_DOWN_RATE, THROTTLE_UP_RATE } from '../src/game/intent'
 import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
@@ -2548,6 +2549,220 @@ function testPresentationCannotChangeTheMatch(): void {
   clamped.start({ ships: ['hornet', 'wasp'], seed: SEED, local: 9 })
   check('an out-of-range drawn seat is clamped, not fatal', clamped.snapshot() !== null)
   clamped.dispose()
+}
+
+/**
+ * A stranger's packet is admitted, not trusted.
+ *
+ * Every field of `Controls` is checked for each of the three ways a claim can be
+ * wrong — out of range, too fast, not a number — and the checks are against exact
+ * values rather than "is in range", because the ramp has to agree with the
+ * keyboard *byte for byte* or the local pilot and the wire drift apart on what one
+ * tick of throttle means. The last block is that agreement, flown rather than
+ * asserted.
+ */
+function testIntentIsAdmittedNotTrusted(): void {
+  section('Intent is admitted, not trusted')
+
+  const held = controls({ throttle: 0.6, pitch: 0.4, yaw: -0.2, roll: 1 })
+  const out = controls()
+  const admit = (raw: unknown): Controls => admitIntent(raw, held, STEP, out)
+
+  /* Out of range is a cheat, and clamping it produces a legal ship. */
+  check('a deflection of 7 is admitted as 1', admit({ pitch: 7 }).pitch === 1)
+  check('a deflection of -Infinity is admitted as -1', admit({ yaw: -Infinity }).yaw === -1)
+  check('a deflection in range is admitted exactly', admit({ roll: 0.25 }).roll === 0.25)
+
+  /* Not a number is not a cheat, it is destruction, and it reads as neutral. */
+  check('NaN pitch is admitted as 0', admit({ pitch: NaN }).pitch === 0)
+  check('a string yaw is admitted as 0', admit({ yaw: 'left' }).yaw === 0)
+  check('a missing roll is admitted as 0', admit({}).roll === 0)
+  check('and none of those is NaN downstream', !Number.isNaN(admit({ pitch: NaN }).pitch))
+
+  /* Too fast is the throttle cheat, and one tick can only move one tick's worth. */
+  const up = 0.6 + THROTTLE_UP_RATE * STEP
+  const down = 0.6 - THROTTLE_DOWN_RATE * STEP
+  check('a throttle snapped to 1 only ramps one tick up', admit({ throttle: 1 }).throttle === up,
+    `got ${admit({ throttle: 1 }).throttle}, wanted ${up}`)
+  check('a throttle snapped to 0 only ramps one tick down', admit({ throttle: 0 }).throttle === down,
+    `got ${admit({ throttle: 0 }).throttle}, wanted ${down}`)
+  check('a throttle of 5 ramps toward 1, not toward 5', admit({ throttle: 5 }).throttle === up)
+  check('a throttle of -3 ramps toward 0, not toward -3', admit({ throttle: -3 }).throttle === down)
+  check('a throttle within reach is admitted exactly', admit({ throttle: 0.605 }).throttle === 0.605)
+  check('a NaN throttle holds rather than stalls', admit({ throttle: NaN }).throttle === 0.6)
+  check('a missing throttle holds rather than stalls', admit({}).throttle === 0.6)
+  check('rampThrottle bounds a wanted value before ramping', rampThrottle(1, 9, STEP) === 1)
+
+  /* Triggers are the literal `true` or nothing. */
+  check('fire: true fires', admit({ fire: true }).fire === true)
+  check("fire: 'yes' does not", admit({ fire: 'yes' }).fire === false)
+  check('fire: 1 does not', admit({ fire: 1 }).fire === false)
+  check('dash: true dashes', admit({ dash: true }).dash === true)
+  check("dash: 'false' does not", admit({ dash: 'false' }).dash === false)
+
+  /* Two fields never survive. */
+  check('an aim override is dropped', admit({ aim: new THREE.Vector3(0, 0, -1) }).aim === null)
+  check('a spread is zeroed', admit({ spread: 0.7 }).spread === 0)
+
+  /* A late tick holds the last intent, except for the triggers. The held intent
+     has both triggers *down*, or "dropped" and "held" would read the same. */
+  held.fire = true
+  held.dash = true
+  for (const [label, late] of [['undefined', undefined], ['null', null], ['a number', 42]] as const) {
+    const a = admit(late)
+    check(
+      `${label} in place of a packet holds the last deflection and throttle`,
+      a.pitch === 0.4 && a.yaw === -0.2 && a.roll === 1 && a.throttle === 0.6,
+      `got ${a.pitch}/${a.yaw}/${a.roll}/${a.throttle}`,
+    )
+    check(`and ${label} does not keep firing or dashing`, a.fire === false && a.dash === false)
+  }
+
+  held.fire = false
+  held.dash = false
+
+  /* Nothing in the packet is retained. */
+  const packet = { pitch: 0.5, throttle: 0.6, fire: true }
+  const admitted = admit(packet)
+  packet.pitch = -1
+  packet.fire = false
+  check('the admitted intent is not the packet', (admitted as unknown) !== packet)
+  check('and changing the packet afterwards changes nothing', admitted.pitch === 0.5 && admitted.fire)
+
+  /* `bound` is the one rule and `Ship` uses it too: it must keep Infinity. */
+  check('bound keeps a request for infinity as the limit', bound(Infinity, -1, 1) === 1)
+  check('bound reads a non-number as 0', bound('1', -1, 1) === 0 && bound(undefined, 0, 1) === 0)
+
+  /* The keyboard and the wire agree byte for byte, flown for 80 ticks. */
+  const device = stubInput()
+  const pilot = createPilot()
+  const wire = controls({ throttle: pilot.advance(device.state, 0).throttle })
+  const scratch = controls()
+  let agreed = 0
+  let disagreed = ''
+  let peak = 0
+  for (let i = 0; i < 80; i++) {
+    const wanted = i < 40 ? 1 : 0
+    device.write.throttleUp = wanted === 1
+    device.write.throttleDown = wanted === 0
+    const key = pilot.advance(device.state, STEP).throttle
+    const packet = admitIntent({ throttle: wanted }, wire, STEP, scratch).throttle
+    wire.throttle = packet
+    peak = Math.max(peak, packet)
+    if (key === packet) agreed++
+    else if (!disagreed) disagreed = `tick ${i}: keyboard ${key}, wire ${packet}`
+  }
+  check('a keyboard ramp and an admitted ramp agree on every tick', agreed === 80, disagreed)
+  // Forty ticks up from 0.6 reaches 1; forty ticks down from 1 lands short of
+  // where it started. Both have to have happened for the agreement to mean
+  // anything — two ramps that never moved would agree perfectly too.
+  check('and the ramp actually moved, up to 1 and back below launch', peak === 1 && wire.throttle < 0.6,
+    `peaked at ${peak}, ended at ${wire.throttle}`)
+
+  /* A ramp arrives exactly, and never overshoots. */
+  const climb = controls({ throttle: 0 })
+  let reachedAt = -1
+  let overshot = false
+  for (let i = 0; i < 120; i++) {
+    climb.throttle = admitIntent({ throttle: 1 }, climb, STEP, scratch).throttle
+    if (climb.throttle > 1) overshot = true
+    if (climb.throttle === 1 && reachedAt < 0) reachedAt = i + 1
+  }
+  const expectedTicks = Math.ceil(1 / (THROTTLE_UP_RATE * STEP))
+  check('a snapped throttle arrives at exactly 1 after a full ramp', reachedAt === expectedTicks,
+    `reached at tick ${reachedAt}, wanted ${expectedTicks}`)
+  check('and never overshoots it', !overshot)
+}
+
+/**
+ * A seat shoots along its nose, whatever its intent says about `aim`.
+ *
+ * Flown rather than asserted on a field: the same seeded match is run twice, once
+ * clean and once with seat 0's every intent carrying a fire-direction override and
+ * a wide spread, and the two fights must be *identical* — including the RNG, which
+ * a positive spread would draw from. The third run turns seat 0's guns off and must
+ * differ, or the decoration was never reaching the game and the equality above is
+ * between two runs of the same thing.
+ */
+function testASeatShootsAlongItsNose(): void {
+  section('A seat shoots along its nose, whatever its intent says')
+
+  const SEED = 0xa1a1
+  const HULLS = [SHIPS.hornet.maxHull, SHIPS.wasp.maxHull]
+  const TICKS = Math.ceil(25 / STEP)
+  const backward = new THREE.Vector3(0, 0, -1)
+
+  function fly(decorate: (intent: Controls) => void): Flown {
+    const game = newMatch()
+    game.start({ ships: ['hornet', 'wasp'], seed: SEED, respawn: true })
+    const crew = seatPilots(2)
+    const intents: Controls[] = []
+    const decorated = controls()
+    let print = ''
+    let fought = false
+    let ran = 0
+    let resolved = false
+    for (let i = 0; i < TICKS; i++) {
+      const views = crew.map((_, at) => game.snapshot(at))
+      if (views.some((v) => v === null)) {
+        resolved = true
+        break
+      }
+      print = matchPrint(game)
+      fought =
+        fought ||
+        (views.every((v) => v!.shotsFired > 0) && views.some((v, at) => v!.hull < HULLS[at]))
+      for (let at = 0; at < crew.length; at++) {
+        const { device } = crew[at]
+        const t = views[at]!.target
+        if (t) {
+          device.write.pitch = clampTo(t.pitch * 3, -1, 1)
+          device.write.yaw = clampTo(t.yaw * 3, -1, 1)
+          device.write.fire = Math.abs(t.pitch) < 0.35 && Math.abs(t.yaw) < 0.35
+          device.write.throttleUp = t.range > 260
+          device.write.throttleDown = t.range < 170
+        } else {
+          device.write.pitch = 0
+          device.write.yaw = 0
+          device.write.fire = false
+          device.write.throttleUp = true
+          device.write.throttleDown = false
+        }
+        intents[at] = crew[at].pilot.advance(device.state, STEP)
+      }
+      Object.assign(decorated, intents[0])
+      decorate(decorated)
+      intents[0] = decorated
+      game.step(intents)
+      ran = i + 1
+    }
+    game.dispose()
+    return { print, ticks: ran, fought, resolved }
+  }
+
+  const clean = fly(() => {})
+  const overridden = fly((c) => {
+    c.aim = backward
+    c.spread = 0.5
+  })
+  const disarmed = fly((c) => {
+    c.fire = false
+  })
+
+  check('the match being compared was a real fight', clean.fought && overridden.fought,
+    `clean fought=${clean.fought}, overridden fought=${overridden.fought}`)
+  check('and ran to the end', !clean.resolved && !overridden.resolved && clean.ticks === TICKS,
+    `ran ${clean.ticks} and ${overridden.ticks} of ${TICKS}`)
+  check(
+    'an aim override and a spread on a seat change nothing about the fight',
+    clean.print.length > 0 && clean.print === overridden.print,
+    `${clean.print}\n         vs ${overridden.print}`,
+  )
+  check(
+    'but the decoration does reach the game: turning the guns off is a different fight',
+    disarmed.print.length > 0 && disarmed.print !== clean.print,
+    'a disarmed seat produced the same match as an armed one — the decoration is not being flown',
+  )
 }
 
 /**
@@ -5317,6 +5532,8 @@ testAFactionResolvesToASeatOrToNobody()
 testTwoSeatsFlyOneArena()
 testStepNeedsOneIntentPerSeat()
 testPresentationCannotChangeTheMatch()
+testIntentIsAdmittedNotTrusted()
+testASeatShootsAlongItsNose()
 testDeathEitherRespawnsOrResolves()
 testEliminationEndsWhenTheArenaEmpties()
 testAnEliminatedSeatStaysEliminated()

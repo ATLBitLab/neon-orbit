@@ -169,6 +169,21 @@ lookup (`seatOf`). Never `humanFaction(seats.indexOf(x))`: `indexOf` returns -1 
 them unable to shoot the filler and the filler unable to shoot back. A miss has to mean "nobody",
 which is a real answer, rather than a faction picked for it.
 
+**Intent is admitted, not trusted.** `Controls` is about to be the packet format, and every
+field in a packet is a claim. `src/game/intent.ts` is the anti-cheat surface: `bound` clamps a
+deflection and reads a non-number as neutral (a single `NaN` would otherwise put a hull at `NaN`
+for the rest of the match), `rampThrottle` is the *only* copy of the throttle ramp — the keyboard
+in `controls.ts` and `admitIntent` on the wire both call it, so a sender cannot skip the ramp and
+gain acceleration the airframe does not have — and `admitIntent` turns whatever arrived into one
+legal tick, holding the last deflection and throttle for a late packet but never the triggers.
+Two fields never reach a seat at all: `aim`, the AI's lead solution and otherwise a
+fire-direction override, and `spread`, which draws from the seat's RNG when it is not zero. Those
+two are dropped in `recordControls`, and `Game.step` flies the *record* rather than the caller's
+struct, so what was simulated and what was recorded are one object by construction. The ramp is
+deliberately not applied inside `Game.step`: its callers are the host's own code, the headless
+suite drives seats on snapped throttles, and the wire boundary that unpacks a packet is what
+calls `admitIntent`.
+
 **Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
 `eliminated` — one field with three shapes, because the version that used a nullable wreck meant
 "never died" and "died, cutscene over" with the same value and so restarted an eliminated seat's
