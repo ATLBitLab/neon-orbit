@@ -19,6 +19,14 @@ import { createBolts, FACTION_AI, FACTION_PLAYER, humanFaction } from '../src/ga
 import { createStepClock } from '../src/core/loop'
 import { createPilot, type Pilot } from '../src/game/controls'
 import { admitIntent, bound, rampThrottle, THROTTLE_DOWN_RATE, THROTTLE_UP_RATE } from '../src/game/intent'
+import {
+  decodeSnapshot,
+  encodeSnapshot,
+  SNAPSHOT_VERSION,
+  type ShipState,
+  type WorldSnapshot,
+} from '../src/net/snapshot'
+import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '../src/net/wire'
 import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
@@ -2763,6 +2771,464 @@ function testASeatShootsAlongItsNose(): void {
     disarmed.print.length > 0 && disarmed.print !== clean.print,
     'a disarmed seat produced the same match as an armed one — the decoration is not being flown',
   )
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+function shipStateFixture(seed: number): ShipState {
+  const f = (n: number) => Math.fround(seed * 1.37 + n * 0.731 - 3.5)
+  return {
+    position: { x: f(1), y: f(2), z: f(3) },
+    quaternion: { x: f(4), y: f(5), z: f(6), w: f(7) },
+    velocity: { x: f(8), y: f(9), z: f(10) },
+    speed: f(11),
+    hull: f(12),
+    throttle: f(13),
+    alive: seed % 2 === 0,
+    warpTimer: f(14),
+    flash: f(15),
+    sinceHit: f(16),
+    heat: f(17),
+    heatLocked: f(18),
+    dashTimer: f(19),
+    dashCooldown: f(20),
+    overdriveTimer: f(21),
+    shieldTimer: f(22),
+    solarExposure: f(23),
+    shotsFired: seed * 97,
+  }
+}
+
+/**
+ * The snapshot codec is total: every field goes out and comes back.
+ *
+ * A hand-built snapshot with every enumeration exercised — all three phases, all
+ * three lock kinds, a bolt in the last slot, a negative score — is encoded and
+ * decoded and must come back *deeply equal*, and the decoded copy must re-encode
+ * to the same bytes. Values are already float32 so the equality is exact rather
+ * than "close", which is what lets a dropped or reordered field be a hard failure.
+ */
+function testTheWorldSurvivesTheWire(): void {
+  section('The world survives the wire')
+
+  const world: WorldSnapshot = {
+    tick: 0xfffffffe,
+    seed: 0xdeadbeef,
+    elapsed: Math.fround(123.456),
+    active: true,
+    paused: true,
+    queued: 5,
+    seats: [
+      {
+        ship: shipStateFixture(2),
+        score: -1500,
+        kills: 3,
+        multiplier: Math.fround(2.5),
+        hits: 77,
+        deaths: 2,
+        phase: 'wrecked',
+        wreckTimer: Math.fround(0.42),
+        throttle: Math.fround(0.77),
+        lock: { kind: 'squadron', id: 9 },
+      },
+      {
+        ship: shipStateFixture(3),
+        score: 0,
+        kills: 0,
+        multiplier: 1,
+        hits: 0,
+        deaths: 0,
+        phase: 'eliminated',
+        wreckTimer: 0,
+        throttle: 0,
+        lock: { kind: 'seat', index: 0 },
+      },
+      {
+        ship: shipStateFixture(4),
+        score: 2147483647,
+        kills: 65535,
+        multiplier: 1,
+        hits: 4294967295,
+        deaths: 65535,
+        phase: 'flying',
+        wreckTimer: 0,
+        throttle: 1,
+        lock: { kind: 'none' },
+      },
+    ],
+    squadron: [
+      { id: 9, spec: 'drone', ship: shipStateFixture(5) },
+      { id: 0, spec: 'wasp', ship: shipStateFixture(6) },
+    ],
+    bolts: [
+      {
+        slot: 419,
+        pos: { x: 1, y: -2, z: 3 },
+        prev: { x: 0.5, y: -1.5, z: 2.5 },
+        vel: { x: 100, y: 0, z: -900 },
+        faction: FACTION_AI,
+        color: { x: 1, y: Math.fround(0.3), z: 0 },
+      },
+      {
+        slot: 0,
+        pos: { x: 0, y: 0, z: 0 },
+        prev: { x: 0, y: 0, z: 0 },
+        vel: { x: 0, y: 0, z: 0 },
+        faction: humanFaction(2),
+        color: { x: 0, y: 0, z: 0 },
+      },
+    ],
+    pods: [
+      { live: true, respawnIn: 0 },
+      { live: false, respawnIn: Math.fround(12.5) },
+    ],
+    mines: [true, false, true],
+  }
+
+  const bytes = encodeSnapshot(world)
+  let back: WorldSnapshot | null = null
+  let decodeError = ''
+  try {
+    back = decodeSnapshot(bytes)
+  } catch (e) {
+    decodeError = String(e)
+  }
+  // A codec that cannot read its own output is the loudest possible failure,
+  // and it has to be a *named* one: an uncaught throw here would end the suite
+  // with every later check unrun, which the mutation gate counts as a gap.
+  check('a snapshot decodes at all', back !== null, decodeError)
+  // No early return: every check below still runs and fails by name when the
+  // decode did not happen, so a broken codec cannot shorten the suite.
+  const decoded = back !== null
+  const b = back ?? { seats: [], bolts: [] }
+  check('a snapshot decodes to an equal snapshot', decoded && JSON.stringify(back) === JSON.stringify(world))
+  check('and re-encodes to the same bytes', decoded && sameBytes(encodeSnapshot(back!), bytes))
+  check('the frame is not trivially small', bytes.length > 300, `${bytes.length} bytes`)
+
+  // Every enumeration is on the wire, or the equality above proved less than it reads.
+  check(
+    'every phase and every lock kind was on the wire',
+    decoded &&
+      b.seats.map((x) => x.phase).join() === 'wrecked,eliminated,flying' &&
+      b.seats.map((x) => x.lock.kind).join() === 'squadron,seat,none',
+  )
+  check(
+    'the last bolt slot and a negative score came back',
+    decoded && b.bolts[0]?.slot === 419 && b.seats[0]?.score === -1500,
+  )
+}
+
+/**
+ * A mirror that applies the host's snapshots *is* the host's match.
+ *
+ * Two games start the same `MatchSetup`. The host flies a real fight on the
+ * autopilot; the mirror never calls `step`. Every tick the host's world is
+ * captured, encoded, decoded and applied, and the mirror is then captured and
+ * encoded again — and the two byte strings must be identical. That pins every
+ * field in both directions at once: a field `apply` forgot to write comes back
+ * as whatever the mirror had, and a field `capture` forgot to read is missing
+ * from both and would be caught by the per-seat comparison that follows.
+ *
+ * The fight has to be real for any of that to mean anything, so the run must
+ * have fought, the squadron must have warped in, bolts must have been in flight,
+ * and the bytes must change over time. A forced death then walks the mirror
+ * through a seat's whole wreck-and-respawn, because that is the one transition
+ * `apply` has to *produce* rather than copy.
+ */
+function testAMirrorIsTheHostsMatch(): void {
+  section("A mirror that applies the host's snapshots is the host's match")
+
+  const SEED = 0x3a1e
+  const setup = { ships: ['hornet', 'wasp'] as ShipId[], seed: SEED, respawn: true }
+  const host = newMatch()
+  const mirror = newMatch()
+  host.start(setup)
+  mirror.start(setup)
+
+  const crew = seatPilots(2)
+  const intents: Controls[] = []
+  const TICKS = Math.ceil(25 / STEP)
+  let mismatched = 0
+  let firstMismatch = ''
+  let boltsSeen = 0
+  let squadronSeen = 0
+  let fought = false
+  let earlyBytes: Uint8Array | null = null
+  let lateBytes: Uint8Array | null = null
+  let seatDisagreed = ''
+  let seatCompared = 0
+
+  let resolvedEarly = -1
+  let threw = ''
+  for (let i = 0; i < TICKS; i++) {
+    flyAll(host, crew, intents)
+    if (!host.snapshot(0)) {
+      resolvedEarly = i
+      break
+    }
+    const hostBytes = encodeSnapshot(host.capture())
+    try {
+      mirror.apply(decodeSnapshot(hostBytes))
+    } catch (e) {
+      threw = `tick ${i}: ${String(e)}`
+      break
+    }
+    mirror.render(1, STEP)
+    const mirrorBytes = encodeSnapshot(mirror.capture())
+    if (!sameBytes(hostBytes, mirrorBytes)) {
+      mismatched++
+      if (!firstMismatch) firstMismatch = `first at tick ${i}: ${hostBytes.length} vs ${mirrorBytes.length} bytes`
+    }
+    const world = decodeSnapshot(hostBytes)
+    if (world.bolts.length > 0) boltsSeen++
+    if (world.squadron.length > 0) squadronSeen++
+    if (i === 60) earlyBytes = hostBytes
+    if (i === TICKS - 1) lateBytes = hostBytes
+
+    for (let at = 0; at < 2; at++) {
+      const h = host.snapshot(at)
+      const m = mirror.snapshot(at)
+      if (!h || !m) continue
+      seatCompared++
+      if (h.hull < SHIPS[setup.ships[at]].maxHull) fought = true
+      const agree =
+        Math.abs(m.hull - h.hull) < 1e-3 &&
+        Math.abs(m.speed - h.speed) < 0.05 &&
+        m.throttle === Math.fround(h.throttle) &&
+        m.overdrive === Math.fround(h.overdrive) &&
+        m.shield === Math.fround(h.shield) &&
+        m.solarExposure === Math.fround(h.solarExposure) &&
+        m.score === h.score &&
+        m.kills === h.kills &&
+        m.deaths === h.deaths &&
+        m.phase === h.phase &&
+        m.shotsFired === h.shotsFired &&
+        m.enemiesAirborne === h.enemiesAirborne &&
+        m.enemiesQueued === h.enemiesQueued &&
+        m.elapsed === Math.fround(h.elapsed) &&
+        Math.abs(m.position.x - h.position.x) < 0.05 &&
+        Math.abs(m.position.y - h.position.y) < 0.05 &&
+        Math.abs(m.position.z - h.position.z) < 0.05 &&
+        (h.target === null) === (m.target === null)
+      if (!agree && !seatDisagreed) {
+        seatDisagreed = `tick ${i} seat ${at}: host ${JSON.stringify(h)} mirror ${JSON.stringify(m)}`
+      }
+    }
+  }
+
+  check('the host match ran the whole budget', resolvedEarly < 0, `resolved at tick ${resolvedEarly}`)
+  check('and no snapshot threw on the way to the mirror', threw === '', threw)
+  check('the host fought a real fight', fought, 'no hull came down in 25 seconds')
+  check('the squadron warped in on the wire', squadronSeen > 0)
+  check('bolts were in flight on the wire', boltsSeen > 0)
+  check(
+    'the world changed over the run',
+    earlyBytes !== null && lateBytes !== null && !sameBytes(earlyBytes, lateBytes),
+    'the same bytes at tick 60 and at the end — nothing is being captured',
+  )
+  check(`the mirror re-encodes to the host's bytes on every tick (${TICKS})`, mismatched === 0, firstMismatch)
+  check(`and every seat view agrees (${seatCompared} compared)`, seatDisagreed === '', seatDisagreed)
+  check(
+    'the mirror reports the squadron it was sent, not its own empty queue',
+    (mirror.snapshot(0)?.enemiesQueued ?? -1) === (host.snapshot(0)?.enemiesQueued ?? -2),
+  )
+
+  host.dispose()
+  mirror.dispose()
+
+  /* A death, walked through the mirror. */
+  const originalHull = SHIPS.wasp.maxHull
+  SHIPS.wasp.maxHull = 40
+  const hostField = disarmedArena()
+  const mirrorField = disarmedArena()
+  const deathSetup = { ships: ['wasp', 'wasp'] as ShipId[], seed: 0x5a1d, local: 1, respawn: true }
+  const h2 = newMatch({ environment: { ...stubEnvironment(), minefield: hostField } })
+  const m2 = newMatch({ environment: { ...stubEnvironment(), minefield: mirrorField } })
+  h2.start(deathSetup)
+  m2.start(deathSetup)
+  const hands = [controls({ throttle: 0.3 }), controls({ throttle: 0.7 })]
+  const phases: string[] = []
+  let mirrorPhases = ''
+  let deathMismatch = 0
+  let mineWentDark = false
+  for (let i = 0; i < 1800; i++) {
+    if (i === 90) hostField.arm()
+    h2.step(hands)
+    if (!h2.snapshot(0)) break
+    const bytes = encodeSnapshot(h2.capture())
+    try {
+      m2.apply(decodeSnapshot(bytes))
+    } catch (e) {
+      deathMismatch += 1000
+      break
+    }
+    m2.render(1, STEP)
+    if (!sameBytes(bytes, encodeSnapshot(m2.capture()))) deathMismatch++
+    const phase = m2.snapshot(0)?.phase ?? 'gone'
+    if (phases[phases.length - 1] !== phase) phases.push(phase)
+    if (m2.capture().mines.some((live) => !live)) mineWentDark = true
+    if (phase === 'flying' && phases.length >= 3) break
+  }
+  mirrorPhases = phases.join(' -> ')
+  check('the mirror walked the seat through its death and back', mirrorPhases === 'flying -> wrecked -> flying', mirrorPhases)
+  check('the death counted on the mirror', (m2.snapshot(0)?.deaths ?? 0) === 1)
+  check('the mine that did it went dark on the mirror', mineWentDark)
+  check("and the mirror's bytes matched the host's throughout", deathMismatch === 0, `${deathMismatch} mismatched ticks`)
+  check('the mirror is drawing the returned seat', m2.dying === false && m2.snapshot(0)?.phase === 'flying')
+  h2.dispose()
+  m2.dispose()
+  SHIPS.wasp.maxHull = originalHull
+}
+
+/**
+ * Squadron hulls come and go by id, and a bad snapshot changes nothing.
+ *
+ * Hand-built rather than flown, because the retire path — a hull the host
+ * stopped sending — is a transition a 25-second autopilot fight may not reach.
+ */
+function testHullsComeAndGoByIdAndBadFramesDoNothing(): void {
+  section('Squadron hulls come and go by id; a bad frame changes nothing')
+
+  const mirror = newMatch()
+  mirror.start({ ships: ['hornet'], seed: 0x1d })
+  const base = mirror.capture()
+  const hull = (id: number, spec: ShipId) => ({ id, spec, ship: shipStateFixture(id + 10) })
+
+  mirror.apply({ ...base, squadron: [hull(7, 'wasp'), hull(3, 'drone')], queued: 4 })
+  check('two hulls sent, two airborne', mirror.snapshot()?.enemiesAirborne === 2)
+  check('and the queue reported is the host\'s', mirror.snapshot()?.enemiesQueued === 4)
+  const withTwo = mirror.capture()
+  check('the mirror reports them by id', withTwo.squadron.map((x) => x.id).join() === '7,3')
+
+  mirror.apply({ ...base, squadron: [hull(3, 'drone')], queued: 4 })
+  check('a hull the host stopped sending is retired', mirror.snapshot()?.enemiesAirborne === 1)
+  check('and the one that stayed kept its id', mirror.capture().squadron[0]?.id === 3)
+
+  mirror.apply({ ...base, squadron: [hull(3, 'drone'), hull(8, 'wasp')], queued: 3 })
+  check('a new id is a new hull', mirror.capture().squadron.map((x) => x.id).join() === '3,8')
+
+  /* Locks resolve to the hull with that id. */
+  const locked: WorldSnapshot = {
+    ...base,
+    squadron: [hull(3, 'drone'), hull(8, 'wasp')],
+    seats: [{ ...base.seats[0], lock: { kind: 'squadron', id: 8 } }],
+  }
+  mirror.apply(locked)
+  check('a lock on a squadron id resolves on the mirror', mirror.snapshot()?.target !== null)
+
+  check('and captures back as the same id', JSON.stringify(mirror.capture().seats[0].lock) === '{"kind":"squadron","id":8}',
+    `got ${JSON.stringify(mirror.capture().seats[0].lock)}`)
+
+  /* Apply then capture is the identity, field by field. This is the asymmetric
+     check: the flown comparison encodes the host and the mirror through the same
+     `capture`, so a field `capture` never read would match on both sides. Here
+     the input is hand-built, so a field `apply` never wrote *or* `capture` never
+     read comes back different. */
+  const hand: WorldSnapshot = {
+    ...base,
+    tick: 777,
+    elapsed: Math.fround(9.25),
+    paused: true,
+    queued: 2,
+    seats: [{ ...base.seats[0], ship: { ...shipStateFixture(20), alive: true }, score: 4321, kills: 6, multiplier: 3, hits: 40, deaths: 2, phase: 'flying', wreckTimer: 0, lock: { kind: 'none' } }],
+    squadron: [hull(3, 'drone'), hull(8, 'wasp')],
+    bolts: [
+      { slot: 5, pos: { x: 1, y: 2, z: 3 }, prev: { x: 0, y: 1, z: 2 }, vel: { x: 9, y: 8, z: 7 }, faction: FACTION_AI, color: { x: 1, y: 0.5, z: 0 } },
+      { slot: 419, pos: { x: -1, y: -2, z: -3 }, prev: { x: 0, y: 0, z: 0 }, vel: { x: 0, y: 0, z: 1 }, faction: humanFaction(0), color: { x: 0, y: 1, z: 0 } },
+    ],
+  }
+  mirror.apply(hand)
+  const captured = mirror.capture()
+  check('apply then capture is the identity', JSON.stringify(captured) === JSON.stringify(hand),
+    `\n         ${JSON.stringify(captured)}\n      vs ${JSON.stringify(hand)}`)
+
+  /* Bad frames. */
+  const before = encodeSnapshot(mirror.capture())
+  function refused(label: string, bytes: Uint8Array): void {
+    let threw = false
+    try {
+      mirror.apply(decodeSnapshot(bytes))
+    } catch (e) {
+      threw = e instanceof RangeError
+    }
+    check(`${label} is refused with a RangeError`, threw)
+  }
+  refused('a truncated snapshot', before.slice(0, before.length - 7))
+  refused('a snapshot with a tail', new Uint8Array([...before, 0]))
+  const wrongVersion = before.slice()
+  wrongVersion[0] = SNAPSHOT_VERSION + 1
+  refused('a snapshot from another version', wrongVersion)
+  refused('an empty frame', new Uint8Array(0))
+  check('and none of them changed the mirror', sameBytes(encodeSnapshot(mirror.capture()), before))
+
+  let rosterThrew = false
+  try {
+    mirror.apply({ ...base, seats: [] })
+  } catch (e) {
+    rosterThrew = e instanceof RangeError
+  }
+  check('a snapshot for a different roster is refused', rosterThrew)
+  check('and changed nothing', sameBytes(encodeSnapshot(mirror.capture()), before))
+
+  mirror.dispose()
+}
+
+/**
+ * An intent frame ends in admission.
+ *
+ * The codec reads floats and a float can be anything, so the decoder's last
+ * step is `admitIntent` and nothing that comes out has bypassed it. A `NaN`
+ * written straight into the throttle bytes holds; a bad frame throws and leaves
+ * `out` untouched.
+ */
+function testAnIntentFrameEndsInAdmission(): void {
+  section('An intent frame ends in admission')
+
+  const held = controls({ throttle: 0.5 })
+  const out = controls({ pitch: 0.123 })
+  const sent = controls({ pitch: 0.25, yaw: -1, roll: 1, throttle: 0.51, fire: true, dash: true })
+  const bytes = encodeIntent(2, 4242, sent)
+  check('an intent frame is fixed-size', bytes.length === INTENT_FRAME_BYTES, `${bytes.length}`)
+
+  const frame = decodeIntent(bytes, held, STEP, out)
+  check('seat and tick come back', frame.seat === 2 && frame.tick === 4242)
+  check(
+    'the controls come back through admission',
+    out.pitch === 0.25 && out.yaw === -1 && out.roll === 1 && out.throttle === Math.fround(0.51) && out.fire && out.dash,
+    JSON.stringify(out),
+  )
+  check('the decoded intent is the out struct, not a fresh one', frame.controls === out)
+
+  // NaN in the throttle bytes: offset 1 + 1 + 4 + 3 floats.
+  const poisoned = bytes.slice()
+  new DataView(poisoned.buffer).setFloat32(6 + 12, NaN, true)
+  decodeIntent(poisoned, held, STEP, out)
+  check('a NaN throttle on the wire holds the last throttle', out.throttle === 0.5, `${out.throttle}`)
+
+  const snapped = encodeIntent(0, 1, controls({ throttle: 1 }))
+  decodeIntent(snapped, held, STEP, out)
+  check('a snapped throttle on the wire is ramped', out.throttle === 0.5 + THROTTLE_UP_RATE * STEP, `${out.throttle}`)
+
+  const before = JSON.stringify(out)
+  function refused(label: string, frame: Uint8Array): void {
+    let threw = false
+    try {
+      decodeIntent(frame, held, STEP, out)
+    } catch (e) {
+      threw = e instanceof RangeError
+    }
+    check(`${label} is refused with a RangeError`, threw)
+  }
+  refused('a short intent frame', bytes.slice(0, bytes.length - 1))
+  refused('a long intent frame', new Uint8Array([...bytes, 0]))
+  const wrong = bytes.slice()
+  wrong[0] = INTENT_VERSION + 1
+  refused('an intent frame from another version', wrong)
+  check('and none of them wrote to out', JSON.stringify(out) === before)
 }
 
 /**
@@ -5534,6 +6000,10 @@ testStepNeedsOneIntentPerSeat()
 testPresentationCannotChangeTheMatch()
 testIntentIsAdmittedNotTrusted()
 testASeatShootsAlongItsNose()
+testTheWorldSurvivesTheWire()
+testAMirrorIsTheHostsMatch()
+testHullsComeAndGoByIdAndBadFramesDoNothing()
+testAnIntentFrameEndsInAdmission()
 testDeathEitherRespawnsOrResolves()
 testEliminationEndsWhenTheArenaEmpties()
 testAnEliminatedSeatStaysEliminated()

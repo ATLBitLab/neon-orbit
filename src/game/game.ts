@@ -45,6 +45,7 @@ import {
 } from '../world/pickups'
 import { EnemyPilot } from './ai'
 import { createBolts, FACTION_AI, FACTION_PLAYER, type Bolts, type Faction } from './bolts'
+import type { LockRef, SeatState, ShipState, SquadronState, WorldSnapshot } from '../net/snapshot'
 import { createChaseCamera, type ChaseCamera } from './chase'
 import { createFx, type Fx } from './fx'
 import type { Hud, HudContact, HudTarget } from './hud'
@@ -60,6 +61,7 @@ import {
   recordControls,
   seatOf,
   type Participant,
+  type SeatPhase,
 } from './roster'
 import { Ship, type Controls, type ShipContext } from './ship'
 
@@ -286,6 +288,15 @@ export interface Game {
    * a frame over.
    */
   snapshot(seat?: number): RunSnapshot | null
+  /** The world this tick, as plain data, for the wire. See `net/snapshot.ts`. */
+  capture(): WorldSnapshot
+  /**
+   * Become a host's world for one tick. A mirror starts the same `MatchSetup`,
+   * never calls `step`, applies each snapshot as it arrives and renders as
+   * normal. Throws `RangeError` if the roster does not match; a snapshot that
+   * throws has changed nothing.
+   */
+  apply(snapshot: WorldSnapshot): void
   dispose(): void
 }
 
@@ -445,6 +456,16 @@ export function createGame(deps: GameDeps): Game {
   let active = false
   let paused = false
   let elapsed = 0
+  /** Fixed ticks since `start`. The snapshot's clock; nothing in the sim reads it. */
+  let tick = 0
+  /**
+   * True once `apply` has run: this game is a mirror of a host's, and reports the
+   * host's queue rather than its own empty one. Cleared by `start`.
+   */
+  let mirrored = false
+  let mirroredQueued = 0
+  /** Spawn order of each squadron hull — the identity a snapshot carries for it. */
+  const pilotIds = new Map<EnemyPilot, number>()
   let best = 0
   let alarmTimer = 0
   let searAlarmTimer = 0
@@ -684,7 +705,9 @@ export function createGame(deps: GameDeps): Game {
     }
 
     scene.add(ship.visual.group)
-    pilots.push(new EnemyPilot(ship, subRng(runSeed, STREAM.pilot + index)))
+    const pilot = new EnemyPilot(ship, subRng(runSeed, STREAM.pilot + index))
+    pilotIds.set(pilot, index)
+    pilots.push(pilot)
     refreshTargets()
 
     fx.warpIn(ship.position, ship.accent)
@@ -698,6 +721,7 @@ export function createGame(deps: GameDeps): Game {
       if (ship.alive) continue
       scene.remove(ship.visual.group)
       ship.dispose()
+      pilotIds.delete(pilots[i])
       pilots.splice(i, 1)
       removed = true
     }
@@ -926,6 +950,9 @@ export function createGame(deps: GameDeps): Game {
       pilot.ship.dispose()
     }
     pilots = []
+    pilotIds.clear()
+    mirrored = false
+    mirroredQueued = 0
     for (const seat of seats) {
       scene.remove(seat.ship.visual.group)
       seat.ship.dispose()
@@ -1097,7 +1124,7 @@ export function createGame(deps: GameDeps): Game {
       multiplier: seat.multiplier,
       best,
       enemiesTotal: PER_ENEMY_TYPE * 2,
-      enemiesRemaining: queue.length + pilots.length,
+      enemiesRemaining: queuedCount() + pilots.length,
       speed: ship.velocity.length(),
       throttle: 0,
       locked: false,
@@ -1259,7 +1286,17 @@ export function createGame(deps: GameDeps): Game {
       g.visible = false
     }
 
-    /* Detonations */
+    fireDueBlasts(seat, watching)
+  }
+
+  /**
+   * Every detonation on the timeline the wreck's clock has passed, once each.
+   * Shared with `apply`, which drives the same timeline from a snapshot's clock.
+   */
+  function fireDueBlasts(seat: Participant, watching: boolean): void {
+    const wreck = seat.phase
+    if (wreck.kind !== 'wrecked') return
+    const ship = seat.ship
     while (wreck.nextBlast < DEATH_BLASTS.length && wreck.timer >= DEATH_BLASTS[wreck.nextBlast].at) {
       const blast = DEATH_BLASTS[wreck.nextBlast++]
       _blast.copy(ship.position)
@@ -1273,6 +1310,256 @@ export function createGame(deps: GameDeps): Game {
       // Only the seat being drawn gets knocked about by its own explosion.
       if (watching) chase.shake(blast.shake)
     }
+  }
+
+  function queuedCount(): number {
+    return mirrored ? mirroredQueued : queue.length
+  }
+
+  /* ---- Snapshots --------------------------------------------------------- */
+
+  function readShip(ship: Ship): ShipState {
+    return {
+      position: { x: ship.position.x, y: ship.position.y, z: ship.position.z },
+      quaternion: { x: ship.quaternion.x, y: ship.quaternion.y, z: ship.quaternion.z, w: ship.quaternion.w },
+      velocity: { x: ship.velocity.x, y: ship.velocity.y, z: ship.velocity.z },
+      speed: ship.speed,
+      hull: ship.hull,
+      throttle: ship.throttle,
+      alive: ship.alive,
+      warpTimer: ship.warpTimer,
+      flash: ship.flash,
+      sinceHit: ship.sinceHit,
+      heat: ship.heat,
+      heatLocked: ship.heatLocked,
+      dashTimer: ship.dashTimer,
+      dashCooldown: ship.dashCooldown,
+      overdriveTimer: ship.overdriveTimer,
+      shieldTimer: ship.shieldTimer,
+      solarExposure: ship.solarExposure,
+      shotsFired: ship.shotsFired,
+    }
+  }
+
+  /**
+   * Write a hull's state, keeping the previous tick's transform for
+   * interpolation: the mirror renders between the last two snapshots exactly as
+   * the host renders between the last two ticks.
+   */
+  function writeShip(ship: Ship, s: ShipState): void {
+    ship.prevPosition.copy(ship.position)
+    ship.prevQuaternion.copy(ship.quaternion)
+    ship.position.set(s.position.x, s.position.y, s.position.z)
+    ship.quaternion.set(s.quaternion.x, s.quaternion.y, s.quaternion.z, s.quaternion.w)
+    ship.velocity.set(s.velocity.x, s.velocity.y, s.velocity.z)
+    ship.speed = s.speed
+    ship.hull = s.hull
+    ship.throttle = s.throttle
+    ship.alive = s.alive
+    ship.warpTimer = s.warpTimer
+    ship.flash = s.flash
+    ship.sinceHit = s.sinceHit
+    ship.heat = s.heat
+    ship.heatLocked = s.heatLocked
+    ship.dashTimer = s.dashTimer
+    ship.dashCooldown = s.dashCooldown
+    ship.overdriveTimer = s.overdriveTimer
+    ship.shieldTimer = s.shieldTimer
+    ship.solarExposure = s.solarExposure
+    ship.shotsFired = s.shotsFired
+  }
+
+  function lockOf(seat: Participant): LockRef {
+    const held = seat.lockedTarget
+    if (!held) return { kind: 'none' }
+    const asSeat = seats.find((s) => s.ship === held)
+    if (asSeat) return { kind: 'seat', index: asSeat.index }
+    for (const pilot of pilots) {
+      if (pilot.ship === held) return { kind: 'squadron', id: pilotIds.get(pilot) ?? 0 }
+    }
+    return { kind: 'none' }
+  }
+
+  function resolveLock(lock: LockRef): Ship | null {
+    if (lock.kind === 'seat') return seats[lock.index]?.ship ?? null
+    if (lock.kind === 'squadron') {
+      for (const pilot of pilots) if (pilotIds.get(pilot) === lock.id) return pilot.ship
+    }
+    return null
+  }
+
+  function capture(): WorldSnapshot {
+    const seatStates: SeatState[] = seats.map((seat) => ({
+      ship: readShip(seat.ship),
+      score: seat.score,
+      kills: seat.kills,
+      multiplier: seat.multiplier,
+      hits: seat.hits,
+      deaths: seat.deaths,
+      phase: seat.phase.kind,
+      wreckTimer: seat.phase.kind === 'wrecked' ? seat.phase.timer : 0,
+      throttle: seat.lastControls.throttle,
+      lock: lockOf(seat),
+    }))
+    const squadronStates: SquadronState[] = pilots.map((pilot) => ({
+      id: pilotIds.get(pilot) ?? 0,
+      spec: pilot.ship.spec.id,
+      ship: readShip(pilot.ship),
+    }))
+    const boltStates: WorldSnapshot['bolts'] = []
+    bolts.each((slot, b) => {
+      boltStates.push({
+        slot,
+        pos: { x: b.pos.x, y: b.pos.y, z: b.pos.z },
+        prev: { x: b.prev.x, y: b.prev.y, z: b.prev.z },
+        vel: { x: b.vel.x, y: b.vel.y, z: b.vel.z },
+        faction: b.faction,
+        color: { x: b.color.r, y: b.color.g, z: b.color.b },
+      })
+    })
+    return {
+      tick,
+      seed: runSeed,
+      elapsed,
+      active,
+      paused,
+      queued: queuedCount(),
+      seats: seatStates,
+      squadron: squadronStates,
+      bolts: boltStates,
+      pods: environment.pickups.pods.map((pod) => ({ live: pod.live, respawnIn: pod.respawnIn })),
+      mines: environment.minefield.mines.map((mine) => mine.live),
+    }
+  }
+
+  /**
+   * Become the host's world for this tick.
+   *
+   * Everything a snapshot carries is written; nothing it does not carry is
+   * touched, so the AI brains, the queue and the RNG streams stay whatever they
+   * were — which for a mirror is empty and unused. Squadron hulls are created and
+   * retired as ids come and go, and the presentation the host's own tick would
+   * have produced along the way — warp-in, a retired hull's explosion, a seat's
+   * death sequence — is produced here from the transitions instead.
+   */
+  function apply(s: WorldSnapshot): void {
+    if (s.seats.length !== seats.length) {
+      throw new RangeError(`snapshot has ${s.seats.length} seat(s), this match has ${seats.length}`)
+    }
+    mirrored = true
+    mirroredQueued = s.queued
+    tick = s.tick
+    elapsed = s.elapsed
+    active = s.active
+    paused = s.paused
+
+    /* Squadron: match hulls to ids. */
+    const seen = new Set<number>()
+    for (const hull of s.squadron) {
+      seen.add(hull.id)
+      let pilot = pilots.find((p) => pilotIds.get(p) === hull.id)
+      if (!pilot) {
+        const ship = new Ship(SHIPS[hull.spec], FACTION_AI)
+        ship.position.set(hull.ship.position.x, hull.ship.position.y, hull.ship.position.z)
+        ship.quaternion.set(
+          hull.ship.quaternion.x,
+          hull.ship.quaternion.y,
+          hull.ship.quaternion.z,
+          hull.ship.quaternion.w,
+        )
+        scene.add(ship.visual.group)
+        pilot = new EnemyPilot(ship)
+        pilotIds.set(pilot, hull.id)
+        pilots.push(pilot)
+        fx.warpIn(ship.position, ship.accent)
+        audio.warp()
+      }
+      writeShip(pilot.ship, hull.ship)
+    }
+    for (let i = pilots.length - 1; i >= 0; i--) {
+      const pilot = pilots[i]
+      if (seen.has(pilotIds.get(pilot) ?? -1)) continue
+      const ship = pilot.ship
+      // A hull the host stopped sending was retired, and a hull is retired dead.
+      fx.explode(ship.position, ship.accent, ship.spec.id === 'drone' ? 1.5 : 1.1)
+      audio.explosion(ship.spec.id === 'drone')
+      scene.remove(ship.visual.group)
+      ship.dispose()
+      pilotIds.delete(pilot)
+      pilots.splice(i, 1)
+    }
+    refreshTargets()
+
+    /* Seats. */
+    for (let i = 0; i < seats.length; i++) {
+      const seat = seats[i]
+      const state = s.seats[i]
+      const ship = seat.ship
+      writeShip(ship, state.ship)
+      // The HUD reads the seat's flown throttle, and a mirror flies nothing.
+      seat.lastControls.throttle = state.throttle
+      seat.score = state.score
+      seat.kills = state.kills
+      seat.multiplier = state.multiplier
+      seat.hits = state.hits
+      seat.deaths = state.deaths
+
+      const was = seat.phase.kind
+      if (state.phase === 'wrecked') {
+        if (was !== 'wrecked') {
+          seat.lockedTarget = null
+          seat.phase = {
+            kind: 'wrecked',
+            timer: state.wreckTimer,
+            nextBlast: 0,
+            emissive: ship.visual.hullMat.emissive.clone(),
+          }
+          ship.visual.group.visible = true
+          ship.visual.thrusterMat.opacity = 0
+          if (seat === local()) hud.callout('HULL BREACH', '#ff3b4e', 3)
+        }
+        const wreck = seat.phase as Extract<SeatPhase, { kind: 'wrecked' }>
+        wreck.timer = state.wreckTimer
+        const g = ship.visual.group
+        if (wreck.timer < WRECK_TUMBLE) {
+          // The tumble is cosmetic and the host's spin is not sent, so it is
+          // rebuilt here from the clock rather than integrated tick by tick.
+          _spin.set(WRECK_PITCH * wreck.timer, WRECK_YAW * wreck.timer, WRECK_ROLL * wreck.timer)
+          _spinQuat.setFromEuler(_spin)
+          g.quaternion.copy(ship.quaternion).multiply(_spinQuat).normalize()
+          ship.visual.hullMat.emissive.copy(wreck.emissive).lerp(WRECK_HOT, wreck.timer / WRECK_TUMBLE)
+        } else if (g.visible) {
+          g.visible = false
+        }
+        fireDueBlasts(seat, seat === local())
+      } else if (state.phase === 'eliminated') {
+        seat.phase = ELIMINATED
+        ship.visual.group.visible = false
+      } else if (was !== 'flying') {
+        seat.phase = FLYING
+        seat.lockedTarget = null
+        ship.visual.group.visible = true
+        // No previous transform to interpolate from on the tick a seat returns.
+        ship.prevPosition.copy(ship.position)
+        ship.prevQuaternion.copy(ship.quaternion)
+        if (seat === local()) {
+          chase.reset(ship)
+          hud.callout('RESPAWN', '#6be6ff', 1.2)
+        }
+      }
+    }
+    // Locks resolve after every hull exists.
+    for (let i = 0; i < seats.length; i++) seats[i].lockedTarget = resolveLock(s.seats[i].lock)
+
+    bolts.restore(s.bolts)
+
+    const pods = environment.pickups.pods
+    for (let i = 0; i < pods.length && i < s.pods.length; i++) {
+      pods[i].live = s.pods[i].live
+      pods[i].respawnIn = s.pods[i].respawnIn
+    }
+    const mines = environment.minefield.mines
+    for (let i = 0; i < mines.length && i < s.mines.length; i++) mines[i].live = s.mines[i]
   }
 
   /**
@@ -1361,6 +1648,7 @@ export function createGame(deps: GameDeps): Game {
     environment.step(STEP)
 
     elapsed += STEP
+    tick++
 
     /* Spawning */
     if (spawnTimer > 0) spawnTimer -= STEP
@@ -1613,7 +1901,7 @@ export function createGame(deps: GameDeps): Game {
     // counts the squadron instead of the markers.
     let airborne = 0
     for (const pilot of pilots) if (pilot.ship.alive) airborne++
-    const remaining = queue.length + airborne
+    const remaining = queuedCount() + airborne
     const critical = self.hullFraction <= CRITICAL_HULL
 
     // Project the gun line so the crosshair marks where shots actually go.
@@ -1780,6 +2068,7 @@ export function createGame(deps: GameDeps): Game {
 
       spawnTimer = OPENING_CALM
       elapsed = 0
+      tick = 0
       alarmTimer = 0
       searAlarmTimer = 0
       wasSearing = false
@@ -1882,7 +2171,7 @@ export function createGame(deps: GameDeps): Game {
         position: { x: self.position.x, y: self.position.y, z: self.position.z },
         throttle: seat.lastControls.throttle,
         enemiesAirborne: pilots.length,
-        enemiesQueued: queue.length,
+        enemiesQueued: queuedCount(),
         elapsed,
         solarExposure: self.solarExposure,
         overdrive: self.overdriveTimer,
@@ -1891,6 +2180,9 @@ export function createGame(deps: GameDeps): Game {
         pickups: nearestPods,
       }
     },
+
+    capture,
+    apply,
 
     cycleTarget() {
       const seat = local()

@@ -143,6 +143,86 @@ const MUTATIONS = [
     to: '  out.dash = claim.dash === true\n  out.aim = claim.aim as THREE.Vector3 | null',
   },
 
+  /* ---- Snapshots: the world on the wire ----------------------------------- */
+  {
+    name: 'capture never reads shotsFired',
+    file: 'src/game/game.ts',
+    from: '      shotsFired: ship.shotsFired,\n    }\n  }',
+    to: '      shotsFired: 0,\n    }\n  }',
+  },
+  {
+    name: 'apply never writes the hull',
+    file: 'src/game/game.ts',
+    from: '    ship.hull = s.hull\n    ship.throttle = s.throttle',
+    to: '    ship.throttle = s.throttle',
+  },
+  {
+    name: 'apply never writes heat',
+    file: 'src/game/game.ts',
+    from: '    ship.heat = s.heat\n',
+    to: '',
+  },
+  {
+    name: 'apply keeps a hull the host stopped sending',
+    file: 'src/game/game.ts',
+    from: '      if (seen.has(pilotIds.get(pilot) ?? -1)) continue',
+    to: '      continue',
+  },
+  {
+    name: 'apply ignores a lock',
+    file: 'src/game/game.ts',
+    from: '    for (let i = 0; i < seats.length; i++) seats[i].lockedTarget = resolveLock(s.seats[i].lock)',
+    to: '',
+  },
+  {
+    name: "apply reports its own queue, not the host's",
+    file: 'src/game/game.ts',
+    from: '    return mirrored ? mirroredQueued : queue.length',
+    to: '    return queue.length',
+  },
+  {
+    name: 'apply never sets the wreck clock',
+    file: 'src/game/game.ts',
+    from: '        wreck.timer = state.wreckTimer\n',
+    to: '',
+  },
+  {
+    name: 'the snapshot codec drops sinceHit',
+    file: 'src/net/snapshot.ts',
+    from: '  w.f32(s.warpTimer).f32(s.flash).f32(s.sinceHit)',
+    to: '  w.f32(s.warpTimer).f32(s.flash)',
+  },
+  {
+    name: 'the snapshot codec reads big-endian',
+    file: 'src/net/wire.ts',
+    from: '    const v = this.view.getFloat32(this.offset, true)',
+    to: '    const v = this.view.getFloat32(this.offset, false)',
+  },
+  {
+    name: 'a frame with a tail is accepted',
+    file: 'src/net/wire.ts',
+    from: '  finish(): void {\n    if (!this.done) {',
+    to: '  finish(): void {\n    if (false) {',
+  },
+  {
+    name: 'restoring the bolt pool keeps stale bolts alive',
+    file: 'src/game/bolts.ts',
+    from: '      for (let i = 0; i < MAX_BOLTS; i++) pool[i].active = false\n      for (const b of live) {',
+    to: '      for (const b of live) {',
+  },
+  {
+    name: 'an intent frame bypasses admission',
+    file: 'src/net/wire.ts',
+    from: '  return { seat, tick, controls: admitIntent(claim, held, dt, out) }',
+    to: '  return { seat, tick, controls: Object.assign(out, claim, { aim: null, spread: 0 }) }',
+  },
+  {
+    name: 'a squadron hull is captured without its id',
+    file: 'src/game/game.ts',
+    from: '      id: pilotIds.get(pilot) ?? 0,\n      spec: pilot.ship.spec.id,',
+    to: '      id: 0,\n      spec: pilot.ship.spec.id,',
+  },
+
   /* ---- Scoring attribution ----------------------------------------------- */
   {
     name: 'every hit is credited to seat 0',
@@ -483,7 +563,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 454
+const EXPECTED_ASSERTIONS = 500
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 
