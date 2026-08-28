@@ -27,6 +27,9 @@ import {
   type WorldSnapshot,
 } from '../src/net/snapshot'
 import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '../src/net/wire'
+import { createLoopback } from '../src/net/channel'
+import { modeFromLocation } from '../src/net/browser'
+import { createClient, createHost, decodeWelcome, encodeWelcome, FRAME } from '../src/net/session'
 import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
@@ -2148,24 +2151,27 @@ function seatPilots(count: number): SeatPilot[] {
 }
 
 /** One tick: aim every seat at its own locked target, then step them together. */
+/** Point a device at a bearing, or fly straight and fast when there is none. */
+function steer(device: Input & { write: InputState }, t: RunSnapshot['target']): void {
+  if (t) {
+    device.write.pitch = clampTo(t.pitch * 3, -1, 1)
+    device.write.yaw = clampTo(t.yaw * 3, -1, 1)
+    device.write.fire = Math.abs(t.pitch) < 0.35 && Math.abs(t.yaw) < 0.35
+    device.write.throttleUp = t.range > 260
+    device.write.throttleDown = t.range < 170
+  } else {
+    device.write.pitch = 0
+    device.write.yaw = 0
+    device.write.fire = false
+    device.write.throttleUp = true
+    device.write.throttleDown = false
+  }
+}
+
 function flyAll(game: Game, crew: SeatPilot[], intents: Controls[]): void {
   for (let i = 0; i < crew.length; i++) {
-    const { device } = crew[i]
-    const t = game.snapshot(i)?.target ?? null
-    if (t) {
-      device.write.pitch = clampTo(t.pitch * 3, -1, 1)
-      device.write.yaw = clampTo(t.yaw * 3, -1, 1)
-      device.write.fire = Math.abs(t.pitch) < 0.35 && Math.abs(t.yaw) < 0.35
-      device.write.throttleUp = t.range > 260
-      device.write.throttleDown = t.range < 170
-    } else {
-      device.write.pitch = 0
-      device.write.yaw = 0
-      device.write.fire = false
-      device.write.throttleUp = true
-      device.write.throttleDown = false
-    }
-    intents[i] = crew[i].pilot.advance(device.state, STEP)
+    steer(crew[i].device, game.snapshot(i)?.target ?? null)
+    intents[i] = crew[i].pilot.advance(crew[i].device.state, STEP)
   }
   game.step(intents)
 }
@@ -3229,6 +3235,279 @@ function testAnIntentFrameEndsInAdmission(): void {
   wrong[0] = INTENT_VERSION + 1
   refused('an intent frame from another version', wrong)
   check('and none of them wrote to out', JSON.stringify(out) === before)
+}
+
+/**
+ * A match over a wire.
+ *
+ * Host and client are two `Game`s joined by a loopback. Over a perfect wire the
+ * client's world must be the host's world, byte for byte, on every tick — and
+ * the client's stick must actually be flying seat 1 on the host, which is
+ * proved by a second host whose seat 1 hears nothing and fights differently.
+ */
+function testAMatchCrossesTheWire(): void {
+  section('A match crosses the wire')
+
+  const SEED = 0x7a1e
+  const TICKS = Math.ceil(25 / STEP)
+
+  function fly(connected: boolean) {
+    const hostGame = newMatch()
+    const clientGame = newMatch()
+    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: SEED, respawn: true } })
+    host.start()
+    const wire = createLoopback()
+    let welcomed = -1
+    const client = createClient({ game: clientGame, channel: wire.b, onWelcome: (s) => (welcomed = s) })
+    const seat = connected ? host.accept(wire.a) : -2
+    wire.pump()
+
+    const hostDevice = stubInput()
+    const hostPilot = createPilot()
+    const clientDevice = stubInput()
+    const clientPilot = createPilot()
+    let mismatched = 0
+    let first = ''
+    let fought = false
+    for (let i = 0; i < TICKS; i++) {
+      steer(hostDevice, hostGame.snapshot(0)?.target ?? null)
+      steer(clientDevice, clientGame.snapshot(1)?.target ?? null)
+      client.tick(clientPilot.advance(clientDevice.state, STEP))
+      host.tick(hostPilot.advance(hostDevice.state, STEP))
+      wire.pump()
+      if (connected && i > 0) {
+        const h = encodeSnapshot(hostGame.capture())
+        const c = encodeSnapshot(clientGame.capture())
+        if (!sameBytes(h, c)) {
+          mismatched++
+          if (!first) first = `first at tick ${i}`
+        }
+      }
+      const s1 = hostGame.snapshot(1)
+      if (s1 && s1.hull < SHIPS.wasp.maxHull) fought = true
+    }
+    const print = matchPrint(hostGame)
+    const result = { seat, welcomed, mismatched, first, fought, print, host, client, hostTick: client.hostTick }
+    hostGame.dispose()
+    clientGame.dispose()
+    return result
+  }
+
+  const live = fly(true)
+  check('the peer was handed seat 1', live.seat === 1 && live.welcomed === 1, `seat ${live.seat}, welcomed ${live.welcomed}`)
+  check('the host fought a real fight', live.fought)
+  check(`the client's world is the host's on every tick`, live.mismatched === 0, live.first)
+  check('the client applied a snapshot for every host tick', live.hostTick === TICKS, `host tick ${live.hostTick} of ${TICKS}`)
+  check('every intent was admitted and only the first tick was held', live.host.stats.admitted === TICKS && live.host.stats.held <= 1,
+    `admitted ${live.host.stats.admitted}, held ${live.host.stats.held}`)
+  check('nothing was refused, stale or malformed on a perfect wire',
+    live.host.stats.wrongSeat === 0 && live.host.stats.stale === 0 && live.host.stats.malformed === 0 && live.client.stats.stale === 0 && live.client.stats.malformed === 0,
+    JSON.stringify(live.host.stats))
+
+  const deaf = fly(false)
+  check('a seat nobody is flying flies differently', deaf.print !== live.print, 'the client\'s stick changed nothing on the host')
+}
+
+/**
+ * The wire is bad, and the match survives it.
+ *
+ * Thirty percent loss, a tick of latency, up to three ticks of jitter (which
+ * reorders), and a tenth of frames duplicated. Nothing may throw; stale and
+ * duplicated frames must be dropped *and counted*, so the numbers below are the
+ * evidence the wire was actually bad; and whatever tick the client last
+ * applied, its world must be the host's world *at that tick*.
+ */
+function testABadWireIsSurvived(): void {
+  section('A bad wire is survived')
+
+  const TICKS = Math.ceil(20 / STEP)
+  const hostGame = newMatch()
+  const clientGame = newMatch()
+  const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0xbad, respawn: true } })
+  host.start()
+  const wire = createLoopback({ loss: 0.3, latency: 1, jitter: 3, duplicate: 0.1, seed: 99 })
+  const client = createClient({ game: clientGame, channel: wire.b })
+  host.accept(wire.a)
+  // The hello or the welcome may be lost; the client keeps asking. Ticked with
+  // the host idle so nothing about the match depends on how long that took.
+  let waited = 0
+  while (client.seat < 0 && waited < 600) {
+    client.tick(controls())
+    wire.pump()
+    waited++
+  }
+  check('the welcome got through the bad wire because the client kept asking', client.seat === 1, `gave up after ${waited} ticks`)
+
+  const hostDevice = stubInput()
+  const hostPilot = createPilot()
+  const clientDevice = stubInput()
+  const clientPilot = createPilot()
+  const history = new Map<number, Uint8Array>()
+  let threw = ''
+  let checkedAgainstHistory = 0
+  let historyMismatch = 0
+  for (let i = 0; i < TICKS; i++) {
+    try {
+      steer(hostDevice, hostGame.snapshot(0)?.target ?? null)
+      steer(clientDevice, clientGame.snapshot(1)?.target ?? null)
+      client.tick(clientPilot.advance(clientDevice.state, STEP))
+      host.tick(hostPilot.advance(hostDevice.state, STEP))
+      history.set(hostGame.capture().tick, encodeSnapshot(hostGame.capture()))
+      wire.pump()
+      const at = client.hostTick
+      const expected = history.get(at)
+      if (at >= 0 && expected) {
+        checkedAgainstHistory++
+        if (!sameBytes(expected, encodeSnapshot(clientGame.capture()))) historyMismatch++
+      }
+    } catch (e) {
+      threw = `tick ${i}: ${String(e)}`
+      break
+    }
+  }
+  const h = host.stats
+  const c = client.stats
+  check('nothing threw', threw === '', threw)
+  check('frames were actually lost', wire.lost > TICKS * 0.2, `${wire.lost} lost`)
+  check('reordered snapshots were dropped as stale', c.stale > 0, `${c.stale}`)
+  check('reordered or duplicated intents were dropped as stale', h.stale > 0, `${h.stale}`)
+  check('lost intents were held, not zeroed', h.held > 0 && h.held < TICKS, `${h.held}`)
+  check('most intents still got through', h.admitted > TICKS * 0.5, `${h.admitted} of ${TICKS}`)
+  check('nothing was malformed or mis-seated', h.malformed === 0 && h.wrongSeat === 0 && c.malformed === 0, JSON.stringify({ h, c }))
+  check(`the client's world is the host's world at whatever tick it last applied (${checkedAgainstHistory} ticks)`,
+    checkedAgainstHistory > TICKS * 0.5 && historyMismatch === 0, `${historyMismatch} mismatched`)
+  check('the client kept up', client.hostTick > TICKS - 40, `client at ${client.hostTick}, host at ${TICKS}`)
+  hostGame.dispose()
+  clientGame.dispose()
+}
+
+/**
+ * Authorisation is by channel, not by claim; ticks only go forward; a full
+ * match refuses; garbage never reaches the simulation.
+ */
+function testThePeerFliesItsOwnSeatOnly(): void {
+  section('A peer flies its own seat only, once per tick, and garbage stops at the door')
+
+  const hostGame = newMatch()
+  const clientGame = newMatch()
+  const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0x5ea7 } })
+  host.start()
+  const wire = createLoopback()
+  const client = createClient({ game: clientGame, channel: wire.b })
+  host.accept(wire.a)
+  wire.pump()
+
+  const idle = controls({ throttle: 0.6 })
+  const before = hostGame.snapshot(0)!.position
+
+  // Forged: the client claims seat 0 with a hard turn.
+  const forged = new Uint8Array([FRAME.INTENT, ...encodeIntent(0, 5000, controls({ pitch: 1, throttle: 1 }))])
+  wire.b.send(forged)
+  wire.pump()
+  host.tick(idle)
+  check('an intent for another seat is refused', host.stats.wrongSeat === 1 && host.stats.admitted === 0)
+  // Seat 0 flew on `idle`, the host's own intent, and nothing else.
+  const after = hostGame.snapshot(0)!.position
+  check('and seat 0 flew straight on the host\'s own intent', Math.abs(after.y - before.y) < 1 && after.z !== before.z,
+    `${JSON.stringify(before)} -> ${JSON.stringify(after)}`)
+
+  // Replay: the same tick twice.
+  const once = new Uint8Array([FRAME.INTENT, ...encodeIntent(1, 10, controls({ throttle: 1 }))])
+  wire.b.send(once)
+  wire.b.send(once)
+  wire.pump()
+  check('a replayed intent is dropped', host.stats.admitted === 1 && host.stats.stale === 1, JSON.stringify(host.stats))
+  const older = new Uint8Array([FRAME.INTENT, ...encodeIntent(1, 9, controls({ throttle: 1 }))])
+  wire.b.send(older)
+  wire.pump()
+  check('an intent for an earlier tick is dropped', host.stats.stale === 2)
+
+  // Hold: seat 1's last admitted intent carries while nothing arrives. The
+  // intent above ramped the throttle one tick toward 1; thirty idle ticks
+  // later it must still be there, not back at launch throttle.
+  host.tick(idle)
+  const rampedTo = hostGame.snapshot(1)!.throttle
+  for (let i = 0; i < 30; i++) host.tick(idle)
+  check('a seat nothing arrives for holds its last intent', rampedTo > 0.6 && hostGame.snapshot(1)!.throttle === rampedTo,
+    `ramped to ${rampedTo}, thirty idle ticks later ${hostGame.snapshot(1)!.throttle}`)
+  check('and every one of those ticks was counted as held', host.stats.held >= 30, `${host.stats.held}`)
+
+  // Garbage.
+  wire.b.send(new Uint8Array([]))
+  wire.b.send(new Uint8Array([FRAME.INTENT, 9, 9, 9]))
+  wire.b.send(new Uint8Array([77, 1, 2]))
+  wire.pump()
+  check('garbage is counted and goes nowhere', host.stats.malformed === 3, `${host.stats.malformed}`)
+  let stepped = true
+  try {
+    host.tick(idle)
+  } catch {
+    stepped = false
+  }
+  check('and the host keeps ticking', stepped)
+
+  wire.pump()
+  const appliedBefore = client.stats.applied
+  wire.a.send(new Uint8Array([FRAME.SNAPSHOT, 1, 2, 3]))
+  wire.a.send(new Uint8Array([200]))
+  wire.pump()
+  check('the client counts garbage too and applies nothing from it',
+    client.stats.malformed === 2 && client.stats.applied === appliedBefore && appliedBefore > 0,
+    JSON.stringify(client.stats))
+
+  // Two seats, a second peer: refused, told, and closed.
+  const second = createLoopback()
+  let refused = false
+  createClient({ game: newMatch(), channel: second.b, onRefused: () => (refused = true) })
+  const seat = host.accept(second.a)
+  second.pump()
+  check('a peer with no seat to take is refused', seat === -1 && host.stats.refused === 1 && refused && !second.a.open,
+    `seat ${seat}, refused ${refused}, open ${second.a.open}`)
+
+  // A peer leaving frees its seat for the next.
+  wire.a.close()
+  const third = createLoopback()
+  check('a seat freed by a leaving peer is handed to the next', host.accept(third.a) === 1)
+
+  hostGame.dispose()
+  clientGame.dispose()
+
+  /* A lost welcome. The wire eats the first one; the client keeps asking. */
+  const lossy = createLoopback({ loss: 1 })
+  const lateGame = newMatch()
+  const lateHost = createHost({ game: lateGame, setup: { ships: ['hornet', 'wasp'], seed: 0x1a7e } })
+  lateHost.start()
+  const lateClient = createClient({ game: newMatch(), channel: lossy.b })
+  lateHost.accept(lossy.a)
+  lossy.pump()
+  lossy.setLoss(0)
+  lossy.pump()
+  check('the welcome was really lost', lateClient.seat === -1 && lossy.lost === 2, `seat ${lateClient.seat}, lost ${lossy.lost}`)
+  let asked = 0
+  while (lateClient.seat < 0 && asked < 200) {
+    lateClient.tick(controls())
+    lossy.pump()
+    asked++
+  }
+  check('a client that keeps asking is welcomed again', lateClient.seat === 1 && asked > 1, `seat ${lateClient.seat} after ${asked} ticks`)
+  lateGame.dispose()
+
+  /* Welcome framing. */
+  const w = decodeWelcome(encodeWelcome(1, { ships: ['drone', 'wasp'], seed: 0xabc, respawn: true }))
+  check('a welcome round-trips', w.seat === 1 && w.setup.ships.join() === 'drone,wasp' && w.setup.seed === 0xabc && w.setup.respawn === true && w.setup.local === 1)
+  let badSeat = false
+  try {
+    decodeWelcome(encodeWelcome(2, { ships: ['drone', 'wasp'], seed: 1 }))
+  } catch (e) {
+    badSeat = e instanceof RangeError
+  }
+  check('a welcome to a seat that does not exist is refused', badSeat)
+
+  /* The URL decides the mode, and solo is the default the shipped game takes. */
+  check('no query is solo', modeFromLocation('').kind === 'solo')
+  check('?host hosts with a wasp in seat 1', JSON.stringify(modeFromLocation('?host')) === '{"kind":"host","guest":"wasp"}')
+  check('?host=drone picks the guest hull', JSON.stringify(modeFromLocation('?host=drone')) === '{"kind":"host","guest":"drone"}')
+  check('?join=abc123 joins, upper-cased', JSON.stringify(modeFromLocation('?join=abc123')) === '{"kind":"join","code":"ABC123"}')
 }
 
 /**
@@ -6004,6 +6283,9 @@ testTheWorldSurvivesTheWire()
 testAMirrorIsTheHostsMatch()
 testHullsComeAndGoByIdAndBadFramesDoNothing()
 testAnIntentFrameEndsInAdmission()
+testAMatchCrossesTheWire()
+testABadWireIsSurvived()
+testThePeerFliesItsOwnSeatOnly()
 testDeathEitherRespawnsOrResolves()
 testEliminationEndsWhenTheArenaEmpties()
 testAnEliminatedSeatStaysEliminated()

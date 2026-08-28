@@ -20,6 +20,7 @@ import { createGame, STEP } from './game/game'
 import { createHud } from './game/hud'
 import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
+import { joinMatch, modeFromLocation, startHosting, type Hosting, type Joining } from './net/browser'
 import { createHangar } from './ui/hangar'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
 import { createScreens } from './ui/screens'
@@ -66,6 +67,12 @@ function boot() {
   const hud = createHud(overlay)
 
   let pendingResult: RunResult | null = null
+
+  // `?host` or `?join=CODE` on the URL. Solo is the shipped game and takes none
+  // of the branches below; see `net/browser.ts`.
+  const mode = modeFromLocation(window.location.search)
+  let hosting: Hosting | null = null
+  let joining: Joining | null = null
 
   /* ---- Screens ---------------------------------------------------------- */
 
@@ -138,11 +145,54 @@ function boot() {
     // Back to launch throttle. The pilot outlives any one run, so a fresh
     // launch has to say so rather than inheriting the last run's last command.
     pilot.reset()
-    // One seat, and elimination rather than respawn — the shipped game is a match
-    // of one, and its lose condition is the run ending. `MatchSetup.respawn` in
-    // `game/game.ts` says why that is a policy rather than the roster size.
-    game.start({ ships: [id] })
+    if (mode.kind === 'host') {
+      hosting?.stop()
+      hosting = startHosting(game, id, mode.guest, (seat) => hud.callout(`PLAYER ${seat + 1} JOINED`, '#6be6ff', 1.5))
+      showJoinCode(hosting.code)
+    } else {
+      // One seat, and elimination rather than respawn — the shipped game is a match
+      // of one, and its lose condition is the run ending. `MatchSetup.respawn` in
+      // `game/game.ts` says why that is a policy rather than the roster size.
+      game.start({ ships: [id] })
+    }
     input.requestPointerLock()
+  }
+
+  function showJoinCode(code: string) {
+    const url = `${location.origin}${location.pathname}?join=${code}`
+    let el = document.getElementById('netcode')
+    if (!el) {
+      el = document.createElement('div')
+      el.id = 'netcode'
+      el.style.cssText =
+        'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:50;font:13px/1.4 monospace;' +
+        'color:#6be6ff;background:rgba(0,0,0,.55);padding:6px 10px;border:1px solid #6be6ff66;user-select:all'
+      overlay!.append(el)
+    }
+    el.textContent = `JOIN: ${url}`
+    console.log('[neon-orbit] join code', code, url)
+  }
+
+  function startJoining(code: string) {
+    hangar.close()
+    pause.hide()
+    debrief.hide()
+    pilot.reset()
+    audio.setMusic('combat')
+    hud.callout(`JOINING ${code}`, '#6be6ff', 4)
+    joinMatch(game, code, (seat) => {
+      screens.moveTo('flight')
+      hud.callout(`SEAT ${seat + 1}`, '#6be6ff', 1.5)
+      input.requestPointerLock()
+    })
+      .then((j) => {
+        joining = j
+      })
+      .catch((error) => {
+        console.error(error)
+        hud.callout('NO HOST FOUND', '#ff3b4e', 4)
+        openHangar()
+      })
   }
 
   /*
@@ -243,7 +293,10 @@ function boot() {
         // arrived rather than ones it produced. The simulation is handed one
         // intent per seat and never asks which of those a device produced.
         intents[0] = pilot.advance(input.state, STEP)
-        game.step(intents)
+        if (hosting) hosting.tick(intents[0])
+        else if (joining) joining.tick(intents[0])
+        else if (mode.kind === 'join') void 0 // waiting on the wire: the host's snapshots drive the game
+        else game.step(intents)
       }
       game.render(alpha, frameSeconds)
     }
@@ -256,7 +309,8 @@ function boot() {
       splashCleared = true
       splash.classList.add('done')
       window.setTimeout(() => splash.remove(), 600)
-      openHangar()
+      if (mode.kind === 'join') startJoining(mode.code)
+      else openHangar()
     }
 
     requestAnimationFrame(frame)
@@ -265,6 +319,8 @@ function boot() {
   requestAnimationFrame(frame)
 
   window.addEventListener('beforeunload', () => {
+    hosting?.stop()
+    joining?.stop()
     game.dispose()
     hangar.dispose()
     pause.dispose()

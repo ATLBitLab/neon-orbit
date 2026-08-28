@@ -223,6 +223,50 @@ const MUTATIONS = [
     to: '      id: 0,\n      spec: pilot.ship.spec.id,',
   },
 
+  /* ---- Transport: the session protocol ------------------------------------ */
+  {
+    name: 'the host flies whatever seat an intent claims',
+    file: 'src/net/session.ts',
+    from: '    if (frame.seat !== peer.seat) {\n      stats.wrongSeat++\n      return\n    }',
+    to: '',
+  },
+  {
+    name: 'the host replays an intent for a tick already flown',
+    file: 'src/net/session.ts',
+    from: '    if (frame.tick <= peer.lastTick) {\n      stats.stale++\n      return\n    }',
+    to: '',
+  },
+  {
+    name: 'a lost intent snaps the seat to neutral',
+    file: 'src/net/session.ts',
+    from: '          admitIntent(undefined, held, STEP, scratch)\n          Object.assign(held, scratch)',
+    to: '          Object.assign(held, neutral())',
+  },
+  {
+    name: 'the client applies a snapshot older than the last',
+    file: 'src/net/session.ts',
+    from: '        if (world.tick <= hostTick) {\n          stats.stale++\n          return\n        }',
+    to: '',
+  },
+  {
+    name: 'the host seats a peer where there is no seat',
+    file: 'src/net/session.ts',
+    from: '      const seat = peers.findIndex((p, i) => i > 0 && p === null)',
+    to: '      const seat = Math.max(1, peers.findIndex((p, i) => i > 0 && p === null))',
+  },
+  {
+    name: 'a repeated hello is ignored',
+    file: 'src/net/session.ts',
+    from: '      peer.channel.send(encodeWelcome(peer.seat, setup))\n      return',
+    to: '      return',
+  },
+  {
+    name: 'the loopback never loses a frame',
+    file: 'src/net/channel.ts',
+    from: '        if (rng() < loss) {',
+    to: '        if (false) {',
+  },
+
   /* ---- Scoring attribution ----------------------------------------------- */
   {
     name: 'every hit is credited to seat 0',
@@ -563,7 +607,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 500
+const EXPECTED_ASSERTIONS = 536
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

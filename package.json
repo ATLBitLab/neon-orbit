@@ -15,6 +15,7 @@
     "check": "npm run typecheck && npm run check:sim && npm run check:balance"
   },
   "dependencies": {
+    "nostr-tools": "^2.25.0",
     "three": "^0.185.1"
   },
   "devDependencies": {
