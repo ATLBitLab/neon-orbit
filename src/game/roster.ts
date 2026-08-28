@@ -211,7 +211,31 @@ export function createSeats(specs: readonly ShipSpec[], runSeed: number): Partic
   })
 }
 
-/** Copy this tick's intent into the seat, without retaining the caller's object. */
+/**
+ * Copy this tick's intent into the seat, without retaining the caller's object —
+ * and, since milestone 4, this copy is what the seat's hull actually flies.
+ *
+ * The record and the simulated intent used to be two things: `step` copied the
+ * caller's struct here and then flew the caller's struct. Now `Game.step` flies
+ * `seat.lastControls`, so "what was recorded" and "what was simulated" are one
+ * object by construction, and this function is where a seat's intent is *admitted*
+ * rather than merely noted. Two fields do not survive admission, deliberately:
+ *
+ * - **`aim` is dropped.** It is the AI's lead solution and the AI never sits in a
+ *   seat. Left in the struct that is about to become the packet format, it is a
+ *   fire-direction override: a sender who sets one vector shoots wherever they
+ *   like regardless of where the nose points. A seat shoots along its nose, full
+ *   stop, and the flight model reads `null` as exactly that.
+ * - **`spread` is zeroed.** The only legal value for a seat is already zero, so
+ *   this changes nothing for any producer that exists — but a positive spread
+ *   also *draws from the seat's gun RNG*, so a remote sender could desynchronise
+ *   the fight for everyone by supplying one. Zero draws nothing.
+ *
+ * Deflection and throttle are *not* bounded here: `Ship` clamps them itself, and
+ * a rule with two implementations is the defect this repository keeps finding.
+ * Rate-limiting the throttle is a wire-boundary policy and lives in
+ * `admitIntent` — see `intent.ts` for why it is not applied to every caller.
+ */
 export function recordControls(seat: Participant, c: Controls): void {
   const held = seat.lastControls
   held.pitch = c.pitch
@@ -220,10 +244,8 @@ export function recordControls(seat: Participant, c: Controls): void {
   held.throttle = c.throttle
   held.fire = c.fire
   held.dash = c.dash
-  held.spread = c.spread
-  // `aim` is a vector the producer owns and nothing downstream of here reads it,
-  // so the reference is neither copied nor kept.
   held.aim = null
+  held.spread = 0
 }
 
 /**

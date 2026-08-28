@@ -1379,7 +1379,10 @@ export function createGame(deps: GameDeps): Game {
       }
       if (seat.phase.kind === 'eliminated' || !seat.ship.alive) continue
       recordControls(seat, intents[i])
-      seat.ship.step(intents[i], STEP, ctx)
+      // The hull flies the *record*, not the caller's struct: admission — `aim`
+      // dropped, `spread` zeroed — happens in `recordControls`, and flying its
+      // output is what makes the record the truth rather than a copy of it.
+      seat.ship.step(seat.lastControls, STEP, ctx)
     }
 
     /* Enemies. Each pilot thinks and immediately steps, so `controls.aim` is
