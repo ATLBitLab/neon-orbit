@@ -196,6 +196,19 @@ versioned; a short, long or foreign frame throws before anything is applied) and
 frame, whose decoder ends in `admitIntent`. `simcheck` flies a host on the autopilot and demands
 that a mirror fed its snapshots re-encodes to the host's exact bytes on every tick.
 
+**Two browsers, one arena: the wire.** `src/net/session.ts` is the protocol and it is headless:
+a host hands each peer a seat and the `MatchSetup` (WELCOME), takes tick-stamped intent frames back
+(a peer drives only the seat it was given — authorisation is by channel, not by claim; a tick at
+or before the last one flown is a replay and dropped; a missing tick holds the last intent minus
+the triggers), and sends a snapshot every tick. `simcheck` runs it over `src/net/channel.ts`'s
+loopback, once perfect (the client's world equals the host's byte for byte every tick) and once
+with 30% loss, jitter and duplicates (nothing throws, every drop is counted, the client's world
+equals the host's at whatever tick it last applied). The browser adapters are thin and carry no
+policy: `webrtc.ts` (an unordered, no-retransmit `RTCDataChannel`) and `signal.ts` (offer/answer
+over Nostr ephemeral events on public relays, so there is nothing to run — SDP is plaintext there,
+which is named in the file rather than solved). **Try it:** open `?host` in one tab, launch, copy
+the join URL it shows, open it in another tab. `?host=drone` picks the guest's hull.
+
 **Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
 `eliminated` — one field with three shapes, because the version that used a nullable wreck meant
 "never died" and "died, cutscene over" with the same value and so restarted an eliminated seat's
