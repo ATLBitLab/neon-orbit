@@ -267,6 +267,38 @@ const MUTATIONS = [
     to: '        if (false) {',
   },
 
+  /* ---- Prediction ---------------------------------------------------------- */
+  {
+    name: 'reconcile never replays',
+    file: 'src/game/game.ts',
+    from: '    for (const c of replay) s.ship.step(c, STEP, dryCtx)\n',
+    to: '',
+  },
+  {
+    name: 'predict records the intent but never flies it',
+    file: 'src/game/game.ts',
+    from: '    recordControls(s, controls)\n    s.ship.step(s.lastControls, STEP, dryCtx)',
+    to: '    recordControls(s, controls)',
+  },
+  {
+    name: 'the host never acknowledges an intent',
+    file: 'src/net/session.ts',
+    from: '        game.acknowledge(seat, peer ? peer.flownTick : -1)',
+    to: '        game.acknowledge(seat, -1)',
+  },
+  {
+    name: 'the client replays intents the host already flew',
+    file: 'src/net/session.ts',
+    from: '          while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()\n',
+    to: '',
+  },
+  {
+    name: 'a predicted shot fires a real bolt',
+    file: 'src/game/game.ts',
+    from: '    bolts: { ...bolts, fire() {} },',
+    to: '    bolts,',
+  },
+
   /* ---- Scoring attribution ----------------------------------------------- */
   {
     name: 'every hit is credited to seat 0',
@@ -607,7 +639,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 536
+const EXPECTED_ASSERTIONS = 548
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

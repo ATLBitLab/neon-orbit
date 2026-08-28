@@ -209,6 +209,16 @@ over Nostr ephemeral events on public relays, so there is nothing to run — SDP
 which is named in the file rather than solved). **Try it:** open `?host` in one tab, launch, copy
 the join URL it shows, open it in another tab. `?host=drone` picks the guest's hull.
 
+**A joined player's stick is attached to their ship.** A client flies its own hull the moment
+the stick moves — `Game.predict` steps that one seat locally on the same flight model, guns into
+nothing — and the host's snapshot carries, per seat, the client intent tick it last flew
+(`ackTick`). On every snapshot the client resets to the host's truth and `Game.reconcile`s by
+replaying its unacknowledged intents on top, keeping the previous pose where the hull was last
+drawn so a correction slides over one frame rather than snapping. Flight is deterministic, so on a
+clean wire there is nothing to correct: `simcheck` asserts the host's truth lands within 0.1 units
+of what the client predicted for every acknowledged intent, and that a client with prediction off
+trails by the wire's latency. Bolts and hits are never predicted; they arrive with the truth.
+
 **Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
 `eliminated` — one field with three shapes, because the version that used a nullable wreck meant
 "never died" and "died, cutscene over" with the same value and so restarted an eliminated seat's
