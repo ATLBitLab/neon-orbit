@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "check:sim": "esbuild scripts/simcheck.ts --bundle --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/simcheck.mjs --log-level=warning && node node_modules/.cache/simcheck.mjs",
     "check:balance": "esbuild scripts/balance.ts --bundle --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/balance.mjs --log-level=warning && node node_modules/.cache/balance.mjs",
+    "check:mutants": "node scripts/mutate.mjs",
     "check": "npm run typecheck && npm run check:sim && npm run check:balance"
   },
   "dependencies": {

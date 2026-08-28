@@ -164,7 +164,19 @@ export class Ship implements BoltTarget {
   /** Seconds of burn banked since the last sear tick. */
   private searTimer = 0
 
-  onDeath?: (ship: Ship) => void
+  /**
+   * `from` is the faction the fatal hit was blamed on, and it is here because a
+   * bounty now has to find a *seat*.
+   *
+   * With one human it did not: whoever fired the last shot, the kill and the
+   * bounty went to the only scoreline there was, so the callback did not need to
+   * say who. With a roster it does — and the honest cases are the ones where the
+   * answer is nobody. Sear is self-attributed, so a hostile that flies into the
+   * star reports the AI faction here and no seat matches it. See `creditKill` in
+   * `roster.ts` for what happens then; it is not the same answer `onDamaged`
+   * gives, deliberately.
+   */
+  onDeath?: (ship: Ship, from: Faction) => void
   onDamaged?: (ship: Ship, amount: number, from: Faction) => void
   /** Fired instead of `onDamaged` when a Shield ate the hit. */
   onShielded?: (ship: Ship, amount: number) => void
@@ -668,7 +680,7 @@ export class Ship implements BoltTarget {
     if (this.hull <= 0) {
       this.hull = 0
       this.alive = false
-      this.onDeath?.(this)
+      this.onDeath?.(this, from)
     }
   }
 

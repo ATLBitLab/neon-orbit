@@ -107,6 +107,19 @@ export const STREAM = {
    * drew at all.
    */
   enemyGuns: 0x6011,
-  /** The player's gun spread. Zero today, so it never draws — see above. */
+  /**
+   * Gun spread for a seat in the roster, offset by seat index.
+   *
+   * Seat 0 draws from the bare label, which is the stream the single player has
+   * always used, so adding seats cannot move an existing one. Thousands of
+   * labels clear of `enemyGuns` above, which is the collision that bug describes.
+   */
   playerGuns: 0x3d02,
+  /**
+   * Where a seat comes back. Its own label rather than sharing `spawn`, so a
+   * respawn cannot shift the enemy arrival points for the rest of the match — a
+   * run in which nobody dies must draw the same squadron as one in which
+   * somebody does.
+   */
+  respawn: 0xb0c4,
 } as const

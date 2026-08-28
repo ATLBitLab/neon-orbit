@@ -119,8 +119,10 @@ duration is safe in a way stacking magnitude is not: the effect is a fixed 2× w
 pod or four, so the ceiling never moves and there is only one number to check. The HUD carries a
 gauge and a live second count for each buff, and a centre countdown for the last five seconds.
 
-Pods are player-only: nothing in `EnemyPilot` steers toward one, so a hostile collecting one would
-be a coin flip with no tell and no counterplay — see the note at the top of `src/world/pickups.ts`.
+Pods are offered to participants only: nothing in `EnemyPilot` steers toward one, so a hostile
+collecting one would be a coin flip with no tell and no counterplay — see the note at the top of
+`src/world/pickups.ts`. The argument turns on steering rather than on sides, which is why it now
+reads "every seat in the roster" rather than "the player".
 
 ## How it fits together
 
@@ -133,7 +135,15 @@ src/
   ui/       hangar, pause and debrief screens
 scripts/
   simcheck.ts   headless simulation checks
+  balance.ts    the balance contract
+  mutate.mjs    mutation runs against simcheck — `npm run check:mutants`
 ```
+
+`mutate.mjs` breaks the code in one named way per entry and asserts the suite *reports* it. It
+exists because every "would catch this" claim in this repo's review history was a run pasted from
+someone's terminal, which is the same weakness the recorded baseline in `simcheck.ts` was added to
+fix. Note its third and fourth verdicts: a mutant caught only by a crash, or one that names its
+assertion and then aborts, has hidden every check after it and counts as a gap rather than a pass.
 
 A few decisions worth knowing before changing things:
 
@@ -141,6 +151,38 @@ A few decisions worth knowing before changing things:
 move ships — it produces the same `Controls` struct the player produces and hands it to
 `Ship.step`. An enemy Wasp is fast because a Wasp is fast, so it cannot cheat, and a balance
 change lands on both sides at once.
+
+**There is no `player` — there is a roster and a seat being drawn.** `Game.start` takes a
+`MatchSetup` with one hull per seat, and `Game.step` takes **one `Controls` per seat**, so a ship
+is flown by whatever intent was supplied for it and the simulation never asks where that came
+from. Single-player is a match of one. The dividing line is worth stating exactly, because
+everything else follows from it: **a seat decides outcomes, `local` only decides what is drawn.**
+The camera, HUD, alarms and gun pitch read `local`; nothing that reads it may reach a hull, a
+score or a result, or two machines watching one match would disagree about what happened in it.
+`simcheck` asserts that directly by flying the same seed and the same intents from both seats and
+demanding the two matches be identical — which is how two real leaks were found, both invisible
+with one seat.
+
+A faction is a seat index, minted through `humanFaction` and resolved back the other way by
+lookup (`seatOf`). Never `humanFaction(seats.indexOf(x))`: `indexOf` returns -1 on a miss and -1
+*is* the AI faction, so that line silently puts a human on the NPC side, where friendly fire makes
+them unable to shoot the filler and the filler unable to shoot back. A miss has to mean "nobody",
+which is a real answer, rather than a faction picked for it.
+
+**Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
+`eliminated` — one field with three shapes, because the version that used a nullable wreck meant
+"never died" and "died, cutscene over" with the same value and so restarted an eliminated seat's
+explosion every 2.4 seconds. `MatchSetup.respawn` decides whether a finished cutscene returns the
+seat to the arena or leaves it out; the shipped single-player game leaves it off, because a run
+that cannot be lost has no debrief to reach. Either way one participant's death does not stop the
+arena — the squadron keeps flying and the wreck tumbles inside the ordinary tick.
+
+**The match waits for every explosion it started.** It resolves when every seat is `eliminated`,
+not when nobody is left *flying*: a seat mid-cutscene is neither, and treating it as finished let
+one wreck's resolution clear another out from under it 85 ticks into its 144. A win is gated the
+same way, because the squadron can empty on the very tick somebody dies. And it resolves on the
+roster's state rather than the drawn seat's, or two machines watching one match would end it at
+different moments.
 
 **The simulation runs on a fixed step; rendering runs on the frame.** `Game.step()` advances
 exactly 1/60s and takes no delta — there is deliberately no argument for a caller to vary.
@@ -160,7 +202,7 @@ lever the whole three-airframe design rests on — was not really one number. Ke
 separate: nothing in `step` may read the camera or write a mesh transform, and nothing in
 `render` may write simulation state.
 
-There is exactly one exception, and it is narrow. `stepDeathSequence` applies the wreck's
+There is exactly one exception, and it is narrow. `stepWreck` applies the wreck's
 *rotation* to the mesh from inside `step`. It earns that because the tumble accumulates —
 `g.quaternion.multiply(spin)` compounds whatever the mesh already holds rather than being a
 function of elapsed time — so running it per frame would make the tumble rate depend on the
@@ -177,7 +219,7 @@ invariant directly by drawing one frozen simulation state at three blends and ch
 is the midpoint of the outer two.
 
 **Gameplay randomness comes from the run seed, never `Math.random()`.** `Game.start` takes an
-optional seed and reports it back through `snapshot().seed`. Everything that decides an outcome
+optional seed in its `MatchSetup` and reports it back through `snapshot().seed`. Everything that decides an outcome
 — squadron order, arrival points, AI wander and break timing, gun spread — draws from a
 substream of it (`subRng` in `src/core/rng.ts`), so a run is a function of its seed and its
 inputs and nothing else. Cosmetic scatter — particles, camera shake, wreck sparks — is exempt
