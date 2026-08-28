@@ -157,6 +157,35 @@ export interface Bolts {
   render(alpha: number): void
   clear(): void
   dispose(): void
+  /**
+   * Visit every live bolt by pool slot. For the host's snapshot: the slot is
+   * the identity a mirror needs to carry `prev` across ticks.
+   */
+  each(visit: (slot: number, bolt: BoltView) => void): void
+  /**
+   * Overwrite the pool from a snapshot: every listed slot becomes live with
+   * exactly this state, every other slot goes dark. Nothing about the pool's
+   * own lifetimes or hits survives — a mirror's bolts are drawn, not flown.
+   */
+  restore(live: readonly BoltRestore[]): void
+}
+
+/** A live bolt, read-only, as `each` presents it. */
+export interface BoltView {
+  readonly pos: THREE.Vector3
+  readonly prev: THREE.Vector3
+  readonly vel: THREE.Vector3
+  readonly faction: Faction
+  readonly color: THREE.Color
+}
+
+export interface BoltRestore {
+  slot: number
+  pos: { x: number; y: number; z: number }
+  prev: { x: number; y: number; z: number }
+  vel: { x: number; y: number; z: number }
+  faction: Faction
+  color: { x: number; y: number; z: number }
 }
 
 const FORWARD = new THREE.Vector3(0, 0, 1)
@@ -358,6 +387,28 @@ export function createBolts(): Bolts {
         mesh.setMatrixAt(i, hidden)
       }
       mesh.instanceMatrix.needsUpdate = true
+    },
+
+    each(visit) {
+      for (let i = 0; i < MAX_BOLTS; i++) if (pool[i].active) visit(i, pool[i])
+    },
+
+    restore(live) {
+      for (let i = 0; i < MAX_BOLTS; i++) pool[i].active = false
+      for (const b of live) {
+        const bolt = pool[b.slot]
+        if (!bolt) continue
+        bolt.active = true
+        bolt.pos.set(b.pos.x, b.pos.y, b.pos.z)
+        bolt.prev.set(b.prev.x, b.prev.y, b.prev.z)
+        bolt.vel.set(b.vel.x, b.vel.y, b.vel.z)
+        // Drawn, not flown: a mirror never calls `update`, so life and damage
+        // are set to values that would be harmless if it ever did.
+        bolt.life = BOLT_LIFETIME
+        bolt.damage = 0
+        bolt.faction = b.faction
+        bolt.color.setRGB(b.color.x, b.color.y, b.color.z)
+      }
     },
 
     dispose() {

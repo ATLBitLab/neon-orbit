@@ -184,6 +184,18 @@ deliberately not applied inside `Game.step`: its callers are the host's own code
 suite drives seats on snapped throttles, and the wire boundary that unpacks a packet is what
 calls `admitIntent`.
 
+**The world crosses the wire as a snapshot a mirror draws, not a state it continues.** Under a
+host-authoritative model the client never runs the host's simulation forward, so
+`src/net/snapshot.ts` carries what a client needs to *show* the match — every hull's visible
+state (squadron hulls with a stable spawn id), every seat's scoreline and phase, the bolt pool by
+slot, pods and mines — and nothing it would need to *continue* it: no AI brains, no RNG streams,
+no spawn queue. `Game.capture()` fills one, `Game.apply()` writes one back, and a mirror is a
+`Game` that `start`s the same `MatchSetup`, never calls `step`, and applies each tick's snapshot
+before rendering as normal. `src/net/wire.ts` is the byte codec (little-endian, float32,
+versioned; a short, long or foreign frame throws before anything is applied) and the intent
+frame, whose decoder ends in `admitIntent`. `simcheck` flies a host on the autopilot and demands
+that a mirror fed its snapshots re-encodes to the host's exact bytes on every tick.
+
 **Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
 `eliminated` — one field with three shapes, because the version that used a nullable wreck meant
 "never died" and "died, cutscene over" with the same value and so restarted an eliminated seat's
