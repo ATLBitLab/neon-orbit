@@ -34,7 +34,7 @@ import { STEP, type Game, type MatchSetup } from '../game/game'
 import type { Controls } from '../game/ship'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import type { Channel } from './channel'
-import { decodeSnapshot, encodeSnapshot } from './snapshot'
+import { decodeSnapshot, encodeSnapshot, type WorldSnapshot } from './snapshot'
 import { ByteReader, ByteWriter, decodeIntent, encodeIntent } from './wire'
 
 export const PROTOCOL_VERSION = 1
@@ -280,7 +280,7 @@ export function createHost(options: HostOptions): Host {
 /* ---- Client --------------------------------------------------------------- */
 
 export interface ClientStats {
-  /** Snapshots dropped for being older than one already applied. */
+  /** Snapshots dropped for being older than one already applied or already waiting. */
   stale: number
   /** Frames that could not be decoded, or that failed to apply. */
   malformed: number
@@ -288,7 +288,26 @@ export interface ClientStats {
   applied: number
   /** Intents sent. */
   sent: number
+  /** Ticks flown with nothing to apply, on the last velocity. */
+  coasted: number
+  /** Extra snapshots applied in one tick to drain a backlog — each a tick skipped on screen. */
+  skipped: number
 }
+
+/**
+ * How many snapshots a client will hold back before it starts skipping them.
+ *
+ * A client applies one snapshot per tick of its own rather than each as it
+ * arrives, and this is the depth the queue is allowed to reach before it drains
+ * two a tick. Four ticks is 67 ms of jitter absorbed, and the queue only fills
+ * to what the wire actually needs: a snapshot that arrives late leaves a tick
+ * with nothing to apply, and the tick after it holds one more than before. See
+ * `createClient`.
+ */
+export const SNAPSHOT_DEPTH = 4
+
+/** Snapshots held waiting at most; beyond this the oldest are dropped unapplied. */
+export const SNAPSHOT_QUEUE = 16
 
 export interface ClientOptions {
   game: Game
@@ -303,6 +322,14 @@ export interface ClientOptions {
   onWelcome?: (seat: number) => void
   /** Called if the host had no seat. */
   onRefused?: () => void
+  /**
+   * Apply snapshots one per tick of this client's own clock, holding what the
+   * wire delivers early and coasting through what it delivers late. On by
+   * default. Off, a snapshot is applied the moment it arrives — which draws the
+   * arena to the wire's rhythm rather than the frame's, and a wire's rhythm is
+   * not smooth. Left as a switch so the difference is measurable.
+   */
+  pace?: boolean
 }
 
 export interface Client {
@@ -314,20 +341,101 @@ export interface Client {
   tick(controls: Controls): void
   /** The host tick of the last snapshot applied, or -1. */
   readonly hostTick: number
+  /** Snapshots arrived and not yet applied. */
+  readonly waiting: number
   readonly stats: ClientStats
 }
 
 export function createClient(options: ClientOptions): Client {
   const { game, channel } = options
-  const stats: ClientStats = { stale: 0, malformed: 0, applied: 0, sent: 0 }
+  const stats: ClientStats = { stale: 0, malformed: 0, applied: 0, sent: 0, coasted: 0, skipped: 0 }
   const predict = options.predict ?? true
+  const pace = options.pace ?? true
   let seat = -1
   let tick = 0
   let hostTick = -1
   /** Every intent sent since the last acknowledged one, oldest first. */
   const buffer: { tick: number; controls: Controls }[] = []
+  /**
+   * Snapshots arrived and not yet applied, oldest first.
+   *
+   * The wire delivers to its own rhythm — two in one tick, none the next — and
+   * a mirror that applied each on arrival would draw to that rhythm: the frame
+   * blends between the last two poses at a factor taken from the *local* clock,
+   * so a pair that advanced twice between frames jumps and a pair that did not
+   * advance slides back. Applying one per local tick instead makes the pair
+   * advance exactly as the frame expects. The queue holds whatever arrived
+   * early; a tick that finds it empty coasts (`Game.coast`); and a queue deeper
+   * than `SNAPSHOT_DEPTH` drains two a tick, so the picture never falls further
+   * behind the wire than that.
+   */
+  const queue: WorldSnapshot[] = []
+  /** The host tick the client last coasted from, so a gap is coasted once, not forever. */
+  let coastedAt = -2
 
   channel.send(encodeHello())
+
+  function applySnapshot(world: WorldSnapshot): void {
+    game.apply(world)
+    hostTick = world.tick
+    stats.applied++
+    if (predict) {
+      // Drop everything the host has flown, replay the rest on its truth.
+      const ack = world.seats[seat]?.ackTick ?? -1
+      while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()
+      game.reconcile(
+        seat,
+        buffer.map((b) => b.controls),
+      )
+    }
+  }
+
+  /** Keep the queue sorted by tick, with no tick twice. Returns false for one not worth keeping. */
+  function enqueue(world: WorldSnapshot): boolean {
+    let at = queue.length
+    while (at > 0 && queue[at - 1].tick > world.tick) at--
+    if (at > 0 && queue[at - 1].tick === world.tick) return false
+    queue.splice(at, 0, world)
+    if (queue.length > SNAPSHOT_QUEUE) queue.shift()
+    return true
+  }
+
+  function coast(): void {
+    game.coast(predict ? seat : -1)
+    stats.coasted++
+    coastedAt = hostTick
+  }
+
+  /**
+   * One tick's worth of the world: the next snapshot, a second if behind, or a
+   * coast.
+   *
+   * A coast stands in for the tick after the last one applied, and it is taken
+   * in two cases. Nothing waiting is the obvious one. The other is the next
+   * snapshot waiting being *not the next tick* — the one before it is late or
+   * lost — and nothing having been coasted since the last apply: one coast
+   * covers the missing tick's motion either way, and if the straggler arrives
+   * meanwhile it sorts to the front and is applied next. Without this, a
+   * snapshot reordered past its predecessor was applied on arrival and the
+   * predecessor dropped as stale — a tick skipped on screen every time the wire
+   * reordered while the queue was still shallow, which is every session's first
+   * hundred milliseconds.
+   */
+  function advance(): void {
+    if (queue.length === 0) {
+      if (hostTick >= 0) coast()
+      return
+    }
+    if (hostTick >= 0 && queue[0].tick > hostTick + 1 && coastedAt !== hostTick) {
+      coast()
+      return
+    }
+    applySnapshot(queue.shift()!)
+    if (queue.length > SNAPSHOT_DEPTH) {
+      applySnapshot(queue.shift()!)
+      stats.skipped++
+    }
+  }
 
   channel.onMessage((bytes) => {
     if (bytes.length === 0) {
@@ -361,18 +469,11 @@ export function createClient(options: ClientOptions): Client {
           stats.stale++
           return
         }
-        game.apply(world)
-        hostTick = world.tick
-        stats.applied++
-        if (predict) {
-          // Drop everything the host has flown, replay the rest on its truth.
-          const ack = world.seats[seat]?.ackTick ?? -1
-          while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()
-          game.reconcile(
-            seat,
-            buffer.map((b) => b.controls),
-          )
+        if (!pace) {
+          applySnapshot(world)
+          return
         }
+        if (!enqueue(world)) stats.stale++
       } catch {
         stats.malformed++
       }
@@ -393,6 +494,8 @@ export function createClient(options: ClientOptions): Client {
         if (++tick % HELLO_EVERY === 0) channel.send(encodeHello())
         return
       }
+      // The world first, then this seat's own step on top of it.
+      if (pace) advance()
       const sent = tick++
       channel.send(withType(FRAME.INTENT, encodeIntent(seat, sent, controls)))
       stats.sent++
@@ -410,6 +513,9 @@ export function createClient(options: ClientOptions): Client {
     },
     get hostTick() {
       return hostTick
+    },
+    get waiting() {
+      return queue.length
     },
     get stats() {
       return stats

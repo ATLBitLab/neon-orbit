@@ -168,6 +168,13 @@ export interface Bolts {
    * own lifetimes or hits survives — a mirror's bolts are drawn, not flown.
    */
   restore(live: readonly BoltRestore[]): void
+  /**
+   * Carry every live bolt one `dt` along its velocity, keeping the tick pose for
+   * interpolation, and decide nothing: no lifetimes, no hits. For a mirror on the
+   * tick no snapshot arrived — a bolt is the fastest thing on screen, so a pool
+   * left where the last snapshot put it is the stall the eye catches first.
+   */
+  coast(dt: number): void
 }
 
 /** A live bolt, read-only, as `each` presents it. */
@@ -408,6 +415,15 @@ export function createBolts(): Bolts {
         bolt.damage = 0
         bolt.faction = b.faction
         bolt.color.setRGB(b.color.x, b.color.y, b.color.z)
+      }
+    },
+
+    coast(dt) {
+      for (let i = 0; i < MAX_BOLTS; i++) {
+        const bolt = pool[i]
+        if (!bolt.active) continue
+        bolt.prev.copy(bolt.pos)
+        bolt.pos.addScaledVector(bolt.vel, dt)
       }
     },
 

@@ -305,6 +305,13 @@ export interface Game {
   reconcile(seat: number, replay: readonly Controls[]): void
   /** Host only: record the client intent tick a seat just flew, for the next snapshot. */
   acknowledge(seat: number, tick: number): void
+  /**
+   * Mirror only: no snapshot arrived for this tick, so carry every hull and bolt
+   * one tick along its last velocity — except the seat given, which is being
+   * predicted and moves on its own intent. See the implementation for why this
+   * is not a stall.
+   */
+  coast(except: number): void
   dispose(): void
 }
 
@@ -1387,6 +1394,39 @@ export function createGame(deps: GameDeps): Game {
     if (seat >= 0 && seat < acks.length) acks[seat] = tick
   }
 
+  /**
+   * The mirror's tick when nothing arrived.
+   *
+   * A paced client applies one snapshot per tick of its own, so the pose the
+   * frame blends from is always one tick behind the pose it blends to. On a
+   * tick the wire delivered nothing there is no new pose, and leaving the pair
+   * alone is wrong in a way that is visible: the blend factor restarts at zero
+   * against the *same* pair, so every hull slides back up to a tick and
+   * re-covers it. Copying the pose forward instead freezes everything for a
+   * tick. Carrying it along the last velocity — exactly what `Ship.step` and
+   * the bolt pool do to a position in one tick — is a hold that keeps moving,
+   * and on straight flight it lands where the missing snapshot would have.
+   * Orientation is held: a hull's turn rate is not sent.
+   *
+   * Only hulls the mirror does not fly: the predicted seat has its own step
+   * this tick, and a wreck's drift is the same coast the host does.
+   */
+  function coast(except: number): void {
+    if (!mirrored) return
+    for (const seat of seats) {
+      if (seat.index === except || seat.phase.kind === 'eliminated') continue
+      carry(seat.ship)
+    }
+    for (const pilot of pilots) carry(pilot.ship)
+    bolts.coast(STEP)
+  }
+
+  function carry(ship: Ship): void {
+    ship.prevPosition.copy(ship.position)
+    ship.prevQuaternion.copy(ship.quaternion)
+    ship.position.addScaledVector(ship.velocity, STEP)
+  }
+
   /* ---- Snapshots --------------------------------------------------------- */
 
   function readShip(ship: Ship): ShipState {
@@ -2260,6 +2300,7 @@ export function createGame(deps: GameDeps): Game {
     predict,
     reconcile,
     acknowledge,
+    coast,
 
     cycleTarget() {
       const seat = local()

@@ -201,9 +201,9 @@ a host hands each peer a seat and the `MatchSetup` (WELCOME), takes tick-stamped
 (a peer drives only the seat it was given — authorisation is by channel, not by claim; a tick at
 or before the last one flown is a replay and dropped; a missing tick holds the last intent minus
 the triggers), and sends a snapshot every tick. `simcheck` runs it over `src/net/channel.ts`'s
-loopback, once perfect (the client's world equals the host's byte for byte every tick) and once
-with 30% loss, jitter and duplicates (nothing throws, every drop is counted, the client's world
-equals the host's at whatever tick it last applied). The browser adapters are thin and carry no
+loopback, once perfect (the client's world equals the host's byte for byte at every tick it
+applies) and once with 30% loss, jitter and duplicates (nothing throws, every drop is counted,
+the client's world equals the host's at whatever tick it last applied). The browser adapters are thin and carry no
 policy: `webrtc.ts` (an unordered, no-retransmit `RTCDataChannel`) and `signal.ts` (offer/answer
 over Nostr ephemeral events on public relays, so there is nothing to run — SDP is plaintext there,
 which is named in the file rather than solved). **Try it:** open `?host` — the join code and a
@@ -230,6 +230,24 @@ drawn so a correction slides over one frame rather than snapping. Flight is dete
 clean wire there is nothing to correct: `simcheck` asserts the host's truth lands within 0.1 units
 of what the client predicted for every acknowledged intent, and that a client with prediction off
 trails by the wire's latency. Bolts and hits are never predicted; they arrive with the truth.
+
+**The picture moves to the frame's clock, not the wire's.** A wire delivers to its own rhythm —
+two snapshots in one tick, none the next — and a client that applied each as it arrived drew to
+that rhythm: the frame blends between the last two poses at a factor from the *local* clock, so a
+pair that advanced twice between frames jumped and one that did not slid backwards. That was the
+"jerky on the joined player" of the first two-device test, and the host never showed it because
+its pairs advance exactly once per tick. So the client applies one snapshot per tick of its own
+(`createClient`'s `pace`, on by default), holds what arrives early in a queue sorted by tick, and
+coasts through what arrives late or not at all: `Game.coast` carries every hull and bolt one tick
+along its last velocity, which on straight flight lands where the missing snapshot would have. A
+gap at the head of the queue is coasted once before it is applied, so a reordered snapshot is
+waited for rather than skipped past; a queue deeper than `SNAPSHOT_DEPTH` (four ticks, 67 ms)
+drains two a tick; and the queue fills only to the depth the wire's jitter actually needs, because
+every late arrival leaves one more waiting the tick after. `simcheck` measures it on the host's
+hull as the client draws it over a wire with three ticks of jitter: applied on arrival it stalls
+on a quarter of the client's ticks and jumps on a fifth; paced, never either, while whatever was
+applied is still the host's world byte for byte, a coasted tick is within 0.005 units of the
+snapshot it stood in for, and the queue settles three deep and stays there.
 
 **Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
 `eliminated` — one field with three shapes, because the version that used a nullable wreck meant
