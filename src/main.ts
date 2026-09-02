@@ -20,7 +20,7 @@ import { createGame, STEP } from './game/game'
 import { createHud } from './game/hud'
 import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
-import { joinMatch, modeFromLocation, startHosting, type Hosting, type Joining } from './net/browser'
+import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, type Joining, type Lobby } from './net/browser'
 import { createHangar } from './ui/hangar'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
 import { createScreens } from './ui/screens'
@@ -69,10 +69,46 @@ function boot() {
   let pendingResult: RunResult | null = null
 
   // `?host` or `?join=CODE` on the URL. Solo is the shipped game and takes none
-  // of the branches below; see `net/browser.ts`.
-  const mode = modeFromLocation(window.location.search)
+  // of the branches below; see `net/browser.ts`. `mode` is reassigned to solo
+  // when a join fails and the player chooses to fly alone, which is what makes
+  // the frame loop step the simulation again.
+  let mode = modeFromLocation(window.location.search)
   let hosting: Hosting | null = null
   let joining: Joining | null = null
+  let lobby: Lobby | null = null
+
+  /** The one line of network status on screen, in either mode. */
+  const netPanel = document.createElement('div')
+  netPanel.id = 'net'
+  netPanel.style.cssText =
+    'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:50;display:none;' +
+    'font:13px/1.5 monospace;color:#6be6ff;background:rgba(0,0,0,.6);padding:8px 12px;' +
+    'border:1px solid #6be6ff66;max-width:90vw;text-align:center;pointer-events:auto'
+  overlay.append(netPanel)
+
+  function netStatus(html: string) {
+    netPanel.style.display = 'block'
+    netPanel.innerHTML = html
+  }
+
+  if (mode.kind === 'host') {
+    // Listening from page load, so the code can be shared from the hangar and a
+    // peer can connect before the host has even picked a ship.
+    lobby = openLobby((stage) => console.log('[neon-orbit] lobby:', stage))
+    const url = `${location.origin}${location.pathname}?join=${lobby.code}`
+    netStatus(
+      `JOIN CODE <b>${lobby.code}</b> &nbsp; <button id="copyjoin" style="font:inherit;color:#0b0f1a;background:#6be6ff;border:0;padding:2px 8px;cursor:pointer">COPY LINK</button>` +
+        `<div style="opacity:.7;user-select:all">${url}</div>`,
+    )
+    console.log('[neon-orbit] join code', lobby.code, url)
+    document.getElementById('copyjoin')?.addEventListener('click', (ev) => {
+      ev.stopPropagation()
+      navigator.clipboard?.writeText(url).then(
+        () => ((ev.target as HTMLButtonElement).textContent = 'COPIED'),
+        () => ((ev.target as HTMLButtonElement).textContent = 'SELECT + COPY'),
+      )
+    })
+  }
 
   /* ---- Screens ---------------------------------------------------------- */
 
@@ -145,10 +181,9 @@ function boot() {
     // Back to launch throttle. The pilot outlives any one run, so a fresh
     // launch has to say so rather than inheriting the last run's last command.
     pilot.reset()
-    if (mode.kind === 'host') {
+    if (mode.kind === 'host' && lobby) {
       hosting?.stop()
-      hosting = startHosting(game, id, mode.guest, (seat) => hud.callout(`PLAYER ${seat + 1} JOINED`, '#6be6ff', 1.5))
-      showJoinCode(hosting.code)
+      hosting = startHosting(lobby, game, id, mode.guest, (seat) => hud.callout(`PLAYER ${seat + 1} JOINED`, '#6be6ff', 1.5))
     } else {
       // One seat, and elimination rather than respawn — the shipped game is a match
       // of one, and its lose condition is the run ending. `MatchSetup.respawn` in
@@ -158,49 +193,44 @@ function boot() {
     input.requestPointerLock()
   }
 
-  function showJoinCode(code: string) {
-    const url = `${location.origin}${location.pathname}?join=${code}`
-    let el = document.getElementById('netcode')
-    if (!el) {
-      el = document.createElement('div')
-      el.id = 'netcode'
-      el.style.cssText =
-        'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:50;font:13px/1.4 monospace;' +
-        'color:#6be6ff;background:rgba(0,0,0,.55);padding:6px 10px;border:1px solid #6be6ff66;user-select:all'
-      overlay!.append(el)
-    }
-    el.textContent = `JOIN: ${url}`
-    console.log('[neon-orbit] join code', code, url)
-  }
-
   function startJoining(code: string) {
     hangar.close()
     pause.hide()
     debrief.hide()
     pilot.reset()
     audio.setMusic('combat')
-    hud.callout(`JOINING ${code}`, '#6be6ff', 4)
-    joinMatch(game, code, (seat) => {
-      screens.moveTo('flight')
-      hud.callout(`SEAT ${seat + 1}`, '#6be6ff', 1.5)
-      input.requestPointerLock()
-    })
+    netStatus(`JOINING <b>${code}</b><div>looking for the host…</div>`)
+    joinMatch(
+      game,
+      code,
+      (stage) => netStatus(`JOINING <b>${code}</b><div>${stage}</div>`),
+      (seat) => {
+        netPanel.style.display = 'none'
+        screens.moveTo('flight')
+        hud.callout(`SEAT ${seat + 1}`, '#6be6ff', 1.5)
+        input.requestPointerLock()
+      },
+    )
       .then((j) => {
         joining = j
       })
       .catch((error) => {
         console.error(error)
-        hud.callout('NO HOST FOUND', '#ff3b4e', 4)
-        openHangar()
+        const reason = error instanceof Error ? error.message : String(error)
+        netStatus(
+          `COULD NOT JOIN <b>${code}</b><div style="color:#ff3b4e">${reason}</div>` +
+            `<button id="retryjoin" style="font:inherit;margin:6px 4px 0;cursor:pointer">RETRY</button>` +
+            `<button id="solojoin" style="font:inherit;margin:6px 4px 0;cursor:pointer">PLAY SOLO</button>`,
+        )
+        document.getElementById('retryjoin')?.addEventListener('click', () => startJoining(code))
+        document.getElementById('solojoin')?.addEventListener('click', () => {
+          mode = { kind: 'solo' }
+          netPanel.style.display = 'none'
+          openHangar()
+        })
       })
   }
 
-  /*
-   * `src/ui/screens.ts` owns the screen and every transition's precondition. There is no
-   * state to hand it and no answer to assign back — the fourth attempt at removing the
-   * part of this decision that no test could reach, and the first with nothing left for
-   * a caller to finish. What remains here is five one-line adapters and no branches.
-   */
   const screens = createScreens({
     pause: () => game.pause(),
     resume: () => game.resume(),
@@ -295,8 +325,9 @@ function boot() {
         intents[0] = pilot.advance(input.state, STEP)
         if (hosting) hosting.tick(intents[0])
         else if (joining) joining.tick(intents[0])
-        else if (mode.kind === 'join') void 0 // waiting on the wire: the host's snapshots drive the game
-        else game.step(intents)
+        else if (mode.kind !== 'join') game.step(intents)
+        // In join mode with no session yet, nothing steps: the host's snapshots
+        // will drive the game once the welcome arrives.
       }
       game.render(alpha, frameSeconds)
     }
@@ -321,6 +352,7 @@ function boot() {
   window.addEventListener('beforeunload', () => {
     hosting?.stop()
     joining?.stop()
+    lobby?.close()
     game.dispose()
     hangar.dispose()
     pause.dispose()

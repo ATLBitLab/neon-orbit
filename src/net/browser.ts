@@ -6,17 +6,24 @@
  * the right thing. Kept out of `main.ts` so the shipped single-player path
  * does not grow a branch it never takes.
  *
- * Nothing in here runs headless, and the same obligation `boot()` carries is
- * named here too: the protocol is tested over a loopback; this file is the
- * browser residue, and the two-tab check in the README is how it is exercised.
+ * A host *lobby* is open from the moment the page loads in host mode, so the
+ * join code can be shared from the hangar and a peer can connect while the
+ * host is still choosing a ship: its channel is held until the match starts
+ * and seated then. The first version only listened once the host was in
+ * flight, which made "open the join link too early" a silent failure.
+ *
+ * Nothing in here runs headless. The protocol is tested over a loopback; this
+ * file is the browser residue, and the two-tab check in the README is how it
+ * is exercised.
  */
 
 import type { Game, MatchSetup } from '../game/game'
 import type { Controls } from '../game/ship'
 import type { ShipId } from '../ships/specs'
+import type { Channel } from './channel'
 import { createClient, createHost, type Client, type Host } from './session'
 import { createNostrSignal, newJoinCode, type Signal } from './signal'
-import { acceptAsHost, connectAsClient } from './webrtc'
+import { acceptAsHost, connectAsClient, type Status } from './webrtc'
 
 export type NetMode = { kind: 'solo' } | { kind: 'host'; guest: ShipId } | { kind: 'join'; code: string }
 
@@ -32,44 +39,71 @@ export function modeFromLocation(search: string): NetMode {
   return { kind: 'solo' }
 }
 
-export interface Hosting {
+export interface Lobby {
   readonly code: string
+  /** Channels that opened before the match started, waiting for a seat. */
+  readonly waiting: number
+  /** Hand every open channel, now and later, to the callback. */
+  onChannel(handler: (channel: Channel) => void): void
+  close(): void
+}
+
+/** Listen on a fresh join code from now on. Peers connect; seating waits for the match. */
+export function openLobby(status: Status = () => {}): Lobby {
+  const code = newJoinCode()
+  const signal: Signal = createNostrSignal(code)
+  const answered = new Set<string>()
+  const held: Channel[] = []
+  let handler: ((channel: Channel) => void) | null = null
+
+  const stop = signal.listen((message) => {
+    if (message.type !== 'offer' || answered.has(message.from)) return
+    answered.add(message.from)
+    status(`peer ${message.from.slice(0, 6)}: offer received`)
+    acceptAsHost(signal, message, (stage) => status(`peer ${message.from.slice(0, 6)}: ${stage}`))
+      .then((channel) => {
+        if (handler) handler(channel)
+        else held.push(channel)
+      })
+      .catch((error) => status(`peer ${message.from.slice(0, 6)} failed: ${error instanceof Error ? error.message : error}`))
+  })
+
+  return {
+    code,
+    get waiting() {
+      return held.length
+    },
+    onChannel(h) {
+      handler = h
+      for (const channel of held.splice(0)) h(channel)
+    },
+    close() {
+      stop()
+      signal.close()
+    },
+  }
+}
+
+export interface Hosting {
   readonly host: Host
   tick(local: Controls): void
   stop(): void
 }
 
-/**
- * Start a two-seat match and listen for one peer at a time on the join code.
- * Returns synchronously with the code; the match runs whether or not anyone
- * joins, and seat 1 sits idle until they do.
- */
-export function startHosting(game: Game, ship: ShipId, guest: ShipId, onPeer: (seat: number) => void): Hosting {
-  const code = newJoinCode()
+/** Start a two-seat match on an open lobby; every peer that connects is seated. */
+export function startHosting(lobby: Lobby, game: Game, ship: ShipId, guest: ShipId, onPeer: (seat: number) => void): Hosting {
   const setup: MatchSetup & { ships: ShipId[] } = { ships: [ship, guest], respawn: true }
   const host = createHost({ game, setup })
   host.start()
-
-  const signal: Signal = createNostrSignal(code)
-  const answered = new Set<string>()
-  const stopListening = signal.listen((message) => {
-    if (message.type !== 'offer' || answered.has(message.from)) return
-    answered.add(message.from)
-    acceptAsHost(message.sdp, (sdp) => signal.send({ type: 'answer', to: message.from, sdp }))
-      .then((channel) => {
-        const seat = host.accept(channel)
-        if (seat >= 0) onPeer(seat)
-      })
-      .catch((error) => console.warn('peer failed to connect', error))
+  lobby.onChannel((channel) => {
+    const seat = host.accept(channel)
+    if (seat >= 0) onPeer(seat)
   })
-
   return {
-    code,
     host,
     tick: (local) => host.tick(local),
     stop() {
-      stopListening()
-      signal.close()
+      lobby.onChannel(() => {})
     },
   }
 }
@@ -81,25 +115,15 @@ export interface Joining {
 }
 
 /** Connect to a host by code. Resolves once the data channel is open; the welcome follows on it. */
-export async function joinMatch(game: Game, code: string, onWelcome: (seat: number) => void): Promise<Joining> {
+export async function joinMatch(game: Game, code: string, status: Status, onWelcome: (seat: number) => void): Promise<Joining> {
   const signal = createNostrSignal(code)
-  const channel = await connectAsClient(
-    (offer) =>
-      new Promise<string>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          stop()
-          reject(new Error(`no host answered code ${code}`))
-        }, 30000)
-        const stop = signal.listen((message) => {
-          if (message.type !== 'answer' || message.to !== signal.pubkey) return
-          clearTimeout(timeout)
-          stop()
-          resolve(message.sdp)
-        })
-        signal.send({ type: 'offer', sdp: offer }).catch(reject)
-      }),
-  )
-  signal.close()
+  let channel: Channel
+  try {
+    channel = await connectAsClient(signal, status)
+  } finally {
+    signal.close()
+  }
+  status('connected — waiting for the host to launch')
   const client = createClient({ game, channel, onWelcome })
   return {
     client,

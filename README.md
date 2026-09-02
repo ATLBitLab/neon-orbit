@@ -206,8 +206,20 @@ with 30% loss, jitter and duplicates (nothing throws, every drop is counted, the
 equals the host's at whatever tick it last applied). The browser adapters are thin and carry no
 policy: `webrtc.ts` (an unordered, no-retransmit `RTCDataChannel`) and `signal.ts` (offer/answer
 over Nostr ephemeral events on public relays, so there is nothing to run — SDP is plaintext there,
-which is named in the file rather than solved). **Try it:** open `?host` in one tab, launch, copy
-the join URL it shows, open it in another tab. `?host=drone` picks the guest's hull.
+which is named in the file rather than solved). **Try it:** open `?host` — the join code and a
+COPY LINK button are on screen from the hangar onwards — and open the link on **another device**.
+`?host=drone` picks the guest's hull. The join screen reports each stage (offer sent, answer
+received, ice checking, connected) and names the failing one.
+
+**Two tabs on one machine will usually not connect, and that is WebRTC, not this code.** Chrome
+hides its LAN address behind an mDNS name and the only other route is back through your own
+router, which most do not allow; a plain two-tab WebRTC test with no relay in between sits in
+`ice checking` until it times out on the same Mac this was written on. Use a second device (a
+phone on mobile data is the cleanest test), and on macOS make sure Chrome is allowed under
+System Settings → Privacy & Security → Local Network. Two browsers behind a symmetric NAT need a
+TURN relay: set `VITE_TURN_URL`, `VITE_TURN_USERNAME` and `VITE_TURN_CREDENTIAL` at build time.
+None is configured by default, because a relay is exactly the infrastructure this project is
+trying not to run.
 
 **Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
 `eliminated` — one field with three shapes, because the version that used a nullable wreck meant
