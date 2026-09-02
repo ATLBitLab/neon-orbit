@@ -376,7 +376,16 @@ export function createClient(options: ClientOptions): Client {
   channel.send(encodeHello())
 
   function applySnapshot(world: WorldSnapshot): void {
-    game.apply(world)
+    // A snapshot that throws has changed nothing (`Game.apply`'s contract), and
+    // it is counted, not thrown on: this runs inside the client's own tick now,
+    // not inside the wire's handler, and a host whose match has resolved sends
+    // a roster of nobody until it notices.
+    try {
+      game.apply(world)
+    } catch {
+      stats.malformed++
+      return
+    }
     hostTick = world.tick
     stats.applied++
     if (predict) {

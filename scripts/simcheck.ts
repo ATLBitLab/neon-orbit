@@ -3485,6 +3485,24 @@ function testThePeerFliesItsOwnSeatOnly(): void {
   check('the client counts garbage too and applies nothing from it',
     client.stats.malformed === 2 && client.stats.applied === appliedBefore && appliedBefore > 0,
     JSON.stringify(client.stats))
+  // A frame that decodes but cannot be applied — the wrong roster — is counted
+  // on the tick it would have been applied, and the tick goes on.
+  const other = newMatch()
+  other.start({ ships: ['drone'], seed: 1 })
+  while (client.waiting > 0) client.tick(idle)
+  const appliedThen = client.stats.applied
+  wire.a.send(new Uint8Array([FRAME.SNAPSHOT, ...encodeSnapshot({ ...other.capture(), tick: hostGame.capture().tick + 1000 })]))
+  other.dispose()
+  wire.pump()
+  let ticked = true
+  try {
+    // Two ticks: a gap at the head of the queue is coasted once before it is applied.
+    for (let i = 0; i < 3 && client.waiting > 0; i++) client.tick(idle)
+  } catch {
+    ticked = false
+  }
+  check('a snapshot for another roster is counted, applies nothing, and the tick survives it',
+    ticked && client.stats.malformed === 3 && client.stats.applied === appliedThen, JSON.stringify(client.stats))
 
   // Two seats, a second peer: refused, told, and closed.
   const second = createLoopback()

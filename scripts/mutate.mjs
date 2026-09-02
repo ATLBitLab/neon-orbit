@@ -333,7 +333,7 @@ const MUTATIONS = [
   {
     name: 'the client replays intents the host already flew',
     file: 'src/net/session.ts',
-    from: '          while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()\n',
+    from: '      while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()\n',
     to: '',
   },
   {
@@ -683,7 +683,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 566
+const EXPECTED_ASSERTIONS = 567
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 
