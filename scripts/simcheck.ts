@@ -2839,6 +2839,7 @@ function testTheWorldSurvivesTheWire(): void {
         phase: 'wrecked',
         wreckTimer: Math.fround(0.42),
         throttle: Math.fround(0.77),
+        ackTick: 123456,
         lock: { kind: 'squadron', id: 9 },
       },
       {
@@ -2851,6 +2852,7 @@ function testTheWorldSurvivesTheWire(): void {
         phase: 'eliminated',
         wreckTimer: 0,
         throttle: 0,
+        ackTick: -1,
         lock: { kind: 'seat', index: 0 },
       },
       {
@@ -2863,6 +2865,7 @@ function testTheWorldSurvivesTheWire(): void {
         phase: 'flying',
         wreckTimer: 0,
         throttle: 1,
+        ackTick: 0,
         lock: { kind: 'none' },
       },
     ],
@@ -3258,7 +3261,8 @@ function testAMatchCrossesTheWire(): void {
     host.start()
     const wire = createLoopback()
     let welcomed = -1
-    const client = createClient({ game: clientGame, channel: wire.b, onWelcome: (s) => (welcomed = s) })
+    // A mirror, not a predictor: this test is about the world crossing the wire.
+    const client = createClient({ game: clientGame, channel: wire.b, predict: false, onWelcome: (s) => (welcomed = s) })
     const seat = connected ? host.accept(wire.a) : -2
     wire.pump()
 
@@ -3326,7 +3330,7 @@ function testABadWireIsSurvived(): void {
   const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0xbad, respawn: true } })
   host.start()
   const wire = createLoopback({ loss: 0.3, latency: 1, jitter: 3, duplicate: 0.1, seed: 99 })
-  const client = createClient({ game: clientGame, channel: wire.b })
+  const client = createClient({ game: clientGame, channel: wire.b, predict: false })
   host.accept(wire.a)
   // The hello or the welcome may be lost; the client keeps asking. Ticked with
   // the host idle so nothing about the match depends on how long that took.
@@ -3508,6 +3512,153 @@ function testThePeerFliesItsOwnSeatOnly(): void {
   check('?host hosts with a wasp in seat 1', JSON.stringify(modeFromLocation('?host')) === '{"kind":"host","guest":"wasp"}')
   check('?host=drone picks the guest hull', JSON.stringify(modeFromLocation('?host=drone')) === '{"kind":"host","guest":"drone"}')
   check('?join=abc123 joins, upper-cased', JSON.stringify(modeFromLocation('?join=abc123')) === '{"kind":"join","code":"ABC123"}')
+}
+
+/**
+ * The stick is attached to the ship.
+ *
+ * A joined client flies its own hull the moment it moves the stick, and the
+ * host's truth, when it arrives a few ticks later, lands exactly where the
+ * prediction said — flight is deterministic, so on a perfect wire there is no
+ * correction to make. Both halves are measured: every acknowledged intent's
+ * host position against what the client predicted for that intent, and the
+ * client's hull after each reconcile against its own latest prediction. The
+ * contrast is a client with prediction off, whose hull trails the host by the
+ * wire's latency — the round trip of lag this milestone exists to remove.
+ */
+function testTheStickIsAttachedToTheShip(): void {
+  section('The stick is attached to the ship')
+
+  const LATENCY = 3
+  const TICKS = Math.ceil(15 / STEP)
+
+  // Immortal for the duration: a death is a jump no prediction can foresee, and
+  // it is not what is being measured here.
+  const hulls = { hornet: SHIPS.hornet.maxHull, wasp: SHIPS.wasp.maxHull }
+  SHIPS.hornet.maxHull = 1e6
+  SHIPS.wasp.maxHull = 1e6
+
+  function fly(predict: boolean) {
+    const hostGame = newMatch()
+    const clientGame = newMatch()
+    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0x9e11, respawn: true } })
+    host.start()
+    const wire = createLoopback({ latency: LATENCY })
+    const client = createClient({ game: clientGame, channel: wire.b, predict })
+    host.accept(wire.a)
+    for (let i = 0; i <= LATENCY; i++) wire.pump()
+
+    const hostDevice = stubInput()
+    const hostPilot = createPilot()
+    const clientDevice = stubInput()
+    const clientPilot = createPilot()
+    const predicted = new Map<number, { x: number; y: number; z: number }>()
+    let acked = 0
+    let ackMismatch = 0
+    let worstAck = 0
+    let reconciled = 0
+    let worstReconcile = 0
+    let lagSum = 0
+    let lagSamples = 0
+    let lastAck = -1
+    let moved = 0
+    /** The host's truth for seat 1, by the intent tick it was flown on. */
+    const truth = new Map<number, { x: number; y: number; z: number }>()
+
+    for (let i = 0; i < TICKS; i++) {
+      steer(hostDevice, hostGame.snapshot(0)?.target ?? null)
+      steer(clientDevice, clientGame.snapshot(1)?.target ?? null)
+      const sent = client.stats.sent
+      const before = clientGame.snapshot(1)!.position
+      client.tick(clientPilot.advance(clientDevice.state, STEP))
+      const after = clientGame.snapshot(1)!.position
+      if (Math.hypot(after.x - before.x, after.y - before.y, after.z - before.z) > 0.01) moved++
+      predicted.set(sent, after)
+      host.tick(hostPilot.advance(hostDevice.state, STEP))
+      const flown = hostGame.capture().seats[1]
+      if (flown.ackTick >= 0) truth.set(flown.ackTick, flown.ship.position)
+      wire.pump()
+
+      const view = clientGame.capture().seats[1]
+      const ack = view.ackTick
+      if (ack > lastAck && view.phase === 'flying') {
+        lastAck = ack
+        const p = predicted.get(ack)
+        const t = truth.get(ack)
+        if (p && t && acked++ >= LATENCY + 2) {
+          // The first few intents were flown after a warm-up of held ticks the
+          // client could not have known about; from the first reconcile on,
+          // every prediction is built on the host's truth and must land on it.
+          const d = Math.hypot(p.x - t.x, p.y - t.y, p.z - t.z)
+          worstAck = Math.max(worstAck, d)
+          if (d > 0.1) ackMismatch++
+        }
+        // Where the hull is now, against the latest prediction made for it.
+        const now = clientGame.snapshot(1)!.position
+        const latest = predicted.get(sent)!
+        const lag = Math.hypot(now.x - latest.x, now.y - latest.y, now.z - latest.z)
+        reconciled++
+        worstReconcile = Math.max(worstReconcile, lag)
+        lagSum += lag
+        lagSamples++
+      }
+    }
+    const result = { acked, ackMismatch, worstAck, reconciled, worstReconcile, meanLag: lagSamples ? lagSum / lagSamples : -1, moved, unacked: client.unacknowledged }
+    hostGame.dispose()
+    clientGame.dispose()
+    return result
+  }
+
+  const on = fly(true)
+  const off = fly(false)
+  SHIPS.hornet.maxHull = hulls.hornet
+  SHIPS.wasp.maxHull = hulls.wasp
+  // Not every tick: two autopilots chasing each other throttle down inside 170
+  // units and can sit nose to nose. Most of the run, though.
+  check('the predicted hull moved on the stick', on.moved > TICKS * 0.8, `${on.moved} of ${TICKS}`)
+  check('the host acknowledged intents throughout', on.acked > TICKS * 0.8, `${on.acked}`)
+  check(`the host's truth landed where the client predicted, every time (${on.acked})`, on.ackMismatch === 0,
+    `${on.ackMismatch} off by more than 0.1; worst ${on.worstAck.toFixed(3)}`)
+  check('and after every reconcile the hull sits on its own latest prediction', on.worstReconcile < 0.1,
+    `worst ${on.worstReconcile.toFixed(3)}`)
+  check('the replay window is the wire latency, not the whole history', on.unacked >= 1 && on.unacked <= LATENCY + 2, `${on.unacked}`)
+
+  check('without prediction the hull does not move on the stick', off.moved < TICKS, `${off.moved} of ${TICKS}`)
+  check('and trails the host by the wire latency', off.meanLag > 5 && off.meanLag > on.meanLag * 20,
+    `mean lag ${off.meanLag.toFixed(2)} units unpredicted, ${on.meanLag.toFixed(3)} predicted`)
+
+  /* predict and reconcile refuse what they cannot fly, quietly. */
+  const solo = newMatch()
+  // A wasp: no heat quirk, so a long burst cannot lock the guns and turn the
+  // "no bolt" result below into a vacuous one.
+  solo.start({ ships: ['wasp'], seed: 1 })
+  const p0 = solo.snapshot(0)!.position
+  let threw = false
+  try {
+    solo.predict(1, controls({ throttle: 1 }))
+    solo.predict(-1, controls())
+    solo.reconcile(4, [controls()])
+    solo.predict(0, controls({ pitch: 1, throttle: 1 }))
+  } catch {
+    threw = true
+  }
+  const p1 = solo.snapshot(0)!.position
+  check('a seat that does not exist is not predicted, and nothing throws', !threw)
+  check('a seat that does is', p1.z !== p0.z || p1.y !== p0.y)
+
+  // Guns into nothing: a predicted shot must leave the bolt pool empty, or the
+  // host's next restore would flicker it out and the truth re-fire it later.
+  // Past the warp-in first: a hull cannot fire for its first 0.85 s, and a
+  // burst shorter than that would prove nothing either way.
+  for (let i = 0; i < 120; i++) solo.predict(0, controls({ fire: true, throttle: 1 }))
+  const predictedBolts = solo.capture().bolts.length
+  const shotsPredicted = solo.snapshot(0)!.shotsFired
+  for (let i = 0; i < 30; i++) solo.step([controls({ fire: true, throttle: 1 })])
+  const steppedBolts = solo.capture().bolts.length
+  check('the predicted trigger was actually pulled', shotsPredicted > 0, `${shotsPredicted} shots`)
+  check('a predicted shot fires no bolt', predictedBolts === 0, `${predictedBolts} bolts in the pool`)
+  check('while a stepped one does', steppedBolts > 0, `${steppedBolts}`)
+  solo.dispose()
 }
 
 /**
@@ -6286,6 +6437,7 @@ testAnIntentFrameEndsInAdmission()
 testAMatchCrossesTheWire()
 testABadWireIsSurvived()
 testThePeerFliesItsOwnSeatOnly()
+testTheStickIsAttachedToTheShip()
 testDeathEitherRespawnsOrResolves()
 testEliminationEndsWhenTheArenaEmpties()
 testAnEliminatedSeatStaysEliminated()

@@ -143,10 +143,13 @@ export interface Host {
 interface Peer {
   channel: Channel
   seat: number
-  /** The last tick this seat flew an intent *for*. Ticks only go forward. */
+  /** The last tick admitted from this peer. Ticks only go forward. */
   lastTick: number
-  /** The freshest admitted intent not yet flown, if any. */
+  /** The tick of the intent this seat is currently flying on; -1 before the first. */
+  flownTick: number
+  /** The freshest admitted intent not yet flown, if any, and its tick. */
   pending: Controls | null
+  pendingTick: number
   /** What this seat last flew on — the `held` for admission. */
   held: Controls
 }
@@ -203,6 +206,7 @@ export function createHost(options: HostOptions): Host {
     peer.lastTick = frame.tick
     // Copy out of the scratch: the next frame reuses it.
     peer.pending = { ...frame.controls }
+    peer.pendingTick = frame.tick
     stats.admitted++
   }
 
@@ -221,7 +225,7 @@ export function createHost(options: HostOptions): Host {
         channel.close()
         return -1
       }
-      const peer: Peer = { channel, seat, lastTick: -1, pending: null, held: holds[seat] }
+      const peer: Peer = { channel, seat, lastTick: -1, flownTick: -1, pending: null, pendingTick: -1, held: holds[seat] }
       peers[seat] = peer
       channel.onMessage((bytes) => onFrame(peer, bytes))
       channel.onClose(() => {
@@ -238,6 +242,7 @@ export function createHost(options: HostOptions): Host {
         const held = holds[seat]
         if (peer && peer.pending) {
           Object.assign(held, peer.pending)
+          peer.flownTick = peer.pendingTick
           peer.pending = null
         } else {
           // Nothing arrived for this tick: hold, minus the triggers.
@@ -246,6 +251,9 @@ export function createHost(options: HostOptions): Host {
           if (peer) stats.held++
         }
         intents[seat] = held
+        // Told to the seat before the tick, so the snapshot this tick carries
+        // says which intent it was flown on.
+        game.acknowledge(seat, peer ? peer.flownTick : -1)
       }
       game.step(intents)
       tick++
@@ -285,6 +293,12 @@ export interface ClientStats {
 export interface ClientOptions {
   game: Game
   channel: Channel
+  /**
+   * Fly the local seat immediately on each intent and reconcile against every
+   * snapshot. On by default: this is what makes the stick feel attached to the
+   * ship. Off, the hull moves only when the host says so — a round trip late.
+   */
+  predict?: boolean
   /** Called once the host has handed over a seat and the match has started. */
   onWelcome?: (seat: number) => void
   /** Called if the host had no seat. */
@@ -294,6 +308,8 @@ export interface ClientOptions {
 export interface Client {
   /** The seat this client flies, or -1 before the welcome. */
   readonly seat: number
+  /** Intents sent and not yet acknowledged by the host — the replay window. */
+  readonly unacknowledged: number
   /** Send this tick's intent. Nothing is sent before the welcome. */
   tick(controls: Controls): void
   /** The host tick of the last snapshot applied, or -1. */
@@ -304,9 +320,12 @@ export interface Client {
 export function createClient(options: ClientOptions): Client {
   const { game, channel } = options
   const stats: ClientStats = { stale: 0, malformed: 0, applied: 0, sent: 0 }
+  const predict = options.predict ?? true
   let seat = -1
   let tick = 0
   let hostTick = -1
+  /** Every intent sent since the last acknowledged one, oldest first. */
+  const buffer: { tick: number; controls: Controls }[] = []
 
   channel.send(encodeHello())
 
@@ -345,6 +364,15 @@ export function createClient(options: ClientOptions): Client {
         game.apply(world)
         hostTick = world.tick
         stats.applied++
+        if (predict) {
+          // Drop everything the host has flown, replay the rest on its truth.
+          const ack = world.seats[seat]?.ackTick ?? -1
+          while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()
+          game.reconcile(
+            seat,
+            buffer.map((b) => b.controls),
+          )
+        }
       } catch {
         stats.malformed++
       }
@@ -365,8 +393,20 @@ export function createClient(options: ClientOptions): Client {
         if (++tick % HELLO_EVERY === 0) channel.send(encodeHello())
         return
       }
-      channel.send(withType(FRAME.INTENT, encodeIntent(seat, tick++, controls)))
+      const sent = tick++
+      channel.send(withType(FRAME.INTENT, encodeIntent(seat, sent, controls)))
       stats.sent++
+      if (predict) {
+        // A copy: the producer reuses its struct, and this one has to be replayable.
+        const copy = { ...controls, aim: null, spread: 0 }
+        buffer.push({ tick: sent, controls: copy })
+        // Bounded: a host that never acknowledges must not grow this forever.
+        if (buffer.length > 240) buffer.shift()
+        game.predict(seat, copy)
+      }
+    },
+    get unacknowledged() {
+      return buffer.length
     },
     get hostTick() {
       return hostTick

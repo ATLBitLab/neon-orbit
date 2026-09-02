@@ -84,6 +84,12 @@ export interface SeatState {
    * this one.
    */
   throttle: number
+  /**
+   * The client intent tick this seat last flew, or -1. The host's answer to
+   * "how much of what I sent have you heard?", which is what lets a predicting
+   * client know which of its own intents to replay on top of this snapshot.
+   */
+  ackTick: number
   lock: LockRef
 }
 
@@ -191,7 +197,7 @@ export function encodeSnapshot(s: WorldSnapshot, w = new ByteWriter(4096)): Uint
   for (const seat of s.seats) {
     writeShip(w, seat.ship)
     w.i32(seat.score).u16(seat.kills).f32(seat.multiplier).u32(seat.hits).u16(seat.deaths)
-    w.u8(PHASES.indexOf(seat.phase)).f32(seat.wreckTimer).f32(seat.throttle)
+    w.u8(PHASES.indexOf(seat.phase)).f32(seat.wreckTimer).f32(seat.throttle).i32(seat.ackTick)
     writeLock(w, seat.lock)
   }
 
@@ -254,8 +260,9 @@ export function decodeSnapshot(bytes: Uint8Array): WorldSnapshot {
     if (!phase) throw new RangeError(`unknown seat phase ${phaseIndex}`)
     const wreckTimer = r.f32()
     const throttle = r.f32()
+    const ackTick = r.i32()
     const lock = readLock(r)
-    seats.push({ ship, score, kills, multiplier, hits, deaths, phase, wreckTimer, throttle, lock })
+    seats.push({ ship, score, kills, multiplier, hits, deaths, phase, wreckTimer, throttle, ackTick, lock })
   }
 
   const squadron: SquadronState[] = []

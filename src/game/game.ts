@@ -155,6 +155,8 @@ const DEATH_BLASTS: { at: number; scale: number; spread: number; shake: number; 
 
 const _spawnDir = new THREE.Vector3()
 const _spawnPos = new THREE.Vector3()
+const _drawnPos = new THREE.Vector3()
+const _drawnQuat = new THREE.Quaternion()
 /** Where the fight is, recomputed per use. See `fightCentre`. */
 const _anchor = new THREE.Vector3()
 const _forward = new THREE.Vector3()
@@ -297,6 +299,12 @@ export interface Game {
    * throws has changed nothing.
    */
   apply(snapshot: WorldSnapshot): void
+  /** Fly one seat one tick locally, provisionally — flight only. See the implementation. */
+  predict(seat: number, controls: Controls): void
+  /** After `apply`: replay this seat's unacknowledged intents on top of the host's truth. */
+  reconcile(seat: number, replay: readonly Controls[]): void
+  /** Host only: record the client intent tick a seat just flew, for the next snapshot. */
+  acknowledge(seat: number, tick: number): void
   dispose(): void
 }
 
@@ -423,6 +431,19 @@ export function createGame(deps: GameDeps): Game {
     bolts,
     localFaction: FACTION_PLAYER,
   }
+  /**
+   * The context a *predicted* step flies in: the same arena, but the guns fire
+   * into nothing. A client predicts its own flight so the stick feels
+   * immediate; it does not predict its bolts, because the host's snapshot
+   * restores the whole pool every tick and a locally fired bolt would flicker
+   * out and reappear a round trip later. Bolts arrive with the truth.
+   */
+  const dryCtx: ShipContext = {
+    hazards: environment.hazards,
+    audio,
+    bolts: { ...bolts, fire() {} },
+    localFaction: FACTION_PLAYER,
+  }
 
   /**
    * The roster. Empty between matches, which is the state `player === null` used
@@ -466,6 +487,12 @@ export function createGame(deps: GameDeps): Game {
   let mirroredQueued = 0
   /** Spawn order of each squadron hull — the identity a snapshot carries for it. */
   const pilotIds = new Map<EnemyPilot, number>()
+  /**
+   * Per seat, the client intent tick the host last flew — protocol state the
+   * snapshot carries so a predicting client knows what to replay. Set by the
+   * host through `acknowledge`, copied through `apply`, never read by the sim.
+   */
+  let acks: number[] = []
   let best = 0
   let alarmTimer = 0
   let searAlarmTimer = 0
@@ -1316,6 +1343,50 @@ export function createGame(deps: GameDeps): Game {
     return mirrored ? mirroredQueued : queue.length
   }
 
+  /* ---- Prediction --------------------------------------------------------- */
+
+  /**
+   * Fly one seat one tick, locally and provisionally.
+   *
+   * What a joined client does with its own intent instead of waiting a round
+   * trip to see it: the hull moves now, on the same flight model the host runs,
+   * and the host's next snapshot either lands exactly where this predicted —
+   * the normal case, since flight is deterministic — or corrects it. Flight
+   * only: the guns fire into `dryCtx`, and nothing here decides a hit.
+   */
+  function predict(seat: number, controls: Controls): void {
+    const s = seats[seat]
+    if (!s || s.phase.kind !== 'flying' || !s.ship.alive) return
+    recordControls(s, controls)
+    s.ship.step(s.lastControls, STEP, dryCtx)
+  }
+
+  /**
+   * After `apply`, re-fly what the host has not heard yet.
+   *
+   * `apply` has just put this seat's hull at the host's truth, which is where
+   * the hull was as of the intent tick the host acknowledged. Every intent sent
+   * since is replayed on top, so the hull ends up where a prediction that had
+   * known the truth would have put it. The pose the frame interpolates from is
+   * kept at where the hull was *drawn* last tick — `apply` saved it as the
+   * previous pose and each replayed step would overwrite it — so a correction
+   * is a smooth slide over one frame rather than a snap.
+   */
+  function reconcile(seat: number, replay: readonly Controls[]): void {
+    const s = seats[seat]
+    if (!s || s.phase.kind !== 'flying' || !s.ship.alive) return
+    _drawnPos.copy(s.ship.prevPosition)
+    _drawnQuat.copy(s.ship.prevQuaternion)
+    for (const c of replay) s.ship.step(c, STEP, dryCtx)
+    s.ship.prevPosition.copy(_drawnPos)
+    s.ship.prevQuaternion.copy(_drawnQuat)
+  }
+
+  /** The host recording which of a seat's intent ticks it just flew. */
+  function acknowledge(seat: number, tick: number): void {
+    if (seat >= 0 && seat < acks.length) acks[seat] = tick
+  }
+
   /* ---- Snapshots --------------------------------------------------------- */
 
   function readShip(ship: Ship): ShipState {
@@ -1399,6 +1470,7 @@ export function createGame(deps: GameDeps): Game {
       phase: seat.phase.kind,
       wreckTimer: seat.phase.kind === 'wrecked' ? seat.phase.timer : 0,
       throttle: seat.lastControls.throttle,
+      ackTick: acks[seat.index] ?? -1,
       lock: lockOf(seat),
     }))
     const squadronStates: SquadronState[] = pilots.map((pilot) => ({
@@ -1498,6 +1570,7 @@ export function createGame(deps: GameDeps): Game {
       writeShip(ship, state.ship)
       // The HUD reads the seat's flown throttle, and a mirror flies nothing.
       seat.lastControls.throttle = state.throttle
+      acks[i] = state.ackTick
       seat.score = state.score
       seat.kills = state.kills
       seat.multiplier = state.multiplier
@@ -2008,6 +2081,7 @@ export function createGame(deps: GameDeps): Game {
 
       respawns = setup.respawn ?? false
       seats = built
+      acks = seats.map(() => -1)
       localIndex = drawnSeatIndex(setup.local, seats.length)
       ctx.localFaction = seats[localIndex].faction
 
@@ -2183,6 +2257,9 @@ export function createGame(deps: GameDeps): Game {
 
     capture,
     apply,
+    predict,
+    reconcile,
+    acknowledge,
 
     cycleTarget() {
       const seat = local()
