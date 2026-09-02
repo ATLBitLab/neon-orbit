@@ -25,7 +25,7 @@ import * as THREE from 'three'
 import type { Audio } from '../core/audio'
 import type { Input } from '../core/input'
 import { STREAM, subRng, type Rng } from '../core/rng'
-import type { RunResult } from '../core/scores'
+import type { MatchResult, RunResult, SeatLine } from '../core/scores'
 import { otherShips, SHIPS, type ShipId } from '../ships/specs'
 import {
   ARENA_RADIUS,
@@ -90,6 +90,25 @@ export const STEP = 1 / 60
  * pay for it. Two is a first guess and a balance lever, not a finding.
  */
 export const PARTICIPANT_BOUNTY_MULT = 2
+
+/**
+ * Place every line by score, equal scores sharing a place, and mark the winners:
+ * the seats placed first and still flying. Eliminated seats place after every
+ * flying one whatever their score — a seat that is not in the arena when it is
+ * cleared did not clear it. A match that emptied the arena has nobody flying,
+ * so nobody wins it; "cleared" is implied by "alive at the end".
+ */
+export function placeLines(lines: SeatLine[]): void {
+  const order = lines.slice().sort((a, b) => (a.alive === b.alive ? b.score - a.score : a.alive ? -1 : 1))
+  let place = 0
+  for (let i = 0; i < order.length; i++) {
+    const line = order[i]
+    const prev = order[i - 1]
+    if (!prev || prev.alive !== line.alive || prev.score !== line.score) place = i + 1
+    line.place = place
+    line.won = line.alive && place === 1
+  }
+}
 
 /** Hulls of each non-chosen type that make up the squadron. */
 const PER_ENEMY_TYPE = 3
@@ -322,6 +341,14 @@ export interface Game {
    * is not a stall.
    */
   coast(except: number): void
+  /**
+   * Mirror only: the host's match has resolved and this is how. Ends the
+   * match here the way `finish` does on the host — arena cleared, `onEnd`
+   * called with this machine's seat's line as its `RunResult`.
+   */
+  conclude(result: MatchResult): void
+  /** How the last match ended, once it has; `null` while one is running or before any. */
+  readonly result: MatchResult | null
   dispose(): void
 }
 
@@ -539,6 +566,8 @@ export function createGame(deps: GameDeps): Game {
    * a resolution, so there is nothing to seal.
    */
   let pendingResult: RunResult | null = null
+  /** How the last match ended. Set by `finish`, read by the host to tell its peers. */
+  let lastResult: MatchResult | null = null
 
   const contactBuffer: HudContact[] = []
   /** Enemy-only view of the arena, reused each frame for AI separation. */
@@ -1063,53 +1092,89 @@ export function createGame(deps: GameDeps): Game {
   }
 
   /**
-   * The scoreline at the instant the run resolves, for the seat being drawn.
+   * The match's end, for every seat: the rules of the scoreboard, in one place.
    *
-   * Sealed here rather than read at `finish`, because a loss keeps the arena
-   * running for `DEATH_SEQUENCE` seconds afterwards — long enough for a hostile
-   * to fly into the star and post a bounty to a pilot who is already dead.
+   * On a cleared squadron every seat still flying is paid for finishing intact
+   * (hull fraction × 1200) and for finishing fast (4000 − 25/s, floored at zero),
+   * which for one seat is exactly the win bonus the debrief always showed. Seats
+   * that were eliminated are paid nothing more. Every seat is then placed by its
+   * final score, equal scores sharing a place, and the seats placed first on a
+   * cleared squadron have won. A match that ended with everybody eliminated has
+   * no winner. The time bonus is the same for everyone and cannot change the
+   * placing; the hull bonus can, and is meant to: finishing intact is part of
+   * the game.
+   */
+  function sealMatch(cleared: boolean): MatchResult {
+    const timeBonus = cleared ? Math.max(0, Math.round(4000 - elapsed * 25)) : 0
+    const lines: SeatLine[] = seats.map((seat) => {
+      const alive = seat.phase.kind === 'flying' && seat.ship.alive
+      const bonus = cleared && alive ? Math.round(seat.ship.hullFraction * 1200) + timeBonus : 0
+      return {
+        seat: seat.index,
+        ship: seat.ship.spec.id,
+        score: seat.score + bonus,
+        kills: seat.kills,
+        deaths: seat.deaths,
+        hits: seat.hits,
+        shots: seat.ship.shotsFired,
+        alive,
+        place: 0,
+        won: false,
+      }
+    })
+    placeLines(lines)
+    return { time: elapsed, cleared, lines }
+  }
+
+  /** One seat's line as the report its own debrief and score store consume. */
+  function runResultOf(line: SeatLine, match: MatchResult): RunResult {
+    return {
+      ship: line.ship,
+      score: line.score,
+      kills: line.kills,
+      time: match.time,
+      won: line.won,
+      accuracy: line.shots > 0 ? Math.min(1, line.hits / line.shots) : 0,
+      match: match.lines.length > 1 ? match : undefined,
+    }
+  }
+
+  /**
+   * The scoreline at the instant the local seat is eliminated, sealed.
    *
-   * Reports the local seat because `RunResult` is what the debrief and the score
-   * store consume, and both are single-player shaped: one ship, one score, one
-   * accuracy. A match-wide result — every seat's line, a winner, a placing — is
-   * milestone 8's, and inventing the shape now would mean guessing at the rules
-   * it has to describe.
-   *
-   * **Reads state and writes none**, which it did not used to do: the win bonuses
-   * were added to the running score. That was invisible with one seat and is a
-   * leak with more than one — the seat being *drawn* would end the match with a
-   * different score from the seat beside it, so which machine was watching would
-   * change a number the simulation owns. Who deserves a win bonus in a match with
-   * several seats is a match rule, and until milestone 8 decides one, the bonus
-   * belongs to the report rather than to the scoreline.
-   *
-   * **No test covers this, and it is not for want of trying.** Restoring the
-   * mutation — `seat.score += bonus` — leaves all 292 checks green, because with
-   * today's call sites the write is unobservable: `sealResult(true)` is reached
-   * from exactly one place, `finish(sealResult(true))`, and `finish` calls
-   * `clearArena` before returning, so no caller can read a seat's score between
-   * the two. On a loss the bonus is zero and the write is a no-op. The purity is
-   * therefore defensive rather than currently load-bearing — it becomes real at
-   * milestone 8, where a win stops ending the match. Written down because a
-   * mutation that survives is worth a sentence, not a pretend assertion.
+   * A loss keeps the arena running for `DEATH_SEQUENCE` seconds afterwards —
+   * long enough for a hostile this seat had hit to fly into a mine and pay a
+   * pilot who is already dead — and the report is what the seat died with.
    */
   function sealResult(won: boolean): RunResult {
     const seat = local()
     if (!seat) return { ship: 'hornet', score: 0, kills: 0, time: elapsed, won, accuracy: 0 }
-
-    // Reward finishing intact and finishing fast, in that order.
-    const bonus = won
-      ? Math.round(seat.ship.hullFraction * 1200) + Math.max(0, Math.round(4000 - elapsed * 25))
-      : 0
-
     return {
       ship: seat.ship.spec.id,
-      score: seat.score + bonus,
+      score: seat.score,
       kills: seat.kills,
       time: elapsed,
       won,
       accuracy: accuracyOf(seat),
     }
+  }
+
+  /**
+   * Resolve the match: seal every seat's line, report the local seat's, and
+   * keep the whole for the host to send. A local seat that was eliminated
+   * reports the line it was sealed with at death, attached to the match.
+   */
+  function resolveMatch(cleared: boolean): void {
+    const match = sealMatch(cleared)
+    const mine = local()
+    const line = mine ? match.lines[mine.index] : undefined
+    const report = pendingResult
+      ? { ...pendingResult, match: match.lines.length > 1 ? match : undefined }
+      : line
+        ? runResultOf(line, match)
+        : sealResult(false)
+    lastResult = match
+    finish(report)
   }
 
   function finish(result: RunResult): void {
@@ -1458,6 +1523,16 @@ export function createGame(deps: GameDeps): Game {
     if (seat >= 0 && seat < acks.length) acks[seat] = tick
   }
 
+  /** The mirror's `resolveMatch`: the host decided, this machine reports its seat's line. */
+  function conclude(result: MatchResult): void {
+    if (!active) return
+    const mine = local()
+    const line = mine ? result.lines.find((l) => l.seat === mine.index) : undefined
+    lastResult = result
+    if (line?.won) hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
+    finish(line ? runResultOf(line, result) : sealResult(false))
+  }
+
   /**
    * The mirror's tick when nothing arrived.
    *
@@ -1784,7 +1859,7 @@ export function createGame(deps: GameDeps): Game {
     // first wreck to resolve used to call `finish` — and `clearArena` with it —
     // straight through a second wreck that was 85 ticks into its own 144. The
     // match waits for every cutscene it started.
-    if (!matchStillRunning()) finish(pendingResult ?? sealResult(false))
+    if (!matchStillRunning()) resolveMatch(false)
   }
 
   /* ------------------------------------------------------------------------ */
@@ -1955,9 +2030,9 @@ export function createGame(deps: GameDeps): Game {
       if (!active) return
     }
 
-    /* A cleared squadron is still the win, and still the only one. What it means
-       with more than one seat in the arena — shared, first past a post, highest
-       score — is a match rule, and match rules are milestone 8.
+    /* A cleared squadron is still the win, and still the only one. With more than
+       one seat in the arena it is a *placing*: `sealMatch` pays every seat still
+       flying for finishing, ranks them, and the seats placed first have won.
 
        Gated on nobody being mid-cutscene as well as somebody being alive, and both
        halves are load-bearing. The squadron can empty on the very tick a seat dies
@@ -1981,7 +2056,7 @@ export function createGame(deps: GameDeps): Game {
        * only way to reach this branch is to still be alive, and `pendingResult` is null.
        */
       if (!pendingResult) hud.callout('SECTOR CLEAR', '#b6ff3d', 3)
-      finish(pendingResult ?? sealResult(true))
+      resolveMatch(true)
     }
   }
 
@@ -2283,6 +2358,7 @@ export function createGame(deps: GameDeps): Game {
       overdriveWarned = false
       shieldWarned = false
       pendingResult = null
+      lastResult = null
       best = deps.bestScoreFor(localSpec.id)
 
       environment.minefield.reset()
@@ -2395,6 +2471,10 @@ export function createGame(deps: GameDeps): Game {
     reconcile,
     acknowledge,
     coast,
+    conclude,
+    get result() {
+      return lastResult
+    },
 
     cycleTarget() {
       const seat = local()

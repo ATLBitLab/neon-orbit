@@ -355,6 +355,50 @@ const MUTATIONS = [
     to: '        this.takeDamage(Math.min(55, 4 + impact * 0.1), (this.faction === 0 ? -1 : 0) as Faction)',
   },
 
+  /* ---- Match rules: the result ------------------------------------------- */
+  {
+    name: 'an eliminated seat places by score like a flying one',
+    file: 'src/game/game.ts',
+    from: '  const order = lines.slice().sort((a, b) => (a.alive === b.alive ? b.score - a.score : a.alive ? -1 : 1))',
+    to: '  const order = lines.slice().sort((a, b) => b.score - a.score)',
+  },
+  {
+    name: 'equal scores do not share a place',
+    file: 'src/game/game.ts',
+    from: '    if (!prev || prev.alive !== line.alive || prev.score !== line.score) place = i + 1',
+    to: '    place = i + 1',
+  },
+  {
+    name: 'the finishing bonus is paid to the eliminated too',
+    file: 'src/game/game.ts',
+    from: '      const bonus = cleared && alive ? Math.round(seat.ship.hullFraction * 1200) + timeBonus : 0',
+    to: '      const bonus = cleared ? Math.round(seat.ship.hullFraction * 1200) + timeBonus : 0',
+  },
+  {
+    name: 'the host never tells its peers the match ended',
+    file: 'src/net/session.ts',
+    from: '        if (result && result !== resultSent) {',
+    to: '        if (false) {',
+  },
+  {
+    name: 'the host snapshots a roster of nobody on the resolving tick',
+    file: 'src/net/session.ts',
+    from: '      if (++sinceSnapshot >= snapshotEvery && game.active) {',
+    to: '      if (++sinceSnapshot >= snapshotEvery) {',
+  },
+  {
+    name: 'a mirror ignores the result',
+    file: 'src/net/session.ts',
+    from: '      queue.length = 0\n      game.conclude(result)',
+    to: '      queue.length = 0',
+  },
+  {
+    name: 'a mirror reports seat 0 whatever seat it flies',
+    file: 'src/game/game.ts',
+    from: '    const line = mine ? result.lines.find((l) => l.seat === mine.index) : undefined\n    lastResult = result',
+    to: '    const line = result.lines[0]\n    lastResult = result',
+  },
+
   /* ---- Snapshot pacing ----------------------------------------------------- */
   {
     name: 'the client applies a snapshot the tick it arrives',
@@ -751,7 +795,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 584
+const EXPECTED_ASSERTIONS = 607
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

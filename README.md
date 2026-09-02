@@ -72,8 +72,9 @@ threading a habitat ring at full throttle stays available. Hitting a core scrape
 bounces you off.
 
 **Mines** are the red spiky ones. Twenty-six of them, scattered on a fixed seed, and they take
-45 hull off anything that touches them — you, or a hostile that gets chased into one. That is
-survivable in every airframe but costs a Wasp two thirds of its hull. Enemies steer around them,
+45 hull off anything that touches them — you, or a hostile that gets chased into one, which pays
+whoever last landed a hit on it. That is survivable in every airframe but costs a Wasp two thirds
+of its hull. Enemies steer around them,
 but only loosely, so pressure can still push one onto a mine. They detonate once and stay gone
 for the rest of the run.
 
@@ -248,6 +249,26 @@ hull as the client draws it over a wire with three ticks of jitter: applied on a
 on a quarter of the client's ticks and jumps on a fifth; paced, never either, while whatever was
 applied is still the host's world byte for byte, a coasted tick is within 0.005 units of the
 snapshot it stood in for, and the queue settles three deep and stays there.
+
+**Every kill has an owner, and the match has a scoreboard.** A bolt names its author, and that
+is the credit. Damage the arena inflicts — a mine, a station scrape — carries a faction of its own
+(`FACTION_ENVIRONMENT`) and is credited to the seat that last landed a hit on the victim, so a
+hostile chased onto a mine still scores for the chaser; in a match of one seat, that seat, which is
+the shipped scoreline bit for bit; with more seats and no last hitter, nobody. Arena damage pays
+points but not a hit, because accuracy is bolts landed over bolts fired. A participant's hull pays
+like any other, at `PARTICIPANT_BOUNTY_MULT` (two) times the airframe's bounty, and never to the
+victim. Every kill is a `KillEvent` the snapshot carries the last four of, so every machine shows
+the same feed from the same events with only YOU moving: the shooter reads `P2 DOWN  +300`, the
+victim `DOWNED BY P1`, everyone else `P1 ▸ P2 DOWN`. When the squadron is cleared the host seals
+a `MatchResult` (`sealMatch`): every seat still flying is paid for finishing intact and fast —
+exactly the single-player win bonus — seats are placed by score with ties shared and the
+eliminated after every flying seat, the seats placed first have won, and the whole thing goes to
+every peer in one RESULT frame. Both debriefs show the same board; a seat that was alive and
+outscored reads OUTSCORED rather than HULL BREACH. `simcheck` flies two Hornets to a death and
+reads both feeds, mines one untouched wave (pays nobody; in a match of one, pays that seat) and one
+a single shooter had worked over (pays the shooter), and resolves a two-seat match over the
+loopback with the host's hull dented first: the mirror gets the same lines, the dented host places
+second, and no snapshot follows the result.
 
 **Death is a per-seat state, and respawn is a match policy.** A seat is `flying`, `wrecked` or
 `eliminated` — one field with three shapes, because the version that used a nullable wreck meant

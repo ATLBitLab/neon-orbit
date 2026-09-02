@@ -14,8 +14,8 @@
 import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
-import type { RunResult } from '../src/core/scores'
-import { createBolts, FACTION_AI, FACTION_PLAYER, humanFaction } from '../src/game/bolts'
+import type { MatchResult, RunResult, SeatLine } from '../src/core/scores'
+import { createBolts, FACTION_AI, FACTION_ENVIRONMENT, FACTION_PLAYER, humanFaction, type Faction } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
 import { createPilot, type Pilot } from '../src/game/controls'
 import { admitIntent, bound, rampThrottle, THROTTLE_DOWN_RATE, THROTTLE_UP_RATE } from '../src/game/intent'
@@ -32,8 +32,8 @@ import {
 import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '../src/net/wire'
 import { createLoopback } from '../src/net/channel'
 import { modeFromLocation } from '../src/net/browser'
-import { createClient, createHost, decodeWelcome, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
-import { createGame, DEATH_SEQUENCE, PARTICIPANT_BOUNTY_MULT, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
+import { createClient, createHost, decodeResult, decodeWelcome, encodeResult, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
+import { createGame, DEATH_SEQUENCE, PARTICIPANT_BOUNTY_MULT, placeLines, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
 import { createDevHook, installDevHook, type DevHook } from '../src/core/dev-hook'
@@ -1263,10 +1263,16 @@ function testDeathPlaysBeforeTheDebrief(): void {
 
   const budget = Math.ceil(20 / STEP)
   let frames = 0
+  let lastScore = 0
+  let scoreBeforeDeath = -1
   for (; frames < budget && resultFrame < 0; frames++) {
+    if (deathFrame < 0) lastScore = game.snapshot()?.score ?? lastScore
     game.step([pilot.advance(input.state, STEP)])
 
-    if (deathFrame < 0 && (game.snapshot()?.hull ?? 1) <= 0) deathFrame = frames
+    if (deathFrame < 0 && (game.snapshot()?.hull ?? 1) <= 0) {
+      deathFrame = frames
+      scoreBeforeDeath = lastScore
+    }
     if (game.dying) {
       dyingFrames++
       // Escape mid-explosion must not strand the player in a paused fireball
@@ -1285,6 +1291,9 @@ function testDeathPlaysBeforeTheDebrief(): void {
   check('the player died', deathFrame > 0, `hull never reached zero in ${(frames * STEP).toFixed(1)}s`)
   check('the run resolved', run !== null, `no result after ${(frames * STEP).toFixed(1)}s`)
   check('a fatal hit is recorded as a loss', run?.won === false, `won=${run?.won}`)
+  // The mine that killed it is the arena's, and in a match of one the arena's
+  // kills pay the sole seat — except this one: a seat is never paid for its own death.
+  check('and the seat was not paid for its own death', run !== null && run.score === scoreBeforeDeath, `${scoreBeforeDeath} before, ${run?.score} reported`)
   check(
     'the debrief does not land on the frame of death',
     resultFrame > deathFrame,
@@ -4569,7 +4578,7 @@ function testAMinePaysTheLastHitter(): void {
 
     const wave1 = waitForWave()
     mine(3)
-    const untouched = { line: line(), feed: game.capture().feed.map((e) => e.killer), airborne: remaining() }
+    const untouched = { line: line(), feed: game.capture().feed.map((e) => e.killer), awards: game.capture().feed.map((e) => e.award), airborne: remaining() }
 
     const wave2 = waitForWave()
     for (let i = 0; i < Math.ceil(10 / STEP); i++) {
@@ -4608,6 +4617,34 @@ function testAMinePaysTheLastHitter(): void {
     `${one.untouched.line[0].kills} kills, ${one.untouched.line[0].hits} hits, score ${one.untouched.line[0].score}`)
   check('and so does the second, without a shot fired', one.worked.airborne === 1 && one.worked.line[0].kills === 5 && one.worked.line[0].shotsFired === 0,
     `${one.worked.line[0].kills} kills, ${one.worked.line[0].shotsFired} shots`)
+  // Points, not hits: the mine's damage on each of the three, plus the three bounties.
+  const awards = one.untouched.awards.reduce((a, b) => a + b, 0)
+  check("and the mine's damage was the sole seat's points too, not its hits",
+    one.untouched.line[0].score === awards + 3 * MINE_DAMAGE && one.untouched.line[0].hits === 0,
+    `score ${one.untouched.line[0].score}, bounties ${awards}, damage ${3 * MINE_DAMAGE}`)
+
+  /* And the arena names itself. A hull driven into a station is damaged by
+     `FACTION_ENVIRONMENT`, whichever side the hull is on — not by "the other
+     side", which with a roster is a real seat that did nothing. */
+  {
+    const station = { center: new THREE.Vector3(0, 0, -4000), radius: 300 } as unknown as Hazard
+    const bolts = createBolts()
+    const seen: Faction[] = []
+    for (const faction of [FACTION_AI, FACTION_PLAYER, humanFaction(1)]) {
+      const ship = new Ship(SHIPS.hornet, faction)
+      ship.spawn(new THREE.Vector3(0, 0, -4000 + 300 + ship.radius - 2), new THREE.Vector3(0, 0, -4000))
+      ship.velocity.set(0, 0, -400)
+      ship.onDamaged = (_self, _amount, from) => {
+        seen.push(from)
+      }
+      const ctx: ShipContext = { hazards: [station], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
+      ship.step(controls(), STEP, ctx)
+      ship.dispose()
+    }
+    bolts.dispose()
+    check('a station scrape is the arena\'s, whichever side the hull is on',
+      seen.length === 3 && seen.every((f) => f === FACTION_ENVIRONMENT), JSON.stringify(seen))
+  }
 
   SHIPS.wasp.maxHull = original.waspHull
   SHIPS.drone.maxHull = original.droneHull
@@ -4617,6 +4654,181 @@ function testAMinePaysTheLastHitter(): void {
   SHIPS.drone.damage = original.droneDamage
   SHIPS.hornet.maxHull = original.hornetHull
   SHIPS.hornet.damage = original.hornetDamage
+}
+
+/**
+ * How a match ends, for everybody: the scoreboard's rules, and the wire that
+ * carries it.
+ *
+ * `placeLines` is the rule: by score, equal scores share a place, eliminated
+ * seats place after every flying one whatever they scored, and the winners are
+ * the seats placed first on a cleared squadron — none when the arena emptied.
+ * Then the whole thing over the loopback: a two-seat match the host resolves by
+ * clearing the squadron, with the host's own hull dented first so the placing is
+ * not a tie. Both machines are told the match ended, with the same lines; the
+ * mirror is told through a RESULT frame, once, and hears no snapshots after it.
+ */
+function testTheMatchEndsOnEveryMachine(): void {
+  section('The match ends on every machine, with one scoreboard')
+
+  const line = (seat: number, score: number, alive = true): SeatLine => ({
+    seat, ship: 'hornet', score, kills: 0, deaths: 0, hits: 0, shots: 0, alive, place: 0, won: false,
+  })
+
+  const tie = [line(0, 500), line(1, 900), line(2, 900)]
+  placeLines(tie)
+  check('equal scores share a place, and the next place is skipped', tie.map((l) => l.place).join(',') === '3,1,1', tie.map((l) => l.place).join(','))
+  check('and every seat placed first on a cleared squadron has won', tie.map((l) => l.won).join(',') === 'false,true,true')
+
+  const out = [line(0, 5000, false), line(1, 100), line(2, 100, false)]
+  placeLines(out)
+  check('an eliminated seat places after every flying one whatever it scored', out.map((l) => l.place).join(',') === '2,1,3', out.map((l) => l.place).join(','))
+  check('and does not win', out.map((l) => l.won).join(',') === 'false,true,false')
+
+  const empty = [line(0, 800, false), line(1, 200, false)]
+  placeLines(empty)
+  check('a match that emptied the arena has a placing and no winner', empty.map((l) => l.place).join(',') === '1,2' && empty.every((l) => !l.won))
+
+  /* The frame. */
+  const result: MatchResult = {
+    time: Math.fround(83.25),
+    cleared: true,
+    lines: [
+      { seat: 0, ship: 'wasp', score: 4321, kills: 5, deaths: 1, hits: 40, shots: 120, alive: true, place: 2, won: false },
+      { seat: 1, ship: 'drone', score: 5000, kills: 6, deaths: 0, hits: 30, shots: 31, alive: true, place: 1, won: true },
+    ],
+  }
+  const frame = encodeResult(result)
+  let back: MatchResult | null = null
+  try {
+    back = decodeResult(frame)
+  } catch {
+    back = null
+  }
+  check('a result frame decodes to the result that was encoded', back !== null && JSON.stringify(back) === JSON.stringify(result),
+    JSON.stringify(back))
+  let refused = 0
+  for (const bad of [frame.subarray(0, frame.length - 1), new Uint8Array([...frame, 0]), new Uint8Array([FRAME.RESULT, 99]), new Uint8Array([FRAME.WELCOME, 1])]) {
+    try {
+      decodeResult(bad)
+    } catch (e) {
+      if (e instanceof RangeError) refused++
+    }
+  }
+  check('a short, long, foreign-version or wrong-type result frame is refused', refused === 4, `${refused} of 4`)
+
+  /* Over the wire. */
+  const original = {
+    waspHull: SHIPS.wasp.maxHull,
+    droneHull: SHIPS.drone.maxHull,
+    waspDamage: SHIPS.wasp.damage,
+    droneDamage: SHIPS.drone.damage,
+    waspRadius: SHIPS.wasp.radius,
+    droneRadius: SHIPS.drone.radius,
+  }
+  SHIPS.wasp.maxHull = 30
+  SHIPS.drone.maxHull = 30
+  SHIPS.wasp.damage = 0
+  SHIPS.drone.damage = 0
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
+  const SENTINEL = 350
+  const hornetRadius = SHIPS.hornet.radius
+
+  /**
+   * A two-seat match the host resolves by clearing the squadron, its own hull
+   * dented first so the placing is not a tie, over a wire that loses `loss` of
+   * everything; then `after` more ticks for the result to cross.
+   */
+  function fly(loss: number, after: number) {
+    const field = aimedMinefield()
+    let hostEnd: RunResult | null = null
+    let clientEnd: RunResult | null = null
+    const hostGame = newMatch({ environment: { ...stubEnvironment(), minefield: field }, onEnd: (r) => (hostEnd = r) })
+    const clientGame = newMatch({ onEnd: (r) => (clientEnd = r) })
+    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'hornet'], seed: 0xe4d, respawn: true } })
+    host.start()
+    const wire = createLoopback({ loss, seed: 5 })
+    const client = createClient({ game: clientGame, channel: wire.b })
+    host.accept(wire.a)
+    const idle = controls({ throttle: 0.3 })
+    const step = () => {
+      client.tick(idle)
+      host.tick(idle)
+      wire.pump()
+    }
+    for (let i = 0; i < 600 && client.seat < 0; i++) step()
+    // Everybody in, then dent the host's own hull with one mine (roster order picks seat 0).
+    for (let i = 0; i < Math.ceil(40 / STEP); i++) {
+      step()
+      if ((hostGame.snapshot(0)?.enemiesQueued ?? 1) === 0) break
+    }
+    field.aim((r) => r === hornetRadius)
+    field.arm()
+    step()
+    field.aim(() => false)
+    const dented = hostGame.snapshot(0)!.hull
+    // Then the mine clears the squadron, and the match resolves on the host.
+    field.aim((r) => r === SENTINEL)
+    let resolvedAt = -1
+    let lastHull = dented
+    for (let i = 0; i < 600 && resolvedAt < 0; i++) {
+      lastHull = hostGame.snapshot(0)?.hull ?? lastHull
+      field.arm()
+      step()
+      if (!hostGame.active) resolvedAt = i
+    }
+    const appliedAtEnd = client.stats.applied
+    const malformedAtEnd = client.stats.malformed
+    for (let i = 0; i < after; i++) step()
+    const out = {
+      h: hostEnd as RunResult | null,
+      c: clientEnd as RunResult | null,
+      dented,
+      lastHull,
+      resolvedAt,
+      results: host.stats.results,
+      concluded: !clientGame.active && clientGame.result !== null,
+      quiet: client.stats.applied === appliedAtEnd && client.stats.malformed === malformedAtEnd && client.waiting === 0,
+      stats: { ...client.stats },
+      lost: wire.lost,
+    }
+    hostGame.dispose()
+    clientGame.dispose()
+    return out
+  }
+
+  const clean = fly(0, 10)
+  const lossy = fly(0.5, 240)
+  SHIPS.wasp.maxHull = original.waspHull
+  SHIPS.drone.maxHull = original.droneHull
+  SHIPS.wasp.damage = original.waspDamage
+  SHIPS.drone.damage = original.droneDamage
+  SHIPS.wasp.radius = original.waspRadius
+  SHIPS.drone.radius = original.droneRadius
+
+  const { h, c, dented, lastHull, resolvedAt } = clean
+  check('the host dented its own hull and then cleared the squadron', dented < SHIPS.hornet.maxHull && resolvedAt >= 0, `hull ${dented}, resolved at ${resolvedAt}`)
+  check('the host reported the match ended, with a scoreboard', h !== null && h.match !== undefined && h.match.cleared && h.match.lines.length === 2, JSON.stringify(h))
+  check('and told its peer once so far', clean.results === 1, `${clean.results}`)
+  check('the mirror reported the match ended too, and is no longer running', c !== null && clean.concluded, JSON.stringify(c))
+  // The lines exactly; the clock to the float32 the wire carries it at.
+  check('with the same scoreboard', h !== null && c !== null && h.match !== undefined && c.match !== undefined &&
+      JSON.stringify(h.match.lines) === JSON.stringify(c.match.lines) && Math.abs(h.match.time - c.match.time) < 1e-3 && h.match.cleared === c.match.cleared,
+    `${JSON.stringify(h?.match)} vs ${JSON.stringify(c?.match)}`)
+  check('the dented host placed second and did not win; the peer placed first and did',
+    h !== null && c !== null && !h.won && c.won && h.match?.lines[0].place === 2 && h.match?.lines[1].place === 1 && h.score < c.score,
+    `host ${h?.score} won=${h?.won}, client ${c?.score} won=${c?.won}`)
+  check('and each machine reported its own seat', h?.ship === 'hornet' && c?.ship === 'hornet' && h?.score === h?.match?.lines[0].score && c?.score === c?.match?.lines[1].score)
+  check('the host paid both for finishing, the intact one more by the hull it was missing', h !== null && h.match !== undefined &&
+      h.match.lines[1].score - h.match.lines[0].score === 1200 - Math.round((lastHull / SHIPS.hornet.maxHull) * 1200),
+    `${h?.match?.lines.map((l) => l.score).join(' vs ')}, hull ${lastHull}`)
+  check('no snapshot followed the result', clean.quiet, JSON.stringify(clean.stats))
+
+  check('over a wire that loses half of everything, the match still resolved', lossy.resolvedAt >= 0 && lossy.lost > 100, `resolved at ${lossy.resolvedAt}, ${lossy.lost} lost`)
+  check('and the result was said again until it got through, so the mirror concluded too', lossy.results >= 2 && lossy.concluded && lossy.c !== null,
+    `${lossy.results} result frames, concluded=${lossy.concluded}`)
+  check('with the same scoreboard as the host', lossy.h !== null && lossy.c !== null && JSON.stringify(lossy.h.match?.lines) === JSON.stringify(lossy.c.match?.lines))
 }
 
 /**
@@ -5221,6 +5433,15 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
     'and mines clearing the squadron after its death paid a seat that never fired nothing',
     asVictim.scoreAtEnd === asVictim.scoreAtDeath && asVictim.scoreAtDeath === 0,
     `${asVictim.scoreAtDeath} at death, ${asVictim.scoreAtEnd} when the match ended`,
+  )
+  /* The scoreboard both machines get says the same: the eliminated seat is placed
+     last, paid no finishing bonus, and did not win; the survivor did. */
+  const board = asVictim.result?.match
+  check(
+    'on the scoreboard the eliminated seat is last, unpaid for finishing, and did not win',
+    board !== undefined && board.lines[0].alive === false && board.lines[0].place === 2 && !board.lines[0].won &&
+      board.lines[0].score === asVictim.scoreAtDeath && board.lines[1].alive && board.lines[1].place === 1 && board.lines[1].won,
+    JSON.stringify(board),
   )
   /* The other viewpoint, from the same match: the survivor really did win, so the check
      above is about *whose* result is reported rather than about the match's outcome. */
@@ -6169,8 +6390,8 @@ function testDeathEitherRespawnsOrResolves(): void {
  *
  * What this deliberately does not claim is that watching a teammate fly on after
  * your own hull is gone is *good*. It is the honest generalisation of the rule
- * that exists, and what a match should actually do with an eliminated participant
- * is milestone 8's.
+ * that exists; the scoreboard the match ends with places an eliminated seat after
+ * every flying one (`placeLines`), which is what it says about them.
  */
 function testEliminationEndsWhenTheArenaEmpties(): void {
   section('Elimination ends the run when the arena empties')
@@ -6965,6 +7186,7 @@ testScoringIsPerSeat()
 testTwoScorersKeepSeparateStreaks()
 testShootingAParticipantPays()
 testAMinePaysTheLastHitter()
+testTheMatchEndsOnEveryMachine()
 testTheStepClockNeverLosesTime()
 testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()

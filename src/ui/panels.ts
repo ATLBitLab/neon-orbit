@@ -148,7 +148,11 @@ export function createDebriefPanel(deps: DebriefDeps): DebriefPanel {
 
   const panel = el('div', 'panel')
   const heading = el('h2')
+  const placing = el('div', 'placing')
+  placing.hidden = true
   const scoreBig = el('div', 'score-big', '0')
+  const board = el('div', 'board')
+  board.hidden = true
   const lines = el('div', 'lines')
   const record = el('div', 'record', 'New personal best')
   record.hidden = true
@@ -158,7 +162,7 @@ export function createDebriefPanel(deps: DebriefDeps): DebriefPanel {
   const hangar = button('Change ship', false)
   actions.append(replay, hangar)
 
-  panel.append(heading, scoreBig, record, lines, actions)
+  panel.append(heading, placing, scoreBig, record, board, lines, actions)
   root.append(panel)
   deps.parent.append(root)
 
@@ -168,9 +172,34 @@ export function createDebriefPanel(deps: DebriefDeps): DebriefPanel {
   return {
     show(result, isRecord, best) {
       const spec = SHIPS[result.ship]
-      heading.textContent = result.won ? 'Sector clear' : 'Hull breach'
+      const match = result.match
+      const mine = match?.lines.find((l) => l.ship === result.ship && l.won === result.won && l.score === result.score)
+      // Three ways for a match to end for you: you cleared it, you were shot
+      // down, or somebody cleared it and outscored you.
+      const outscored = !result.won && match !== undefined && match.cleared && mine?.alive === true
+      heading.textContent = result.won ? 'Sector clear' : outscored ? 'Outscored' : 'Hull breach'
       heading.className = result.won ? 'glow-cyan' : 'glow-magenta'
       scoreBig.textContent = result.score.toLocaleString()
+
+      // The scoreboard, when there was more than one seat to place.
+      board.innerHTML = ''
+      board.hidden = !match || match.lines.length < 2
+      placing.hidden = board.hidden
+      if (match && match.lines.length > 1) {
+        const ordinal = (n: number) => `${n}${['th', 'st', 'nd', 'rd'][n % 10 > 3 || Math.floor((n % 100) / 10) === 1 ? 0 : n % 10]}`
+        placing.textContent = mine ? `${ordinal(mine.place)} of ${match.lines.length}` : ''
+        const ordered = match.lines.slice().sort((a, b) => a.place - b.place || a.seat - b.seat)
+        for (const line of ordered) {
+          const row = el('div', line === mine ? 'row you' : 'row')
+          const who = line === mine ? 'YOU' : `P${line.seat + 1}`
+          const acc = line.shots > 0 ? Math.round(Math.min(1, line.hits / line.shots) * 100) : 0
+          row.innerHTML =
+            `<span>${ordinal(line.place)}</span><b>${who}</b><span>${SHIPS[line.ship].name}</span>` +
+            `<b>${line.score.toLocaleString()}</b><span>${line.kills} kills · ${line.deaths} deaths · ${acc}%</span>` +
+            (line.alive ? '' : '<span class="out">eliminated</span>')
+          board.append(row)
+        }
+      }
 
       lines.innerHTML = ''
       const rows: [string, string][] = [
