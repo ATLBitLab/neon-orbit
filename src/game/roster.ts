@@ -249,7 +249,7 @@ export function recordControls(seat: Participant, c: Controls): void {
 }
 
 /**
- * Credit a landed hit.
+ * Credit a landed bolt: the damage as points, and one more hit for accuracy.
  *
  * The bounty for the kill is separate — see `creditKill` — because the two have
  * different answers to "and if nobody did it": a hit with no author scores
@@ -257,6 +257,15 @@ export function recordControls(seat: Participant, c: Controls): void {
  */
 export function creditHit(seat: Participant, amount: number): void {
   seat.hits++
+  creditDamage(seat, amount)
+}
+
+/**
+ * Credit damage that was not a bolt — a mine or a scrape the seat is owed
+ * for (`hitCredit` in `game.ts`). Points, but not a hit: accuracy is bolts
+ * landed over bolts fired, and a mine is neither.
+ */
+export function creditDamage(seat: Participant, amount: number): void {
   seat.score += Math.round(amount)
 }
 

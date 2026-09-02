@@ -44,19 +44,19 @@ import {
   type PickupKind,
 } from '../world/pickups'
 import { EnemyPilot } from './ai'
-import { createBolts, FACTION_AI, FACTION_PLAYER, type Bolts, type Faction } from './bolts'
-import type { LockRef, SeatState, ShipState, SquadronState, WorldSnapshot } from '../net/snapshot'
+import { createBolts, FACTION_AI, FACTION_ENVIRONMENT, FACTION_PLAYER, type Bolts, type Faction } from './bolts'
+import { FEED_RING, NOBODY, THE_ARENA, type KillEvent, type LockRef, type SeatState, type ShipState, type SquadronState, type WorldSnapshot } from '../net/snapshot'
 import { createChaseCamera, type ChaseCamera } from './chase'
 import { createFx, type Fx } from './fx'
 import type { Hud, HudContact, HudTarget } from './hud'
 import {
   accuracyOf,
   createSeats,
+  creditDamage,
   creditHit,
   creditKill,
   ELIMINATED,
   FLYING,
-  isParticipant,
   launchPoint,
   recordControls,
   seatOf,
@@ -80,6 +80,16 @@ import { Ship, type Controls, type ShipContext } from './ship'
  * `scripts/simcheck.ts` has always asserted against.
  */
 export const STEP = 1 / 60
+
+/**
+ * What a participant's hull is worth to whoever downs it, as a multiple of the
+ * bounty the same airframe carries when the squadron flies it.
+ *
+ * A number, not a mechanism, and it is here so that it is one number: a human
+ * on the stick is harder to hit than the scripted pilot, and the match should
+ * pay for it. Two is a first guess and a balance lever, not a finding.
+ */
+export const PARTICIPANT_BOUNTY_MULT = 2
 
 /** Hulls of each non-chosen type that make up the squadron. */
 const PER_ENEMY_TYPE = 3
@@ -492,6 +502,16 @@ export function createGame(deps: GameDeps): Game {
    */
   let mirrored = false
   let mirroredQueued = 0
+  /**
+   * The seat that last landed a hit on each hull, for damage with no author.
+   * Weak, so a retired squadron hull takes its entry with it.
+   */
+  const lastHitter = new WeakMap<Ship, Participant>()
+  /** The latest kills, oldest first, at most `FEED_RING`. Sent with every snapshot. */
+  let feed: KillEvent[] = []
+  let feedSeq = 0
+  /** A mirror: the last `KillEvent.seq` announced. */
+  let feedSeen = 0
   /** Spawn order of each squadron hull — the identity a snapshot carries for it. */
   const pilotIds = new Map<EnemyPilot, number>()
   /**
@@ -636,26 +656,79 @@ export function createGame(deps: GameDeps): Game {
   }
 
   /**
-   * Which seat is paid for a hostile going down.
+   * The seat a hit is credited to, or nobody.
    *
-   * A hit has an author or it has none, and `onDamaged` treats "none" as nobody
-   * scoring. A *kill* cannot do that without changing the game: sear is
-   * self-attributed on purpose — crediting it would count every burn tick as a
-   * shot landed and destroy the accuracy stat — and a mine has no faction at all,
-   * yet baiting a hostile into either still clears it from the squadron and still
-   * pays out. The README sells the mine version as a tactic.
-   *
-   * So an unattributable kill falls back to seat 0. With one seat that is exactly
-   * today's behaviour on every path, bit for bit, because seat 0 is the only
-   * scoreline there is. **With more than one it is arbitrary and wrong**, and it
-   * is written this way rather than fixed because fixing it means deciding
-   * whether environment kills count at all and who gets them — a match rule, and
-   * milestone 8 owns match rules. `notMe` in `ship.ts` carries the other half of
-   * the same deferral. What this must never become is a rule invented here and
-   * then inherited as if it had been chosen.
+   * A bolt names its author, and that is the credit. Damage the arena inflicts
+   * — a mine, a scrape — arrives as `FACTION_ENVIRONMENT`, and goes to the seat
+   * that last landed a hit on the victim: a hostile chased onto a mine still
+   * scores for the chaser, which the README sells as a tactic. In a match of
+   * one seat, the arena's damage to a hostile is that seat's — exactly what the
+   * old "blame the other side" produced there — so the single-player scoreline
+   * is unchanged bit for bit. With more seats and no last hitter it is nobody's.
+   * The star names the victim's own faction and is never a hit for anyone.
    */
-  function bountyGoesTo(from: Faction): Participant | null {
-    return seatOf(seats, from) ?? seats[0] ?? null
+  function hitCredit(from: Faction, victim: Ship): Participant | null {
+    if (from === FACTION_ENVIRONMENT) return lastHitter.get(victim) ?? soleSeat()
+    return seatOf(seats, from) ?? null
+  }
+
+  /**
+   * The seat paid for a kill, or nobody.
+   *
+   * The author if it has one, else the last seat to land a hit, else — in a
+   * match of one seat only — that seat. That last clause is the whole of the
+   * single-player behaviour, in which every kill was seat 0's: a hostile that
+   * flew into the star untouched still paid. With more than one seat it is
+   * no longer arbitrary: an untouched hostile burning up pays nobody.
+   */
+  function bountyGoesTo(from: Faction, victim: Ship): Participant | null {
+    return seatOf(seats, from) ?? lastHitter.get(victim) ?? soleSeat()
+  }
+
+  /** The one seat, in a match of one; nobody otherwise. */
+  function soleSeat(): Participant | null {
+    return seats.length === 1 ? seats[0] : null
+  }
+
+  /* ---- The kill feed ------------------------------------------------------ */
+
+  /** A seat by name for the feed: the watcher is YOU, everyone else is P<n>. */
+  function seatName(index: number): string {
+    return seats[index] === local() ? 'YOU' : `P${index + 1}`
+  }
+
+  /**
+   * Show one kill to the seat being drawn. The host runs this as the kill
+   * happens; a mirror runs it as the event arrives in a snapshot. Same text on
+   * every machine, from the same event, with only YOU moving.
+   */
+  function announceKill(e: KillEvent): void {
+    const watcher = local()
+    const victimName = e.victim >= 0 ? seatName(e.victim) : SHIPS[e.hull].name.toUpperCase()
+    const killerName = e.killer >= 0 ? seatName(e.killer) : e.killer === THE_ARENA ? 'THE ARENA' : 'THE SQUADRON'
+    if (e.killer >= 0 && seats[e.killer] === watcher) {
+      hud.feed(`${victimName} DOWN  +${e.award}`)
+      hud.callout('TARGET DESTROYED', `#${SHIPS[e.hull].accent.toString(16).padStart(6, '0')}`, 1.1)
+    } else if (e.victim >= 0 && seats[e.victim] === watcher) {
+      hud.feed(`DOWNED BY ${killerName}`)
+    } else {
+      hud.feed(`${killerName} ▸ ${victimName} DOWN`)
+    }
+  }
+
+  /** Record a kill for the wire and announce it here. */
+  function recordKill(killer: Participant | null, from: Faction, victim: Participant | null, hull: ShipId, award: number): void {
+    const e: KillEvent = {
+      seq: ++feedSeq,
+      killer: killer ? killer.index : from === FACTION_AI ? NOBODY : THE_ARENA,
+      victim: victim ? victim.index : NOBODY,
+      hull,
+      award,
+    }
+    feed.push(e)
+    if (feed.length > FEED_RING) feed.shift()
+    feedSeen = e.seq
+    announceKill(e)
   }
 
   /* ------------------------------------------------------------------------ */
@@ -715,27 +788,25 @@ export function createGame(deps: GameDeps): Game {
     // A hit is credited to whoever landed it, and to nobody when that is nobody.
     // `seatOf` is the lookup that makes this safe — resolving faction to seat and
     // returning nothing on a miss, rather than minting a faction from a search.
-    ship.onDamaged = (_self, amount, from) => {
-      const scorer = seatOf(seats, from)
-      if (!scorer) return
-      creditHit(scorer, amount)
+    ship.onDamaged = (self, amount, from) => {
+      const direct = seatOf(seats, from)
+      if (direct) {
+        lastHitter.set(self, direct)
+        creditHit(direct, amount)
+        return
+      }
+      const owed = hitCredit(from, self)
+      if (owed) creditDamage(owed, amount)
     }
 
     ship.onDeath = (self, from) => {
-      const scorer = bountyGoesTo(from)
+      const scorer = bountyGoesTo(from, self)
       const award = scorer ? creditKill(scorer, self.spec.bounty) : 0
       fx.explode(self.position, self.accent, self.spec.id === 'drone' ? 1.5 : 1.1)
       audio.explosion(self.spec.id === 'drone')
       const watcher = local()
       chase.shake(watcher && self.position.distanceTo(watcher.ship.position) < 420 ? 0.8 : 0.25)
-      // Announced to the seat that was paid, and to nobody else. A kill feed
-      // carrying other participants' kills is milestone 8; "TARGET DESTROYED" is
-      // about *your* target, and showing it for someone else's shot is a lie the
-      // single-player HUD never had to tell.
-      if (scorer === watcher) {
-        hud.feed(`${self.spec.name.toUpperCase()} DOWN  +${award}`)
-        hud.callout('TARGET DESTROYED', `#${self.spec.accent.toString(16).padStart(6, '0')}`, 1.1)
-      }
+      recordKill(scorer, from, null, self.spec.id, award)
     }
 
     scene.add(ship.visual.group)
@@ -796,19 +867,11 @@ export function createGame(deps: GameDeps): Game {
       }
       if (watcher && target === watcher.ship) hud.callout('MINE', '#ff3b4e', 1.2)
 
-      // Attributed to "not the victim" so a hostile chased onto a mine scores
-      // for a participant — documented behaviour, and the one place the arena has
-      // to name a culprit it does not have. See `notMe` in `ship.ts` and
-      // `bountyGoesTo` above: this is the shape that stops working once there are
-      // more than two factions, and it is deliberately still that shape.
-      //
-      // Which seat it names is now a lookup rather than a constant, and it is the
-      // *victim's* seat that decides: a participant on a mine is blamed on the AI
-      // so nobody profits from it, and a hostile on a mine is blamed on
-      // `FACTION_PLAYER`, which `bountyGoesTo` resolves to seat 0. Identical to
-      // the old ternary for one seat, and arbitrary for more than one.
-      const victimIsSeat = isParticipant(seats, target.faction)
-      target.takeDamage(MINE_DAMAGE, victimIsSeat ? FACTION_AI : FACTION_PLAYER)
+      // The arena's doing. Who is credited is `hitCredit` / `bountyGoesTo`'s
+      // rule: the last seat to land a hit on the victim, so a hostile chased
+      // onto a mine scores for the chaser and a participant on a mine pays
+      // whoever was on their tail.
+      target.takeDamage(MINE_DAMAGE, FACTION_ENVIRONMENT)
     }
   }
 
@@ -1187,6 +1250,7 @@ export function createGame(deps: GameDeps): Game {
   function respawnSeat(seat: Participant): void {
     seat.phase = FLYING
     seat.lockedTarget = null
+    lastHitter.delete(seat.ship)
     pickRespawnPoint(seat, _spawnPos)
     fightCentre(_anchor)
     seat.ship.spawn(_spawnPos, _anchor)
@@ -1537,6 +1601,7 @@ export function createGame(deps: GameDeps): Game {
       paused,
       queued: queuedCount(),
       seats: seatStates,
+      feed: feed.map((e) => ({ ...e })),
       squadron: squadronStates,
       bolts: boltStates,
       pods: environment.pickups.pods.map((pod) => ({ live: pod.live, respawnIn: pod.respawnIn })),
@@ -1663,6 +1728,17 @@ export function createGame(deps: GameDeps): Game {
     }
     // Locks resolve after every hull exists.
     for (let i = 0; i < seats.length; i++) seats[i].lockedTarget = resolveLock(s.seats[i].lock)
+
+    // The feed: whatever this snapshot carries that has not been shown. Kept
+    // as the host's ring so a re-capture is the host's bytes.
+    for (const e of s.feed) {
+      if (e.seq > feedSeen) {
+        feedSeen = e.seq
+        announceKill(e)
+      }
+    }
+    feed = s.feed.map((e) => ({ ...e }))
+    feedSeq = feed.length > 0 ? feed[feed.length - 1].seq : feedSeq
 
     bolts.restore(s.bolts)
 
@@ -2123,6 +2199,9 @@ export function createGame(deps: GameDeps): Game {
       seats = built
       acks = seats.map(() => -1)
       localIndex = drawnSeatIndex(setup.local, seats.length)
+      feed = []
+      feedSeq = 0
+      feedSeen = 0
       ctx.localFaction = seats[localIndex].faction
 
       for (const seat of seats) {
@@ -2130,13 +2209,28 @@ export function createGame(deps: GameDeps): Game {
         launchPoint(seat.index, seats.length, _spawnPos)
         ship.spawn(_spawnPos, PLAYER_SPAWN_LOOK)
 
-        // Feedback is the drawn seat's, and only the drawn seat's. Another
-        // participant being hit shakes their camera, on their machine.
-        ship.onDamaged = (_self, amount) => {
+        // A participant's hull pays like any other: the hit to whoever landed it,
+        // the kill to whoever is owed it (`bountyGoesTo`), at `PARTICIPANT_BOUNTY_MULT`
+        // times the airframe's bounty. Never to the victim, whoever the arena
+        // blames: a seat cannot profit from its own death.
+        ship.onDamaged = (self, amount, from) => {
+          const direct = seatOf(seats, from)
+          if (direct && direct !== seat) {
+            lastHitter.set(self, direct)
+            creditHit(direct, amount)
+          }
+          // Feedback is the drawn seat's, and only the drawn seat's. Another
+          // participant being hit shakes their camera, on their machine.
           if (seat !== local()) return
           hud.flashDamage()
           audio.hullHit()
           chase.shake(Math.min(1.6, 0.25 + amount * 0.02))
+        }
+        ship.onDeath = (self, from) => {
+          const owed = bountyGoesTo(from, self)
+          const scorer = owed && owed !== seat ? owed : null
+          const award = scorer ? creditKill(scorer, Math.round(self.spec.bounty * PARTICIPANT_BOUNTY_MULT)) : 0
+          recordKill(scorer, from, seat, self.spec.id, award)
         }
         // A shielded hit has to feel like *something* or the player cannot tell
         // the shield from a lull in enemy fire. Deliberately a much smaller nudge

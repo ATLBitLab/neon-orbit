@@ -24,7 +24,7 @@ import {
   type Hazard,
 } from '../world/environment'
 import { OVERDRIVE_RATE_MULT } from '../world/pickups'
-import { FACTION_AI, FACTION_PLAYER, type BoltTarget, type Bolts, type Faction } from './bolts'
+import { FACTION_ENVIRONMENT, type BoltTarget, type Bolts, type Faction } from './bolts'
 import { bound } from './intent'
 
 export interface Controls {
@@ -508,9 +508,8 @@ export class Ship implements BoltTarget {
         // Kill the inward component and bounce back a little.
         this.velocity.addScaledVector(_normal, -closing * 1.5)
         const impact = Math.abs(closing)
-        // Blamed on "somebody else", which is the one shape that does not
-        // survive more than two factions — see `NOT_ME` below.
-        this.takeDamage(Math.min(55, 4 + impact * 0.1), notMe(this.faction))
+        // The arena's doing; who is credited for it is the match's rule.
+        this.takeDamage(Math.min(55, 4 + impact * 0.1), FACTION_ENVIRONMENT)
         this.onCollide?.(this, impact)
       }
     }
@@ -763,21 +762,3 @@ export class Ship implements BoltTarget {
   }
 }
 
-/**
- * Someone other than `faction`, for damage the arena inflicts on its own.
- *
- * A station scrape and a mine have no faction, but `takeDamage` wants one, and
- * blaming the victim would let a ship credit itself. With two sides "the other
- * one" was well defined. With N it is not, and this function is where that
- * shows — it can only answer for the two factions that exist today.
- *
- * Deliberately preserved rather than fixed. This is what makes chasing a
- * hostile onto a mine score for you, which the README sells as a tactic, so
- * changing it here would be a balance change wearing a refactor's clothes. The
- * real answer is an environment faction plus a scoring rule deciding whether
- * environment kills count — a match-rules decision, milestone 8 in
- * `PLANS/NEON_ORBIT_PHASE_B.md`.
- */
-function notMe(faction: Faction): Faction {
-  return faction === FACTION_PLAYER ? FACTION_AI : FACTION_PLAYER
-}

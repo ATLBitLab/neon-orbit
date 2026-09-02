@@ -287,6 +287,74 @@ const MUTATIONS = [
     to: '        game.acknowledge(seat, -1)',
   },
 
+  /* ---- Match rules: attribution and the feed ------------------------------- */
+  {
+    name: 'a kill with no author pays seat 0 whatever the roster',
+    file: 'src/game/game.ts',
+    from: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? soleSeat()',
+    to: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? seats[0] ?? null',
+  },
+  {
+    name: 'a kill with no author pays nobody, even the last hitter',
+    file: 'src/game/game.ts',
+    from: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? soleSeat()',
+    to: '    return seatOf(seats, from) ?? soleSeat()',
+  },
+  {
+    name: 'the last hitter is never remembered',
+    file: 'src/game/game.ts',
+    from: '      if (direct) {\n        lastHitter.set(self, direct)\n        creditHit(direct, amount)\n        return\n      }',
+    to: '      if (direct) {\n        creditHit(direct, amount)\n        return\n      }',
+  },
+  {
+    name: "the arena's damage is nobody's, even in a match of one",
+    file: 'src/game/game.ts',
+    from: '    if (from === FACTION_ENVIRONMENT) return lastHitter.get(victim) ?? soleSeat()',
+    to: '    if (from === FACTION_ENVIRONMENT) return null',
+  },
+  {
+    name: 'a hit on a participant pays nothing',
+    file: 'src/game/game.ts',
+    from: '            lastHitter.set(self, direct)\n            creditHit(direct, amount)',
+    to: '            lastHitter.set(self, direct)',
+  },
+  {
+    name: 'a participant kill pays the victim',
+    file: 'src/game/game.ts',
+    from: '          const scorer = owed && owed !== seat ? owed : null',
+    to: '          const scorer = owed',
+  },
+  {
+    name: "a participant's hull is worth the same as the squadron's",
+    file: 'src/game/game.ts',
+    from: '          const award = scorer ? creditKill(scorer, Math.round(self.spec.bounty * PARTICIPANT_BOUNTY_MULT)) : 0',
+    to: '          const award = scorer ? creditKill(scorer, self.spec.bounty) : 0',
+  },
+  {
+    name: 'a mirror announces every kill in every snapshot',
+    file: 'src/game/game.ts',
+    from: '      if (e.seq > feedSeen) {\n        feedSeen = e.seq\n        announceKill(e)\n      }',
+    to: '      announceKill(e)',
+  },
+  {
+    name: 'the feed ring never lets go',
+    file: 'src/game/game.ts',
+    from: '    if (feed.length > FEED_RING) feed.shift()',
+    to: '',
+  },
+  {
+    name: 'the feed is never captured',
+    file: 'src/game/game.ts',
+    from: '      feed: feed.map((e) => ({ ...e })),',
+    to: '      feed: [],',
+  },
+  {
+    name: 'a scrape is blamed on the other side again',
+    file: 'src/game/ship.ts',
+    from: '        this.takeDamage(Math.min(55, 4 + impact * 0.1), FACTION_ENVIRONMENT)',
+    to: '        this.takeDamage(Math.min(55, 4 + impact * 0.1), (this.faction === 0 ? -1 : 0) as Faction)',
+  },
+
   /* ---- Snapshot pacing ----------------------------------------------------- */
   {
     name: 'the client applies a snapshot the tick it arrives',
@@ -683,7 +751,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 567
+const EXPECTED_ASSERTIONS = 584
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

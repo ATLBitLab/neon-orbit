@@ -22,7 +22,10 @@ import { admitIntent, bound, rampThrottle, THROTTLE_DOWN_RATE, THROTTLE_UP_RATE 
 import {
   decodeSnapshot,
   encodeSnapshot,
+  FEED_RING,
+  NOBODY,
   SNAPSHOT_VERSION,
+  THE_ARENA,
   type ShipState,
   type WorldSnapshot,
 } from '../src/net/snapshot'
@@ -30,7 +33,7 @@ import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '
 import { createLoopback } from '../src/net/channel'
 import { modeFromLocation } from '../src/net/browser'
 import { createClient, createHost, decodeWelcome, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
-import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
+import { createGame, DEATH_SEQUENCE, PARTICIPANT_BOUNTY_MULT, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
 import { createDevHook, installDevHook, type DevHook } from '../src/core/dev-hook'
@@ -2896,6 +2899,11 @@ function testTheWorldSurvivesTheWire(): void {
       { live: false, respawnIn: Math.fround(12.5) },
     ],
     mines: [true, false, true],
+    feed: [
+      { seq: 7, killer: 0, victim: NOBODY, hull: 'wasp', award: 150 },
+      { seq: 8, killer: THE_ARENA, victim: 1, hull: 'hornet', award: 0 },
+      { seq: 9, killer: 1, victim: 0, hull: 'drone', award: 240 },
+    ],
   }
 
   const bytes = encodeSnapshot(world)
@@ -3255,8 +3263,10 @@ function testAMatchCrossesTheWire(): void {
   const TICKS = Math.ceil(25 / STEP)
 
   function fly(connected: boolean) {
-    const hostGame = newMatch()
-    const clientGame = newMatch()
+    const hostHud = feedRecordingHud()
+    const clientHud = feedRecordingHud()
+    const hostGame = newMatch({ hud: hostHud })
+    const clientGame = newMatch({ hud: clientHud })
     const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: SEED, respawn: true } })
     host.start()
     const wire = createLoopback()
@@ -3302,7 +3312,11 @@ function testAMatchCrossesTheWire(): void {
       if (s1 && s1.hull < SHIPS.wasp.maxHull) fought = true
     }
     const print = matchPrint(hostGame)
-    const result = { seat, welcomed, compared, mismatched, first, fought, print, host, client, hostTick: client.hostTick }
+    const kills = hostGame.capture().feed.length > 0 ? hostGame.capture().feed[hostGame.capture().feed.length - 1].seq : 0
+    const result = {
+      seat, welcomed, compared, mismatched, first, fought, print, host, client, hostTick: client.hostTick,
+      kills, hostFeed: hostHud.lines, clientFeed: clientHud.lines,
+    }
     hostGame.dispose()
     clientGame.dispose()
     return result
@@ -3322,6 +3336,13 @@ function testAMatchCrossesTheWire(): void {
     live.host.stats.wrongSeat === 0 && live.host.stats.stale === 0 && live.host.stats.malformed === 0 && live.client.stats.stale === 0 && live.client.stats.malformed === 0,
     JSON.stringify(live.host.stats))
 
+  check('the host announced every kill once, and so did the mirror', live.kills > 0 && live.hostFeed.length === live.kills && live.clientFeed.length === live.kills,
+    `${live.kills} kills; host ${live.hostFeed.length} lines, client ${live.clientFeed.length}`)
+  check('from its own seat: the same kill reads YOU on one side and P<n> on the other',
+    live.hostFeed.some((l) => l.includes('YOU') || l.startsWith('WASP DOWN') || l.startsWith('DRONE DOWN') || l.includes('P2')) &&
+      live.clientFeed.every((l) => !l.includes('P2')) && live.hostFeed.every((l) => !l.includes('P1')),
+    JSON.stringify({ host: live.hostFeed.slice(0, 4), client: live.clientFeed.slice(0, 4) }))
+
   const deaf = fly(false)
   check('a seat nobody is flying flies differently', deaf.print !== live.print, 'the client\'s stick changed nothing on the host')
 }
@@ -3339,8 +3360,10 @@ function testABadWireIsSurvived(): void {
   section('A bad wire is survived')
 
   const TICKS = Math.ceil(20 / STEP)
-  const hostGame = newMatch()
-  const clientGame = newMatch()
+  const hostHud = feedRecordingHud()
+  const clientHud = feedRecordingHud()
+  const hostGame = newMatch({ hud: hostHud })
+  const clientGame = newMatch({ hud: clientHud })
   const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0xbad, respawn: true } })
   host.start()
   const wire = createLoopback({ loss: 0.3, latency: 1, jitter: 3, duplicate: 0.1, seed: 99 })
@@ -3405,6 +3428,8 @@ function testABadWireIsSurvived(): void {
     checkedAgainstHistory > TICKS * 0.5 && historyMismatch === 0, `${historyMismatch} mismatched`)
   check('the client kept up', client.hostTick > TICKS - 40, `client at ${client.hostTick}, host at ${TICKS}`)
   check('lost snapshots were coasted through, not waited for', c.coasted > 0 && c.coasted < TICKS * 0.4, `${c.coasted} coasted`)
+  check('and every kill still reached the mirror\'s feed exactly once', hostHud.lines.length > 0 && clientHud.lines.length === hostHud.lines.length,
+    `host ${hostHud.lines.length} lines, client ${clientHud.lines.length}`)
   hostGame.dispose()
   clientGame.dispose()
 }
@@ -4347,64 +4372,251 @@ function testTwoScorersKeepSeparateStreaks(): void {
       (zero.hits !== one.hits || zero.score !== one.score || zero.shotsFired !== one.shotsFired),
     `seat 0 ${zero?.hits}/${zero?.score}/${zero?.shotsFired}, seat 1 ${one?.hits}/${one?.score}/${one?.shotsFired}`,
   )
+  // A Hornet volley is two bolts and `shotsFired` counts volleys, so a seat can
+  // land more hits than it fired shots — and with the other seat now paying for
+  // hits too (milestone 8), it does.
   check(
     'accuracy is each seat’s own hits over its own shots',
     zero !== undefined && one !== undefined &&
-      zero.hits <= zero.shotsFired && one.hits <= one.shotsFired,
+      zero.hits <= zero.shotsFired * SHIPS.hornet.barrels && one.hits <= one.shotsFired * SHIPS.hornet.barrels,
     `seat 0 ${zero?.hits}/${zero?.shotsFired}, seat 1 ${one?.hits}/${one?.shotsFired}`,
   )
 }
 
+/** A HUD stub that keeps every feed line and callout, in order. */
+function feedRecordingHud(): Hud & { lines: string[]; callouts: string[] } {
+  const hud = stubHud() as Hud & { lines: string[]; callouts: string[] }
+  hud.lines = []
+  hud.callouts = []
+  hud.feed = (text) => {
+    hud.lines.push(text)
+  }
+  hud.callout = (text) => {
+    hud.callouts.push(text)
+  }
+  return hud
+}
+
 /**
- * What a participant shooting another participant is worth: nothing, yet.
+ * What a participant shooting another participant is worth: milestone 8's answer.
  *
- * This pins a *gap*, deliberately, so that closing it is a decision rather than an
- * accident. Hits and bounties are credited against the AI squadron only — the
- * enemy ships are where `onDamaged` and `onDeath` do the crediting — so a bolt
- * that lands on another seat does damage and pays no points.
+ * A hit on another seat is a hit — points for the damage, one more for accuracy —
+ * and downing one pays `PARTICIPANT_BOUNTY_MULT` times the bounty the same airframe
+ * carries when the squadron flies it, through the shooter's streak. The victim is
+ * never paid, whoever the arena blames. Both seats' views of the same kill are
+ * asserted from the feed: the shooter is told what it downed and what it was paid,
+ * the victim is told who downed it.
  *
- * That is milestone 8's to settle and not this one's, because the answer is a
- * number rather than a mechanism: `PLANS/NEON_ORBIT_PHASE_B.md` still has "AI kills
- * count for less than human kills" as an open question, and a human hull has no
- * bounty on its spec sheet to borrow. Inventing one here would be a balance
- * decision wearing a refactor's clothes.
- *
- * When milestone 8 does settle it, this check fails. That is the intent: it is a
- * note that has to be read, not a wall.
+ * Flown rather than staged: two Hornets on the autopilot with hulls the size of
+ * stations, the squadron unkillable and untouchable so every point in the match
+ * is participant-on-participant.
  */
-function testShootingAParticipantScoresNothingYet(): void {
-  section('Shooting another participant scores nothing yet — milestone 8')
+function testShootingAParticipantPays(): void {
+  section('Shooting another participant pays, and the feed says who')
 
-  const bolts = createBolts()
-  const ctx: ShipContext = { hazards: [], audio: silentAudio(), bolts, localFaction: FACTION_PLAYER }
+  const original = {
+    hornetHull: SHIPS.hornet.maxHull,
+    hornetRadius: SHIPS.hornet.radius,
+    waspHull: SHIPS.wasp.maxHull,
+    droneHull: SHIPS.drone.maxHull,
+    waspRadius: SHIPS.wasp.radius,
+    droneRadius: SHIPS.drone.radius,
+    waspDamage: SHIPS.wasp.damage,
+    droneDamage: SHIPS.drone.damage,
+  }
+  SHIPS.hornet.maxHull = 40
+  SHIPS.hornet.radius = 350
+  SHIPS.wasp.maxHull = 1e6
+  SHIPS.drone.maxHull = 1e6
+  SHIPS.wasp.radius = 0.001
+  SHIPS.drone.radius = 0.001
+  SHIPS.wasp.damage = 0
+  SHIPS.drone.damage = 0
 
-  const seats = createSeats([SHIPS.hornet, SHIPS.wasp], 0x5c0e2)
-  const [alice, bob] = seats
-  alice.ship.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
-  bob.ship.spawn(new THREE.Vector3(0, 0, -300), new THREE.Vector3(0, 0, -2000))
-  settle([alice.ship, bob.ship], ctx)
-
-  const line = [alice.ship, bob.ship]
-  const before = bob.ship.hull
-  for (let i = 0; i < 400 && bob.ship.hull === before; i++) {
-    alice.ship.position.set(0, 0, 0)
-    alice.ship.velocity.set(0, 0, 0)
-    bob.ship.position.set(0, 0, -300)
-    bob.ship.velocity.set(0, 0, 0)
-    alice.ship.step(controls({ fire: true }), STEP, ctx)
-    bolts.update(STEP, line, [])
+  function fly(localSeat: number) {
+    const hud = feedRecordingHud()
+    const game = newMatch({ hud })
+    game.start({ ships: ['hornet', 'hornet'], seed: 0x8a7e, respawn: true, local: localSeat })
+    const crew = seatPilots(2)
+    const intents: Controls[] = []
+    let last: RunSnapshot[] = []
+    for (let i = 0; i < Math.ceil(30 / STEP); i++) {
+      const views = [game.snapshot(0), game.snapshot(1)]
+      if (views.some((v) => v === null)) break
+      last = views as RunSnapshot[]
+      flyAll(game, crew, intents)
+    }
+    const feed = game.capture().feed
+    game.dispose()
+    return { views: last, hud, feed }
   }
 
-  check('a seat can shoot another seat', bob.ship.hull < before, `hull ${bob.ship.hull}/${before}`)
-  check('the shooter fired', alice.ship.shotsFired > 0)
-  check(
-    'and the hit paid nothing — milestone 8 decides what a participant is worth',
-    alice.score === 0 && alice.hits === 0,
-    `score ${alice.score}, hits ${alice.hits}`,
-  )
+  const from0 = fly(0)
+  const from1 = fly(1)
+  SHIPS.hornet.maxHull = original.hornetHull
+  SHIPS.hornet.radius = original.hornetRadius
+  SHIPS.wasp.maxHull = original.waspHull
+  SHIPS.drone.maxHull = original.droneHull
+  SHIPS.wasp.radius = original.waspRadius
+  SHIPS.drone.radius = original.droneRadius
+  SHIPS.wasp.damage = original.waspDamage
+  SHIPS.drone.damage = original.droneDamage
 
-  bolts.dispose()
-  for (const seat of seats) seat.ship.dispose()
+  const [zero, one] = from0.views
+  const deaths = (zero?.deaths ?? 0) + (one?.deaths ?? 0)
+  const kills = (zero?.kills ?? 0) + (one?.kills ?? 0)
+  check('the two seats fought each other to at least one death', from0.views.length === 2 && deaths > 0, `${deaths} deaths`)
+  check('every death was a kill for the other seat', deaths > 0 && kills === deaths, `${kills} kills for ${deaths} deaths`)
+  check('hits on a participant are hits', (zero?.hits ?? 0) + (one?.hits ?? 0) > 0, `${zero?.hits} / ${one?.hits}`)
+  check('and are paid', (zero?.score ?? 0) + (one?.score ?? 0) > 0, `${zero?.score} / ${one?.score}`)
+
+  const events = from0.feed
+  const first = events[0]
+  const bounty = Math.round(SHIPS.hornet.bounty * PARTICIPANT_BOUNTY_MULT)
+  check('the feed carries the kill: a seat downed a seat', first !== undefined && first.killer >= 0 && first.victim >= 0 && first.killer !== first.victim && first.hull === 'hornet',
+    JSON.stringify(first))
+  // The ring holds the *last* kills, so this may be the shooter's second or third: any
+  // rung of the streak is the right answer, and nothing else is.
+  const rungs = Array.from({ length: 8 }, (_, k) => Math.round(bounty * Math.min(3, 1 + (k + 1) * 0.25)))
+  check(`and the bounty is ${PARTICIPANT_BOUNTY_MULT}× the airframe's, through the shooter's streak`,
+    first !== undefined && rungs.includes(first.award), `${first?.award}, bounty ${bounty}, rungs ${rungs.join('/')}`)
+  check('the feed is capped at the ring', events.length <= FEED_RING && events.every((e, i) => i === 0 || e.seq === events[i - 1].seq + 1),
+    `${events.length} events, seqs ${events.map((e) => e.seq).join(',')}`)
+
+  const killerView = first && first.killer === 0 ? from0 : from1
+  const victimView = first && first.killer === 0 ? from1 : from0
+  const victimName = first ? `P${first.victim + 1}` : '?'
+  const killerName = first ? `P${first.killer + 1}` : '?'
+  check('the shooter\'s feed names what it downed and what it was paid',
+    first !== undefined && killerView.hud.lines.includes(`${victimName} DOWN  +${first.award}`) && killerView.hud.callouts.includes('TARGET DESTROYED'),
+    JSON.stringify(killerView.hud.lines.slice(0, 3)))
+  check('the victim\'s feed names who downed it',
+    first !== undefined && victimView.hud.lines.includes(`DOWNED BY ${killerName}`), JSON.stringify(victimView.hud.lines.slice(0, 3)))
+  check('and the same match was fought from both viewpoints', JSON.stringify(from0.feed) === JSON.stringify(from1.feed))
+}
+
+/**
+ * Who a mine pays: the seat that last hit the victim, and nobody else.
+ *
+ * The README sells chasing a hostile onto a mine as a tactic, and with one seat that
+ * was implemented by blaming "the other side", which resolved to seat 0 whatever had
+ * happened. Milestone 8 makes it a rule that survives a roster: the arena's damage is
+ * credited to the last seat that landed a hit on the victim; a hostile nobody touched
+ * pays nobody — except in a match of one seat, where it pays that seat, which is the
+ * shipped single-player scoreline bit for bit. And a seat is never paid for its own
+ * death, whoever the arena blames.
+ *
+ * Two seats, one shooting and one holding station with its trigger untouched; the
+ * squadron cannot shoot back and cannot be killed by bolts, so every kill is the
+ * mine's, and every point in the shooter's line is a hit or a mine it is owed for.
+ */
+function testAMinePaysTheLastHitter(): void {
+  section('A mine pays the seat that last hit the victim')
+
+  const original = {
+    waspHull: SHIPS.wasp.maxHull,
+    droneHull: SHIPS.drone.maxHull,
+    waspRadius: SHIPS.wasp.radius,
+    droneRadius: SHIPS.drone.radius,
+    waspDamage: SHIPS.wasp.damage,
+    droneDamage: SHIPS.drone.damage,
+    hornetHull: SHIPS.hornet.maxHull,
+    hornetDamage: SHIPS.hornet.damage,
+  }
+  // A hostile a mine kills outright and ten seconds of Hornet fire cannot: at
+  // most 67 bolts of a tenth each against a hull of exactly the mine's damage.
+  SHIPS.wasp.maxHull = MINE_DAMAGE
+  SHIPS.drone.maxHull = MINE_DAMAGE
+  SHIPS.wasp.radius = 350
+  SHIPS.drone.radius = 350
+  SHIPS.wasp.damage = 0
+  SHIPS.drone.damage = 0
+  SHIPS.hornet.maxHull = 1e6
+  SHIPS.hornet.damage = 0.1
+  const SENTINEL = 350
+
+  /**
+   * Two waves. The squadron warps in three at a time, so the first three are
+   * mined before anybody has fired — nobody has touched them — and the next
+   * three are worked over by the shooter for ten seconds first.
+   */
+  function fly(ships: ShipId[], shooter: number | null) {
+    const field = aimedMinefield()
+    const game = newMatch({ environment: { ...stubEnvironment(), minefield: field } })
+    game.start({ ships, seed: 0x3a5e, respawn: true })
+    const crew = seatPilots(ships.length)
+    const intents: Controls[] = []
+    const idle = () => ships.map(() => controls({ throttle: 0.3 }))
+    const line = () => ships.map((_, i) => ({ ...game.snapshot(i)! }))
+
+    function waitForWave(): number {
+      for (let i = 0; i < Math.ceil(40 / STEP); i++) {
+        if ((game.snapshot(0)?.enemiesAirborne ?? 0) >= 3) break
+        game.step(idle())
+      }
+      return game.snapshot(0)?.enemiesAirborne ?? 0
+    }
+    const remaining = () => (game.snapshot(0)?.enemiesAirborne ?? 0) + (game.snapshot(0)?.enemiesQueued ?? 0)
+    /** Mine until the squadron is down to `until` hulls, airborne or waiting. */
+    function mine(until: number): void {
+      field.aim((r) => r === SENTINEL)
+      for (let i = 0; i < 200 && remaining() > until; i++) {
+        field.arm()
+        game.step(idle())
+      }
+      field.aim(() => false)
+    }
+
+    const wave1 = waitForWave()
+    mine(3)
+    const untouched = { line: line(), feed: game.capture().feed.map((e) => e.killer), airborne: remaining() }
+
+    const wave2 = waitForWave()
+    for (let i = 0; i < Math.ceil(10 / STEP); i++) {
+      for (let j = 0; j < crew.length; j++) {
+        steer(crew[j].device, j === shooter ? (game.snapshot(j)?.target ?? null) : null)
+        intents[j] = crew[j].pilot.advance(crew[j].device.state, STEP)
+        if (j !== shooter) intents[j] = controls({ ...intents[j], fire: false })
+      }
+      game.step(intents)
+    }
+    const shot = line()
+    // To one, not none: the last kill clears the squadron, `finish` clears the
+    // arena, and there is no line left to read. See `matchPrint`'s note.
+    mine(1)
+    const worked = { line: line(), airborne: remaining() }
+    game.dispose()
+    return { wave1, wave2, untouched, shot, worked }
+  }
+
+  const two = fly(['hornet', 'hornet'], 1)
+  check('two seats: a wave of three was mined before anybody fired', two.wave1 === 3 && two.untouched.airborne === 3 && two.untouched.line.every((s) => s.shotsFired === 0),
+    `${two.wave1} airborne, ${two.untouched.airborne} left of 6; shots ${two.untouched.line.map((s) => s.shotsFired).join('/')}`)
+  check('and paid nobody: the feed blames the arena', two.untouched.feed.length === 3 && two.untouched.feed.every((k) => k === THE_ARENA) &&
+      two.untouched.line.every((s) => s.kills === 0 && s.score === 0),
+    `killers ${two.untouched.feed.join(',')}; kills ${two.untouched.line.map((s) => s.kills).join('/')}, scores ${two.untouched.line.map((s) => s.score).join('/')}`)
+  check('the second wave was worked over by one seat', two.wave2 === 3 && two.shot[1].hits > 0 && two.shot[1].kills === 0 && two.shot[0].shotsFired === 0,
+    `${two.shot[1].hits} hits by seat 1, seat 0 fired ${two.shot[0].shotsFired}`)
+  check('and when the mine took it, the shooter was paid for what it had hit', two.worked.airborne === 1 && two.worked.line[1].kills > 0 && two.worked.line[1].score > two.shot[1].score,
+    `${two.worked.line[1].kills} kills, ${two.shot[1].score} -> ${two.worked.line[1].score}`)
+  check('and the idle seat, which hit nothing, for nothing', two.worked.line[0].kills === 0 && two.worked.line[0].score === 0 && two.worked.line[0].hits === 0,
+    `${two.worked.line[0].kills} kills, score ${two.worked.line[0].score}`)
+
+  const one = fly(['hornet'], null)
+  check('one seat: the untouched wave still pays the sole seat — the shipped rule', one.wave1 === 3 && one.untouched.airborne === 3 &&
+      one.untouched.line[0].kills === 3 && one.untouched.line[0].hits === 0 && one.untouched.line[0].score > 0,
+    `${one.untouched.line[0].kills} kills, ${one.untouched.line[0].hits} hits, score ${one.untouched.line[0].score}`)
+  check('and so does the second, without a shot fired', one.worked.airborne === 1 && one.worked.line[0].kills === 5 && one.worked.line[0].shotsFired === 0,
+    `${one.worked.line[0].kills} kills, ${one.worked.line[0].shotsFired} shots`)
+
+  SHIPS.wasp.maxHull = original.waspHull
+  SHIPS.drone.maxHull = original.droneHull
+  SHIPS.wasp.radius = original.waspRadius
+  SHIPS.drone.radius = original.droneRadius
+  SHIPS.wasp.damage = original.waspDamage
+  SHIPS.drone.damage = original.droneDamage
+  SHIPS.hornet.maxHull = original.hornetHull
+  SHIPS.hornet.damage = original.hornetDamage
 }
 
 /**
@@ -4991,15 +5203,14 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
   )
   /*
    * Exactly the score it had when it died, and the assertion is the *equality* rather
-   * than a bound. A threshold was the first attempt and it was a bad proxy: this seat
-   * legitimately earned 1813 points, because unattributable kills fall back to seat 0
-   * and the mine clearing the squadron produced a lot of them — so "the score is small"
-   * says nothing about whether a bonus was added.
+   * than a bound. A threshold was the first attempt and it was a bad proxy.
    *
-   * The freeze is load-bearing here, which the second check establishes: the seat keeps
-   * being credited after it is dead, for exactly the reason `sealResult` exists — "long
-   * enough for a hostile to fly into the star and post a bounty to a pilot who is
-   * already dead".
+   * Until milestone 8 this seat went on earning after it was dead — 1813 points, because
+   * unattributable kills fell back to seat 0 and the mine clearing the squadron produced
+   * a lot of them — and the freeze was what kept them out of the report. The rule now is
+   * that a kill with no author pays the last seat to land a hit on the victim, and this
+   * seat never fired, so the second check pins the other half: a dead seat that touched
+   * nothing is credited nothing.
    */
   check(
     'and its result is the scoreline it died with',
@@ -5007,8 +5218,8 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
     `reported ${asVictim.result?.score}, had ${asVictim.scoreAtDeath} at death`,
   )
   check(
-    'which is not the same as its scoreline at the end — the seal is doing work',
-    asVictim.scoreAtEnd > asVictim.scoreAtDeath,
+    'and mines clearing the squadron after its death paid a seat that never fired nothing',
+    asVictim.scoreAtEnd === asVictim.scoreAtDeath && asVictim.scoreAtDeath === 0,
     `${asVictim.scoreAtDeath} at death, ${asVictim.scoreAtEnd} when the match ended`,
   )
   /* The other viewpoint, from the same match: the survivor really did win, so the check
@@ -6752,7 +6963,8 @@ testTheDevHookReadsTheRunningGame()
 testTheLoopSurvivesTheEndOfARun()
 testScoringIsPerSeat()
 testTwoScorersKeepSeparateStreaks()
-testShootingAParticipantScoresNothingYet()
+testShootingAParticipantPays()
+testAMinePaysTheLastHitter()
 testTheStepClockNeverLosesTime()
 testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()
