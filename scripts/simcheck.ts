@@ -29,7 +29,7 @@ import {
 import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '../src/net/wire'
 import { createLoopback } from '../src/net/channel'
 import { modeFromLocation } from '../src/net/browser'
-import { createClient, createHost, decodeWelcome, encodeWelcome, FRAME } from '../src/net/session'
+import { createClient, createHost, decodeWelcome, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
 import { createGame, DEATH_SEQUENCE, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
@@ -3270,28 +3270,39 @@ function testAMatchCrossesTheWire(): void {
     const hostPilot = createPilot()
     const clientDevice = stubInput()
     const clientPilot = createPilot()
+    /** The host's world by tick, as bytes: what the client must be at whatever tick it applied. */
+    const history = new Map<number, Uint8Array>()
+    let compared = 0
     let mismatched = 0
     let first = ''
     let fought = false
+    let lastApplied = -1
     for (let i = 0; i < TICKS; i++) {
       steer(hostDevice, hostGame.snapshot(0)?.target ?? null)
       steer(clientDevice, clientGame.snapshot(1)?.target ?? null)
+      // The client applies a snapshot on its own tick, one behind the wire; the
+      // comparison is therefore against the host's world *at that tick*, and
+      // is made on every tick the client applied one.
       client.tick(clientPilot.advance(clientDevice.state, STEP))
-      host.tick(hostPilot.advance(hostDevice.state, STEP))
-      wire.pump()
-      if (connected && i > 0) {
-        const h = encodeSnapshot(hostGame.capture())
-        const c = encodeSnapshot(clientGame.capture())
-        if (!sameBytes(h, c)) {
-          mismatched++
-          if (!first) first = `first at tick ${i}`
+      if (connected && client.hostTick !== lastApplied) {
+        lastApplied = client.hostTick
+        const h = history.get(lastApplied)
+        if (h) {
+          compared++
+          if (!sameBytes(h, encodeSnapshot(clientGame.capture()))) {
+            mismatched++
+            if (!first) first = `first at host tick ${lastApplied}`
+          }
         }
       }
+      host.tick(hostPilot.advance(hostDevice.state, STEP))
+      history.set(hostGame.capture().tick, encodeSnapshot(hostGame.capture()))
+      wire.pump()
       const s1 = hostGame.snapshot(1)
       if (s1 && s1.hull < SHIPS.wasp.maxHull) fought = true
     }
     const print = matchPrint(hostGame)
-    const result = { seat, welcomed, mismatched, first, fought, print, host, client, hostTick: client.hostTick }
+    const result = { seat, welcomed, compared, mismatched, first, fought, print, host, client, hostTick: client.hostTick }
     hostGame.dispose()
     clientGame.dispose()
     return result
@@ -3300,8 +3311,11 @@ function testAMatchCrossesTheWire(): void {
   const live = fly(true)
   check('the peer was handed seat 1', live.seat === 1 && live.welcomed === 1, `seat ${live.seat}, welcomed ${live.welcomed}`)
   check('the host fought a real fight', live.fought)
-  check(`the client's world is the host's on every tick`, live.mismatched === 0, live.first)
-  check('the client applied a snapshot for every host tick', live.hostTick === TICKS, `host tick ${live.hostTick} of ${TICKS}`)
+  check(`the client's world is the host's at every tick it applied (${live.compared})`, live.compared >= TICKS - 2 && live.mismatched === 0, live.first)
+  check('every host tick was applied one per client tick, none coasted, none skipped',
+    live.client.stats.applied + live.client.waiting === TICKS && live.client.waiting <= 1 &&
+      live.client.stats.coasted === 0 && live.client.stats.skipped === 0,
+    `applied ${live.client.stats.applied}, waiting ${live.client.waiting}, ${JSON.stringify(live.client.stats)}`)
   check('every intent was admitted and only the first tick was held', live.host.stats.admitted === TICKS && live.host.stats.held <= 1,
     `admitted ${live.host.stats.admitted}, held ${live.host.stats.held}`)
   check('nothing was refused, stale or malformed on a perfect wire',
@@ -3350,20 +3364,28 @@ function testABadWireIsSurvived(): void {
   let threw = ''
   let checkedAgainstHistory = 0
   let historyMismatch = 0
+  let lastApplied = -1
+  let wentBackwards = 0
   for (let i = 0; i < TICKS; i++) {
     try {
       steer(hostDevice, hostGame.snapshot(0)?.target ?? null)
       steer(clientDevice, clientGame.snapshot(1)?.target ?? null)
       client.tick(clientPilot.advance(clientDevice.state, STEP))
+      // On the tick it applied one. A tick it coasted through is the host's
+      // world carried a tick forward, and is measured in its own section.
+      const at = client.hostTick
+      if (at !== lastApplied) {
+        if (at < lastApplied) wentBackwards++
+        lastApplied = at
+        const expected = history.get(at)
+        if (at >= 0 && expected) {
+          checkedAgainstHistory++
+          if (!sameBytes(expected, encodeSnapshot(clientGame.capture()))) historyMismatch++
+        }
+      }
       host.tick(hostPilot.advance(hostDevice.state, STEP))
       history.set(hostGame.capture().tick, encodeSnapshot(hostGame.capture()))
       wire.pump()
-      const at = client.hostTick
-      const expected = history.get(at)
-      if (at >= 0 && expected) {
-        checkedAgainstHistory++
-        if (!sameBytes(expected, encodeSnapshot(clientGame.capture()))) historyMismatch++
-      }
     } catch (e) {
       threw = `tick ${i}: ${String(e)}`
       break
@@ -3374,6 +3396,7 @@ function testABadWireIsSurvived(): void {
   check('nothing threw', threw === '', threw)
   check('frames were actually lost', wire.lost > TICKS * 0.2, `${wire.lost} lost`)
   check('reordered snapshots were dropped as stale', c.stale > 0, `${c.stale}`)
+  check('and the world the client shows never went back in time', wentBackwards === 0, `${wentBackwards} regressions`)
   check('reordered or duplicated intents were dropped as stale', h.stale > 0, `${h.stale}`)
   check('lost intents were held, not zeroed', h.held > 0 && h.held < TICKS, `${h.held}`)
   check('most intents still got through', h.admitted > TICKS * 0.5, `${h.admitted} of ${TICKS}`)
@@ -3381,6 +3404,7 @@ function testABadWireIsSurvived(): void {
   check(`the client's world is the host's world at whatever tick it last applied (${checkedAgainstHistory} ticks)`,
     checkedAgainstHistory > TICKS * 0.5 && historyMismatch === 0, `${historyMismatch} mismatched`)
   check('the client kept up', client.hostTick > TICKS - 40, `client at ${client.hostTick}, host at ${TICKS}`)
+  check('lost snapshots were coasted through, not waited for', c.coasted > 0 && c.coasted < TICKS * 0.4, `${c.coasted} coasted`)
   hostGame.dispose()
   clientGame.dispose()
 }
@@ -3451,6 +3475,9 @@ function testThePeerFliesItsOwnSeatOnly(): void {
   check('and the host keeps ticking', stepped)
 
   wire.pump()
+  // The client applies on its own tick; one tick, so there is something applied
+  // for the garbage below to fail to change.
+  client.tick(idle)
   const appliedBefore = client.stats.applied
   wire.a.send(new Uint8Array([FRAME.SNAPSHOT, 1, 2, 3]))
   wire.a.send(new Uint8Array([200]))
@@ -3458,6 +3485,24 @@ function testThePeerFliesItsOwnSeatOnly(): void {
   check('the client counts garbage too and applies nothing from it',
     client.stats.malformed === 2 && client.stats.applied === appliedBefore && appliedBefore > 0,
     JSON.stringify(client.stats))
+  // A frame that decodes but cannot be applied — the wrong roster — is counted
+  // on the tick it would have been applied, and the tick goes on.
+  const other = newMatch()
+  other.start({ ships: ['drone'], seed: 1 })
+  while (client.waiting > 0) client.tick(idle)
+  const appliedThen = client.stats.applied
+  wire.a.send(new Uint8Array([FRAME.SNAPSHOT, ...encodeSnapshot({ ...other.capture(), tick: hostGame.capture().tick + 1000 })]))
+  other.dispose()
+  wire.pump()
+  let ticked = true
+  try {
+    // Two ticks: a gap at the head of the queue is coasted once before it is applied.
+    for (let i = 0; i < 3 && client.waiting > 0; i++) client.tick(idle)
+  } catch {
+    ticked = false
+  }
+  check('a snapshot for another roster is counted, applies nothing, and the tick survives it',
+    ticked && client.stats.malformed === 3 && client.stats.applied === appliedThen, JSON.stringify(client.stats))
 
   // Two seats, a second peer: refused, told, and closed.
   const second = createLoopback()
@@ -3558,8 +3603,8 @@ function testTheStickIsAttachedToTheShip(): void {
     let worstAck = 0
     let reconciled = 0
     let worstReconcile = 0
-    let lagSum = 0
-    let lagSamples = 0
+    let alongSum = 0
+    let alongSamples = 0
     let lastAck = -1
     let moved = 0
     /** The host's truth for seat 1, by the intent tick it was flown on. */
@@ -3599,11 +3644,22 @@ function testTheStickIsAttachedToTheShip(): void {
         const lag = Math.hypot(now.x - latest.x, now.y - latest.y, now.z - latest.z)
         reconciled++
         worstReconcile = Math.max(worstReconcile, lag)
-        lagSum += lag
-        lagSamples++
+      }
+      // Where the client draws its own hull against where the host has it *right
+      // now*, signed along the hull's track: ahead is positive, behind negative.
+      const mine = clientGame.snapshot(1)!.position
+      const theirs = hostGame.capture().seats[1].ship
+      const v = Math.hypot(theirs.velocity.x, theirs.velocity.y, theirs.velocity.z)
+      if (v > 1 && view.phase === 'flying') {
+        alongSum +=
+          ((mine.x - theirs.position.x) * theirs.velocity.x +
+            (mine.y - theirs.position.y) * theirs.velocity.y +
+            (mine.z - theirs.position.z) * theirs.velocity.z) /
+          v
+        alongSamples++
       }
     }
-    const result = { acked, ackMismatch, worstAck, reconciled, worstReconcile, meanLag: lagSamples ? lagSum / lagSamples : -1, moved, unacked: client.unacknowledged }
+    const result = { acked, ackMismatch, worstAck, reconciled, worstReconcile, along: alongSamples ? alongSum / alongSamples : 0, moved, unacked: client.unacknowledged }
     hostGame.dispose()
     clientGame.dispose()
     return result
@@ -3621,11 +3677,14 @@ function testTheStickIsAttachedToTheShip(): void {
     `${on.ackMismatch} off by more than 0.1; worst ${on.worstAck.toFixed(3)}`)
   check('and after every reconcile the hull sits on its own latest prediction', on.worstReconcile < 0.1,
     `worst ${on.worstReconcile.toFixed(3)}`)
-  check('the replay window is the wire latency, not the whole history', on.unacked >= 1 && on.unacked <= LATENCY + 2, `${on.unacked}`)
+  // Plus one: a snapshot waits a tick in the client's queue before it is applied.
+  check('the replay window is the wire latency, not the whole history', on.unacked >= 1 && on.unacked <= LATENCY + 3, `${on.unacked}`)
+  check('the predicted hull flies ahead of where the host has it, by about the uplink', on.along > 3 * LATENCY && on.along < 12 * LATENCY,
+    `${on.along.toFixed(2)} units ahead`)
 
   check('without prediction the hull does not move on the stick', off.moved < TICKS, `${off.moved} of ${TICKS}`)
-  check('and trails the host by the wire latency', off.meanLag > 5 && off.meanLag > on.meanLag * 20,
-    `mean lag ${off.meanLag.toFixed(2)} units unpredicted, ${on.meanLag.toFixed(3)} predicted`)
+  check('and it trails where the host has it, by about the downlink', off.along < -3 * LATENCY,
+    `${off.along.toFixed(2)} units along the track`)
 
   /* predict and reconcile refuse what they cannot fly, quietly. */
   const solo = newMatch()
@@ -3659,6 +3718,243 @@ function testTheStickIsAttachedToTheShip(): void {
   check('a predicted shot fires no bolt', predictedBolts === 0, `${predictedBolts} bolts in the pool`)
   check('while a stepped one does', steppedBolts > 0, `${steppedBolts}`)
   solo.dispose()
+}
+
+
+/**
+ * The picture moves to the frame's clock, not the wire's.
+ *
+ * A wire delivers to its own rhythm: two snapshots in one tick, none the next.
+ * The first version of the client applied each as it arrived, and the frame then
+ * blended between the last two poses at a factor taken from the *local* clock —
+ * so a pair that advanced twice between frames jumped, and one that did not
+ * advance slid backwards. That is the "jerky on the joined player" of the first
+ * real two-device test, and the host never showed it because the host's pairs
+ * advance exactly once per tick by construction.
+ *
+ * So the client applies one snapshot per tick of its own, holds what arrives
+ * early, coasts through what arrives late (`Game.coast`: every hull and bolt
+ * carried one tick along its last velocity), and drains two a tick when it has
+ * fallen more than `SNAPSHOT_DEPTH` behind. Measured here on the host's own hull
+ * as the client draws it: the distance it moves between consecutive client ticks
+ * must never be zero while it is flying and must never jump, against a client
+ * with pacing off over the same wire, which does both on a tenth of its ticks.
+ * Whatever the client applied is still the host's world byte for byte; a
+ * coasted tick is the host's world one tick on, within a unit; and the queue
+ * settles at the depth the jitter needs and no deeper.
+ */
+function testAJitteryWireIsDrawnSteadily(): void {
+  section('A jittery wire is drawn steadily')
+
+  const LATENCY = 2
+  const JITTER = 3
+  const TICKS = Math.ceil(20 / STEP)
+  /** Ticks the queue is given to find the wire's depth before coasting must stop. */
+  const SETTLE = 300
+
+  const hulls = { hornet: SHIPS.hornet.maxHull, wasp: SHIPS.wasp.maxHull }
+  SHIPS.hornet.maxHull = 1e6
+  SHIPS.wasp.maxHull = 1e6
+
+  type Vec = { x: number; y: number; z: number }
+  const dist = (a: Vec, b: Vec) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z)
+
+  function fly(pace: boolean) {
+    const hostGame = newMatch()
+    const clientGame = newMatch()
+    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0x11e7, respawn: true } })
+    host.start()
+    const wire = createLoopback({ latency: LATENCY, jitter: JITTER, duplicate: 0.05, seed: 7 })
+    const client = createClient({ game: clientGame, channel: wire.b, pace })
+    host.accept(wire.a)
+    for (let i = 0; i <= LATENCY + JITTER; i++) wire.pump()
+
+    const hostDevice = stubInput()
+    const hostPilot = createPilot()
+    const clientDevice = stubInput()
+    const clientPilot = createPilot()
+    /** The host's world by tick: seat 0's hull, the bolts by slot, and the bytes. */
+    const truth = new Map<number, { hull: Vec; bolts: Map<number, Vec>; world: WorldSnapshot; bytes: Uint8Array }>()
+    let last: Vec | null = null
+    let stalls = 0
+    let jumps = 0
+    let compared = 0
+    let mismatched = 0
+    let lastApplied = -1
+    let coasts = 0
+    let worstCoast = 0
+    let coastedBySettle = 0
+    let behind = 0
+
+    for (let i = 0; i < TICKS; i++) {
+      steer(hostDevice, hostGame.snapshot(0)?.target ?? null)
+      steer(clientDevice, clientGame.snapshot(1)?.target ?? null)
+      const coastedBefore = client.stats.coasted
+      client.tick(clientPilot.advance(clientDevice.state, STEP))
+
+      /* The host's hull, as this client draws it, tick to tick, against how far
+         the host's own simulation moved it in one tick — so a real event (two
+         hulls bouncing off each other) is not mistaken for the wire. */
+      const view = clientGame.snapshot(0)!.position
+      const h = client.hostTick
+      if (last) {
+        const step = dist(view, last)
+        const t0 = truth.get(h - 1)
+        const t1 = truth.get(h)
+        const t2 = truth.get(h + 1)
+        if (t0 && t1 && dist(t1.hull, t0.hull) > 0.5 && step > 1.5 * dist(t1.hull, t0.hull)) jumps++
+        if (t1 && t2 && dist(t2.hull, t1.hull) > 0.5 && step < 1e-6) stalls++
+      }
+      if (h >= 0) last = view
+
+      /* A coasted tick stands in for the snapshot after the last one applied. */
+      if (client.stats.coasted > coastedBefore) {
+        const t = truth.get(client.hostTick + 1)
+        if (t) {
+          coasts++
+          let worst = dist(view, t.hull)
+          for (const b of clientGame.capture().bolts) {
+            const tb = t.bolts.get(b.slot)
+            if (tb) worst = Math.max(worst, dist(b.pos, tb))
+          }
+          worstCoast = Math.max(worstCoast, worst)
+        }
+      }
+
+      /* An applied tick is the host's world at that tick — every hull but the
+         one this client flies itself, which is predicted ahead by design. */
+      if (client.hostTick !== lastApplied) {
+        lastApplied = client.hostTick
+        const t = truth.get(lastApplied)
+        if (t) {
+          compared++
+          const mine = clientGame.capture()
+          const theirs = t.world
+          if (!sameBytes(t.bytes, encodeSnapshot({ ...mine, seats: [mine.seats[0], theirs.seats[1]] }))) mismatched++
+        }
+      }
+
+      host.tick(hostPilot.advance(hostDevice.state, STEP))
+      const cap = hostGame.capture()
+      truth.set(cap.tick, {
+        hull: cap.seats[0].ship.position,
+        bolts: new Map(cap.bolts.map((b) => [b.slot, b.pos])),
+        world: cap,
+        bytes: encodeSnapshot(cap),
+      })
+      behind = Math.max(behind, cap.tick - client.hostTick)
+      wire.pump()
+      if (i === SETTLE) coastedBySettle = client.stats.coasted
+    }
+    const result = {
+      stalls,
+      jumps,
+      compared,
+      mismatched,
+      coasts,
+      worstCoast,
+      coastedBySettle,
+      behind,
+      stats: { ...client.stats },
+      waiting: client.waiting,
+    }
+    hostGame.dispose()
+    clientGame.dispose()
+    return result
+  }
+
+  const paced = fly(true)
+  const raw = fly(false)
+  SHIPS.hornet.maxHull = hulls.hornet
+  SHIPS.wasp.maxHull = hulls.wasp
+
+  check('the wire was jittery: applied on arrival, the host\'s hull stalls and jumps on the client',
+    raw.stalls > TICKS * 0.1 && raw.jumps > TICKS * 0.04, `${raw.stalls} stalls, ${raw.jumps} jumps in ${TICKS}`)
+  check('paced, the host\'s hull never stalls on the client', paced.stalls === 0, `${paced.stalls} stalls`)
+  check('and never jumps, beyond a tick skipped to drain a backlog', paced.jumps <= paced.stats.skipped, `${paced.jumps} jumps, ${paced.stats.skipped} skipped`)
+  check(`whatever it applied is still the host's world at that tick (${paced.compared})`, paced.compared > TICKS * 0.9 && paced.mismatched === 0,
+    `${paced.mismatched} mismatched`)
+  check('the wire was late enough to coast through, and a coasted tick is the host\'s world one tick on',
+    paced.coasts > 0 && paced.worstCoast < 1, `${paced.coasts} coasts, worst ${paced.worstCoast.toFixed(3)} units off`)
+  check('the queue fills to the jitter and then stops coasting', paced.stats.coasted <= JITTER + 1 && paced.stats.coasted === paced.coastedBySettle,
+    `${paced.coastedBySettle} coasts by tick ${SETTLE}, ${paced.stats.coasted} by the end`)
+  check('and holds no deeper than the jitter needs', paced.waiting <= JITTER && paced.stats.skipped === 0,
+    `${paced.waiting} waiting, ${paced.stats.skipped} skipped`)
+  check('so the picture trails the wire by the jitter, not by more', paced.behind <= LATENCY + JITTER + 2, `${paced.behind} ticks behind at worst`)
+  check('duplicates were dropped before they could be applied twice', paced.stats.stale > 0, `${paced.stats.stale} stale`)
+
+  /* One snapshot lost, on a perfect wire, with the host's hull flying straight
+     and flat out: the coast must land where that snapshot would have — hull and
+     bolts both — not where the last one did. Deterministic, so that "within a
+     unit" above is not the only thing keeping `Game.coast` honest. */
+  {
+    const hostGame = newMatch()
+    const clientGame = newMatch()
+    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0xc0a5, respawn: true } })
+    host.start()
+    const wire = createLoopback()
+    // A mirror: with nothing predicted, the whole world is the host's or is a coast.
+    const client = createClient({ game: clientGame, channel: wire.b, predict: false })
+    host.accept(wire.a)
+    wire.pump()
+    const straight = controls({ throttle: 1, fire: true })
+    for (let i = 0; i < 120; i++) {
+      client.tick(controls())
+      host.tick(straight)
+      wire.pump()
+    }
+    // The last snapshot is still queued; apply it, so the next tick has nothing.
+    client.tick(controls())
+    const before = { hull: clientGame.snapshot(0)!.position, bolts: clientGame.capture().bolts.length }
+    // Lose exactly the next snapshot.
+    wire.setLoss(1)
+    host.tick(straight)
+    wire.setLoss(0)
+    const missing = hostGame.capture()
+    wire.pump()
+    const coastedBefore = client.stats.coasted
+    client.tick(controls())
+    const view = clientGame.snapshot(0)!.position
+    let worstBolt = 0
+    let boltsCompared = 0
+    const missingBolts = new Map(missing.bolts.map((b) => [b.slot, b.pos]))
+    for (const b of clientGame.capture().bolts) {
+      const m = missingBolts.get(b.slot)
+      if (!m) continue
+      boltsCompared++
+      worstBolt = Math.max(worstBolt, dist(b.pos, m))
+    }
+    check('with the next snapshot lost, the client coasted', client.stats.coasted === coastedBefore + 1, JSON.stringify(client.stats))
+    check('and the hull moved to where that snapshot had it', dist(view, before.hull) > 3 && dist(view, missing.seats[0].ship.position) < 0.05,
+      `moved ${dist(view, before.hull).toFixed(2)}, ${dist(view, missing.seats[0].ship.position).toFixed(3)} from the truth`)
+    check(`and so did the bolts (${boltsCompared})`, before.bolts > 0 && boltsCompared > 0 && worstBolt < 0.05, `worst ${worstBolt.toFixed(3)}`)
+    // The tick after, the real thing is back and the coast has been overwritten.
+    host.tick(straight)
+    wire.pump()
+    client.tick(controls())
+    check('and the tick after, the world is the host\'s again', sameBytes(encodeSnapshot(hostGame.capture()), encodeSnapshot(clientGame.capture())))
+
+    /* A client that stopped ticking — a hidden tab — comes back to a backlog,
+       and drains it two a tick rather than replaying half a second of history at
+       the wire's pace or sitting a queue's depth behind for good. */
+    for (let i = 0; i < 40; i++) {
+      host.tick(straight)
+      wire.pump()
+    }
+    check('a stalled client holds a bounded backlog', client.waiting === SNAPSHOT_QUEUE, `${client.waiting} waiting`)
+    const behindBefore = hostGame.capture().tick - client.hostTick
+    let caughtUpAt = -1
+    for (let i = 0; i < 40; i++) {
+      client.tick(controls())
+      host.tick(straight)
+      wire.pump()
+      if (caughtUpAt < 0 && hostGame.capture().tick - client.hostTick <= SNAPSHOT_DEPTH + 2) caughtUpAt = i
+    }
+    check('and drains it', behindBefore > SNAPSHOT_QUEUE && caughtUpAt >= 0 && caughtUpAt <= SNAPSHOT_QUEUE && client.stats.skipped > 0,
+      `${behindBefore} behind, caught up after ${caughtUpAt} ticks, ${client.stats.skipped} skipped`)
+    hostGame.dispose()
+    clientGame.dispose()
+  }
 }
 
 /**
@@ -6438,6 +6734,7 @@ testAMatchCrossesTheWire()
 testABadWireIsSurvived()
 testThePeerFliesItsOwnSeatOnly()
 testTheStickIsAttachedToTheShip()
+testAJitteryWireIsDrawnSteadily()
 testDeathEitherRespawnsOrResolves()
 testEliminationEndsWhenTheArenaEmpties()
 testAnEliminatedSeatStaysEliminated()

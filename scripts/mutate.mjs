@@ -286,10 +286,54 @@ const MUTATIONS = [
     from: '        game.acknowledge(seat, peer ? peer.flownTick : -1)',
     to: '        game.acknowledge(seat, -1)',
   },
+
+  /* ---- Snapshot pacing ----------------------------------------------------- */
+  {
+    name: 'the client applies a snapshot the tick it arrives',
+    file: 'src/net/session.ts',
+    from: '        if (!pace) {\n          applySnapshot(world)\n          return\n        }',
+    to: '        if (true) {\n          applySnapshot(world)\n          return\n        }',
+  },
+  {
+    name: 'a tick nothing arrived for is a stall, not a coast',
+    file: 'src/net/session.ts',
+    from: '  function coast(): void {\n    game.coast(predict ? seat : -1)',
+    to: '  function coast(): void {',
+  },
+  {
+    name: 'a gap in the queue is applied straight away',
+    file: 'src/net/session.ts',
+    from: '    if (hostTick >= 0 && queue[0].tick > hostTick + 1 && coastedAt !== hostTick) {',
+    to: '    if (false) {',
+  },
+  {
+    name: 'the client never drains a backlog',
+    file: 'src/net/session.ts',
+    from: '    if (queue.length > SNAPSHOT_DEPTH) {\n      applySnapshot(queue.shift()!)\n      stats.skipped++\n    }',
+    to: '',
+  },
+  {
+    name: 'the client queues the same tick twice',
+    file: 'src/net/session.ts',
+    from: '    if (at > 0 && queue[at - 1].tick === world.tick) return false',
+    to: '',
+  },
+  {
+    name: 'a coast holds every hull where it was',
+    file: 'src/game/game.ts',
+    from: '    ship.prevQuaternion.copy(ship.quaternion)\n    ship.position.addScaledVector(ship.velocity, STEP)\n  }',
+    to: '    ship.prevQuaternion.copy(ship.quaternion)\n  }',
+  },
+  {
+    name: 'a coast leaves the bolts behind',
+    file: 'src/game/bolts.ts',
+    from: '        bolt.prev.copy(bolt.pos)\n        bolt.pos.addScaledVector(bolt.vel, dt)\n      }\n    },',
+    to: '        bolt.prev.copy(bolt.pos)\n      }\n    },',
+  },
   {
     name: 'the client replays intents the host already flew',
     file: 'src/net/session.ts',
-    from: '          while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()\n',
+    from: '      while (buffer.length > 0 && buffer[0].tick <= ack) buffer.shift()\n',
     to: '',
   },
   {
@@ -639,7 +683,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 548
+const EXPECTED_ASSERTIONS = 567
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 
