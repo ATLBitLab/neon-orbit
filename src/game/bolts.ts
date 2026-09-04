@@ -56,6 +56,18 @@ export const FACTION_AI = -1 as unknown as Faction
 export const FACTION_PLAYER = 0 as unknown as Faction
 
 /**
+ * The arena itself: a mine, a station scrape. Damage with no author.
+ *
+ * Below the AI so it is nobody's seat and nobody's squadron — `seatOf` misses
+ * it and the friendly-fire rule never sees it. Who is *credited* for it is a
+ * match rule (`game.ts`, `bountyGoesTo`): the seat that last landed a hit on
+ * the victim, so a hostile chased onto a mine still scores for the chaser, and
+ * in a match of one seat, that seat — which is what the old "blame the other
+ * side" produced, and is now said rather than derived.
+ */
+export const FACTION_ENVIRONMENT = -2 as unknown as Faction
+
+/**
  * The faction for the human at `index` in the roster. Zero is the local player
  * today; PvP hands out 1, 2, … as participants join.
  *

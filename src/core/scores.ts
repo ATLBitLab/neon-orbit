@@ -18,6 +18,44 @@ export interface RunResult {
   time: number
   won: boolean
   accuracy: number
+  /**
+   * The whole match this run was one seat of, when there was more than one
+   * seat to tell about. Absent for the single-player game, whose result is
+   * this struct alone.
+   */
+  match?: MatchResult
+}
+
+/** One seat's line on the final scoreboard. */
+export interface SeatLine {
+  seat: number
+  ship: ShipId
+  /** The scoreline plus whatever bonus the match paid at the end. */
+  score: number
+  kills: number
+  deaths: number
+  hits: number
+  shots: number
+  /** Still flying when the match ended. */
+  alive: boolean
+  /** 1 is first; equal scores share a place. */
+  place: number
+  won: boolean
+}
+
+/**
+ * How a match ended, for every seat.
+ *
+ * Computed once, on the host, when the match resolves, and sent to every
+ * mirror, so the same scoreboard is shown on every machine. `cleared` is the
+ * squadron being gone; a match that ended with every seat eliminated has it
+ * false and nobody `won`.
+ */
+export interface MatchResult {
+  /** Seconds elapsed. */
+  time: number
+  cleared: boolean
+  lines: SeatLine[]
 }
 
 interface Best {

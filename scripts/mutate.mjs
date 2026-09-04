@@ -287,6 +287,124 @@ const MUTATIONS = [
     to: '        game.acknowledge(seat, -1)',
   },
 
+  /* ---- Match rules: attribution and the feed ------------------------------- */
+  {
+    name: 'a kill with no author pays seat 0 whatever the roster',
+    file: 'src/game/game.ts',
+    from: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? soleSeat()',
+    to: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? seats[0] ?? null',
+  },
+  {
+    name: 'a kill with no author pays nobody, even the last hitter',
+    file: 'src/game/game.ts',
+    from: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? soleSeat()',
+    to: '    return seatOf(seats, from) ?? soleSeat()',
+  },
+  {
+    name: 'the last hitter is never remembered',
+    file: 'src/game/game.ts',
+    from: '      if (direct) {\n        lastHitter.set(self, direct)\n        creditHit(direct, amount)\n        return\n      }',
+    to: '      if (direct) {\n        creditHit(direct, amount)\n        return\n      }',
+  },
+  {
+    name: "the arena's damage is nobody's, even in a match of one",
+    file: 'src/game/game.ts',
+    from: '    if (from === FACTION_ENVIRONMENT) return lastHitter.get(victim) ?? soleSeat()',
+    to: '    if (from === FACTION_ENVIRONMENT) return null',
+  },
+  {
+    name: 'a hit on a participant pays nothing',
+    file: 'src/game/game.ts',
+    from: '            lastHitter.set(self, direct)\n            creditHit(direct, amount)',
+    to: '            lastHitter.set(self, direct)',
+  },
+  {
+    name: 'a participant kill pays the victim',
+    file: 'src/game/game.ts',
+    from: '          const scorer = owed && owed !== seat ? owed : null',
+    to: '          const scorer = owed',
+  },
+  {
+    name: "a participant's hull is worth the same as the squadron's",
+    file: 'src/game/game.ts',
+    from: '          const award = scorer ? creditKill(scorer, Math.round(self.spec.bounty * PARTICIPANT_BOUNTY_MULT)) : 0',
+    to: '          const award = scorer ? creditKill(scorer, self.spec.bounty) : 0',
+  },
+  {
+    name: 'a mirror announces every kill in every snapshot',
+    file: 'src/game/game.ts',
+    from: '      if (e.seq > feedSeen) {\n        feedSeen = e.seq\n        announceKill(e)\n      }',
+    to: '      announceKill(e)',
+  },
+  {
+    name: 'the feed ring never lets go',
+    file: 'src/game/game.ts',
+    from: '    if (feed.length > FEED_RING) feed.shift()',
+    to: '',
+  },
+  {
+    name: 'the feed is never captured',
+    file: 'src/game/game.ts',
+    from: '      feed: feed.map((e) => ({ ...e })),',
+    to: '      feed: [],',
+  },
+  {
+    name: 'a scrape is blamed on the other side again',
+    file: 'src/game/ship.ts',
+    from: '        this.takeDamage(Math.min(55, 4 + impact * 0.1), FACTION_ENVIRONMENT)',
+    to: '        this.takeDamage(Math.min(55, 4 + impact * 0.1), (this.faction === 0 ? -1 : 0) as Faction)',
+  },
+
+  /* ---- Match rules: the result ------------------------------------------- */
+  {
+    name: 'an eliminated seat places by score like a flying one',
+    file: 'src/game/game.ts',
+    from: '  const order = lines.slice().sort((a, b) => (a.alive === b.alive ? b.score - a.score : a.alive ? -1 : 1))',
+    to: '  const order = lines.slice().sort((a, b) => b.score - a.score)',
+  },
+  {
+    name: 'equal scores do not share a place',
+    file: 'src/game/game.ts',
+    from: '    if (!prev || prev.alive !== line.alive || prev.score !== line.score) place = i + 1',
+    to: '    place = i + 1',
+  },
+  {
+    name: 'the finishing bonus is paid to the eliminated too',
+    file: 'src/game/game.ts',
+    from: '      const bonus = cleared && alive ? Math.round(seat.ship.hullFraction * 1200) + timeBonus : 0',
+    to: '      const bonus = cleared ? Math.round(seat.ship.hullFraction * 1200) + timeBonus : 0',
+  },
+  {
+    name: 'the host never tells its peers the match ended',
+    file: 'src/net/session.ts',
+    from: '        if (++sinceResult >= HELLO_EVERY) {',
+    to: '        if (false) {',
+  },
+  {
+    name: 'the result is said once and never again',
+    file: 'src/net/session.ts',
+    from: '          sinceResult = 0\n          const bytes = encodeResult(result)',
+    to: '          sinceResult = Number.NEGATIVE_INFINITY\n          const bytes = encodeResult(result)',
+  },
+  {
+    name: 'the host snapshots a roster of nobody on the resolving tick',
+    file: 'src/net/session.ts',
+    from: '      if (++sinceSnapshot >= snapshotEvery && game.active) {',
+    to: '      if (++sinceSnapshot >= snapshotEvery) {',
+  },
+  {
+    name: 'a mirror ignores the result',
+    file: 'src/net/session.ts',
+    from: '      queue.length = 0\n      game.conclude(result)',
+    to: '      queue.length = 0',
+  },
+  {
+    name: 'a mirror reports seat 0 whatever seat it flies',
+    file: 'src/game/game.ts',
+    from: '    const line = mine ? result.lines.find((l) => l.seat === mine.index) : undefined\n    lastResult = result',
+    to: '    const line = result.lines[0]\n    lastResult = result',
+  },
+
   /* ---- Snapshot pacing ----------------------------------------------------- */
   {
     name: 'the client applies a snapshot the tick it arrives',
@@ -347,13 +465,13 @@ const MUTATIONS = [
   {
     name: 'every hit is credited to seat 0',
     file: 'src/game/game.ts',
-    from: '      const scorer = seatOf(seats, from)\n      if (!scorer) return\n      creditHit(scorer, amount)',
-    to: '      const scorer = seats[0]\n      if (!scorer) return\n      creditHit(scorer, amount)',
+    from: '      const direct = seatOf(seats, from)\n      if (direct) {',
+    to: '      const direct = seats[0]\n      if (direct) {',
   },
   {
     name: 'every kill is credited to seat 0',
     file: 'src/game/game.ts',
-    from: '    return seatOf(seats, from) ?? seats[0] ?? null',
+    from: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? soleSeat()',
     to: '    return seats[0] ?? null',
   },
   {
@@ -387,8 +505,8 @@ const MUTATIONS = [
   {
     name: 'finish waits only for flying seats, not for wrecks',
     file: 'src/game/game.ts',
-    from: '    if (!matchStillRunning()) finish(pendingResult ?? sealResult(false))',
-    to: '    if (!anySeatFlying()) finish(pendingResult ?? sealResult(false))',
+    from: '    if (!matchStillRunning()) resolveMatch(false)',
+    to: '    if (!anySeatFlying()) resolveMatch(false)',
   },
   {
     /*
@@ -399,8 +517,8 @@ const MUTATIONS = [
      */
     name: "a teammate's win overwrites the drawn seat's sealed loss",
     file: 'src/game/game.ts',
-    from: '      finish(pendingResult ?? sealResult(true))',
-    to: '      finish(sealResult(true))',
+    from: '    const report = pendingResult\n      ? { ...pendingResult, match: match.lines.length > 1 ? match : undefined }\n      : line',
+    to: '    const report = line',
   },
   {
     name: 'a win is reported over a wreck',
@@ -683,7 +801,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 567
+const EXPECTED_ASSERTIONS = 608
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

@@ -1096,6 +1096,48 @@ body {
   animation: warn-breathe 1.3s ease-in-out infinite;
 }
 
+/* The match scoreboard: one row per seat, placed, the local seat lit. */
+.panel .placing {
+  font-size: 12px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: rgba(223, 246, 255, 0.62);
+}
+
+.panel .board {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(223, 246, 255, 0.62);
+}
+
+.panel .board .row {
+  display: grid;
+  grid-template-columns: 2.6em 3.2em 1fr auto 1fr auto;
+  gap: 0 12px;
+  align-items: baseline;
+  padding: 4px 8px;
+  border: 1px solid rgba(107, 230, 255, 0.12);
+}
+
+.panel .board .row b {
+  color: #dff6ff;
+  font-weight: 400;
+}
+
+.panel .board .row.you {
+  border-color: rgba(107, 230, 255, 0.55);
+  color: #dff6ff;
+  text-shadow: 0 0 10px rgba(53, 245, 255, 0.5);
+}
+
+.panel .board .out {
+  color: var(--magenta, #ff3b4e);
+}
+
 .panel .actions {
   display: flex;
   gap: 12px;

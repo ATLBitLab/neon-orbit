@@ -12,6 +12,7 @@
  *   INTENT    client -> host   an intent frame (`wire.ts`), tick-stamped
  *   SNAPSHOT  host -> client   the world (`snapshot.ts`), tick-stamped inside
  *   REFUSED   host -> client   no seat for you
+ *   RESULT    host -> client   the match has resolved: every seat's line
  *
  * Three rules carry the anti-cheat weight, and the tests name each:
  *
@@ -29,6 +30,7 @@
  * this layer never constructs a `Controls` by hand.
  */
 
+import type { MatchResult, SeatLine } from '../core/scores'
 import { admitIntent } from '../game/intent'
 import { STEP, type Game, type MatchSetup } from '../game/game'
 import type { Controls } from '../game/ship'
@@ -48,6 +50,7 @@ export const FRAME = {
   INTENT: 3,
   SNAPSHOT: 4,
   REFUSED: 5,
+  RESULT: 6,
 } as const
 
 /* ---- Frames --------------------------------------------------------------- */
@@ -98,6 +101,45 @@ export function decodeWelcome(bytes: Uint8Array): Welcome {
   return { seat, setup: { ships, seed, respawn, local: seat } }
 }
 
+export function encodeResult(result: MatchResult): Uint8Array {
+  const w = new ByteWriter(64)
+  w.u8(FRAME.RESULT).u8(PROTOCOL_VERSION).f32(result.time).bool(result.cleared).u8(result.lines.length)
+  for (const l of result.lines) {
+    w.u8(l.seat).u8(SHIP_ORDER.indexOf(l.ship)).i32(l.score).u16(l.kills).u16(l.deaths).u32(l.hits).u32(l.shots)
+    w.bool(l.alive).u8(l.place).bool(l.won)
+  }
+  return w.bytes()
+}
+
+export function decodeResult(bytes: Uint8Array): MatchResult {
+  const r = new ByteReader(bytes)
+  const type = r.u8()
+  if (type !== FRAME.RESULT) throw new RangeError(`not a result frame: ${type}`)
+  const version = r.u8()
+  if (version !== PROTOCOL_VERSION) throw new RangeError(`protocol ${version}, expected ${PROTOCOL_VERSION}`)
+  const time = r.f32()
+  const cleared = r.bool()
+  const count = r.u8()
+  const lines: SeatLine[] = []
+  for (let i = 0; i < count; i++) {
+    const seat = r.u8()
+    const ship = SHIP_ORDER[r.u8()]
+    if (!ship) throw new RangeError('unknown hull in result')
+    const score = r.i32()
+    const kills = r.u16()
+    const deaths = r.u16()
+    const hits = r.u32()
+    const shots = r.u32()
+    const alive = r.bool()
+    const place = r.u8()
+    const won = r.bool()
+    if (place < 1 || place > count) throw new RangeError(`place ${place} of ${count}`)
+    lines.push({ seat, ship, score, kills, deaths, hits, shots, alive, place, won })
+  }
+  r.finish()
+  return { time, cleared, lines }
+}
+
 /* ---- Host ----------------------------------------------------------------- */
 
 export interface HostStats {
@@ -113,6 +155,8 @@ export interface HostStats {
   admitted: number
   /** Peers refused for want of a seat. */
   refused: number
+  /** Result frames sent: one per peer when the match resolved, and every half second after. */
+  results: number
 }
 
 export interface HostOptions {
@@ -169,9 +213,12 @@ export function createHost(options: HostOptions): Host {
   const intents: Controls[] = Array.from({ length: seatCount }, () => neutral())
   const holds: Controls[] = Array.from({ length: seatCount }, () => neutral())
   const scratch: Controls = neutral()
-  const stats: HostStats = { wrongSeat: 0, stale: 0, malformed: 0, held: 0, admitted: 0, refused: 0 }
+  const stats: HostStats = { wrongSeat: 0, stale: 0, malformed: 0, held: 0, admitted: 0, refused: 0, results: 0 }
   let tick = 0
   let sinceSnapshot = 0
+  /** The result the peers are being told, and how long since it was last said. */
+  let resultSent: MatchResult | null = null
+  let sinceResult = 0
 
   function onFrame(peer: Peer, bytes: Uint8Array): void {
     if (bytes.length === 0) {
@@ -215,6 +262,7 @@ export function createHost(options: HostOptions): Host {
       game.start(setup)
       tick = 0
       sinceSnapshot = 0
+      resultSent = null
     },
 
     accept(channel) {
@@ -236,6 +284,30 @@ export function createHost(options: HostOptions): Host {
     },
 
     tick(local) {
+      // A resolved match is told to every peer, and nothing else is sent: the
+      // roster is gone, and a snapshot of nobody is not a world. Said again
+      // every half second for as long as the host keeps ticking, because the
+      // wire drops frames and a result that never arrived is a debrief the
+      // joiner never sees; a mirror that has already concluded ignores repeats.
+      if (!game.active) {
+        const result = game.result
+        if (!result) return
+        if (result !== resultSent) {
+          resultSent = result
+          sinceResult = HELLO_EVERY
+        }
+        if (++sinceResult >= HELLO_EVERY) {
+          sinceResult = 0
+          const bytes = encodeResult(result)
+          for (const peer of peers) {
+            if (peer && peer.channel.open) {
+              peer.channel.send(bytes)
+              stats.results++
+            }
+          }
+        }
+        return
+      }
       intents[0] = local
       for (let seat = 1; seat < seatCount; seat++) {
         const peer = peers[seat]
@@ -258,7 +330,9 @@ export function createHost(options: HostOptions): Host {
       game.step(intents)
       tick++
 
-      if (++sinceSnapshot >= snapshotEvery) {
+      // Not on the tick the match resolved: `finish` has cleared the roster,
+      // and the result frame is what says so.
+      if (++sinceSnapshot >= snapshotEvery && game.active) {
         sinceSnapshot = 0
         const bytes = withType(FRAME.SNAPSHOT, encodeSnapshot(game.capture()))
         for (const peer of peers) if (peer && peer.channel.open) peer.channel.send(bytes)
@@ -468,6 +542,20 @@ export function createClient(options: ClientOptions): Client {
     }
     if (type === FRAME.REFUSED) {
       options.onRefused?.()
+      return
+    }
+    if (type === FRAME.RESULT) {
+      if (seat < 0) return
+      let result: MatchResult
+      try {
+        result = decodeResult(bytes)
+      } catch {
+        stats.malformed++
+        return
+      }
+      // Whatever is still queued is a world that has ended; the result is the last word.
+      queue.length = 0
+      game.conclude(result)
       return
     }
     if (type === FRAME.SNAPSHOT) {

@@ -28,7 +28,7 @@ import { FACTION_AI, type Faction } from '../game/bolts'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { ByteReader, ByteWriter } from './wire'
 
-export const SNAPSHOT_VERSION = 1
+export const SNAPSHOT_VERSION = 2
 
 export interface Vec3 {
   x: number
@@ -108,6 +108,31 @@ export interface BoltState {
   color: Vec3
 }
 
+/**
+ * A kill, as the match announces it.
+ *
+ * `killer` and `victim` are seat indices, or `NOBODY` for a squadron hull and
+ * `THE_ARENA` for a mine, a scrape or the star. `hull` is the victim's
+ * airframe. `seq` counts up from one per match, which is what lets a mirror
+ * show each kill exactly once from a stream that loses and reorders
+ * snapshots: the snapshot carries the last `FEED_RING` events, and a mirror
+ * announces those with a `seq` above the last it announced.
+ */
+export interface KillEvent {
+  seq: number
+  killer: number
+  victim: number
+  hull: ShipId
+  award: number
+}
+
+/** A `KillEvent` party that is a squadron hull rather than a seat. */
+export const NOBODY = -1
+/** A `KillEvent` killer that is the arena: a mine, a scrape, the star. */
+export const THE_ARENA = -2
+/** How many of the latest kills a snapshot carries. */
+export const FEED_RING = 4
+
 export interface PodState {
   live: boolean
   respawnIn: number
@@ -126,6 +151,8 @@ export interface WorldSnapshot {
   bolts: BoltState[]
   pods: PodState[]
   mines: boolean[]
+  /** The latest kills, oldest first, at most `FEED_RING`. */
+  feed: KillEvent[]
 }
 
 /* ---- Encoding ------------------------------------------------------------ */
@@ -223,6 +250,9 @@ export function encodeSnapshot(s: WorldSnapshot, w = new ByteWriter(4096)): Uint
   w.u16(s.mines.length)
   for (const live of s.mines) w.bool(live)
 
+  w.u8(s.feed.length)
+  for (const e of s.feed) w.u32(e.seq).i32(e.killer).i32(e.victim).u8(SHIP_ORDER.indexOf(e.hull)).i32(e.award)
+
   return w.bytes()
 }
 
@@ -296,8 +326,22 @@ export function decodeSnapshot(bytes: Uint8Array): WorldSnapshot {
   const mineCount = r.u16()
   for (let i = 0; i < mineCount; i++) mines.push(r.bool())
 
+  const feed: KillEvent[] = []
+  const feedCount = r.u8()
+  if (feedCount > FEED_RING) throw new RangeError(`${feedCount} kills in a feed of ${FEED_RING}`)
+  for (let i = 0; i < feedCount; i++) {
+    const seq = r.u32()
+    const killer = r.i32()
+    const victim = r.i32()
+    const hullIndex = r.u8()
+    const hull = SHIP_ORDER[hullIndex]
+    if (!hull) throw new RangeError(`unknown hull ${hullIndex} in the feed`)
+    const award = r.i32()
+    feed.push({ seq, killer, victim, hull, award })
+  }
+
   r.finish()
-  return { tick, seed, elapsed, active, paused, queued, seats, squadron, bolts, pods, mines }
+  return { tick, seed, elapsed, active, paused, queued, seats, squadron, bolts, pods, mines, feed }
 }
 
 /** A faction that is nobody's seat, for a bolt whose owner the mirror cannot see. */
