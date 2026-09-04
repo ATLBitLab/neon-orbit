@@ -32,6 +32,7 @@ import {
 import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '../src/net/wire'
 import { createLoopback } from '../src/net/channel'
 import { modeFromLocation } from '../src/net/browser'
+import { createLinkMonitor, type LinkReport } from '../src/net/link'
 import { createClient, createHost, decodeResult, decodeWelcome, encodeResult, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
 import { createGame, DEATH_SEQUENCE, PARTICIPANT_BOUNTY_MULT, placeLines, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
@@ -6778,6 +6779,76 @@ function testTheStepClockNeverLosesTime(): void {
  * than on any one consumer, and it asserts positions against the arithmetic
  * they are supposed to be, not against a recorded baseline.
  */
+/**
+ * A link that goes quiet is degraded, then down, and never quietly nothing.
+ *
+ * The first two-device test of the match rules sat on "ice disconnected" for
+ * good: the data channel stays open while ICE is disconnected, the client kept
+ * sending, the mirror stopped hearing, and the join screen only reprinted the
+ * state. `link.ts` is the verdict on those states, headless: a drop is
+ * degraded for a grace period, up again if ICE recovers, down when it does not
+ * or when ICE fails or the channel closes — and down is the end of that link.
+ */
+function testALinkThatDropsIsNoticed(): void {
+  section('A link that drops is degraded, then down, never silently nothing')
+
+  let t = 0
+  const reports: LinkReport[] = []
+  const link = createLinkMonitor({ grace: 8000, now: () => t, onChange: (r) => reports.push(r) })
+  link.ice('checking')
+  link.ice('connected')
+  link.ice('completed')
+  check('a connected link is up and says nothing', link.state === 'up' && reports.length === 0, `${link.state} ${reports.length}`)
+
+  link.ice('disconnected')
+  t += 3000
+  link.poll()
+  check(
+    'a drop is degraded, not down, inside the grace',
+    link.state === 'degraded' && reports.length === 1 && reports[0].state === 'degraded' && reports[0].reason === 'ice disconnected',
+    JSON.stringify(reports),
+  )
+  link.ice('checking')
+  link.ice('disconnected')
+  t += 1000
+  link.poll()
+  check('ICE trying again, or saying disconnected twice, is not a second report', link.state === 'degraded' && reports.length === 1, `${link.state} ${reports.length}`)
+
+  link.ice('connected')
+  check('and it is up again when ICE reconnects', link.state === 'up' && reports.length === 2 && reports[1].state === 'up', JSON.stringify(reports))
+  t += 60000
+  link.poll()
+  check('the old outage does not count against a recovered link', link.state === 'up' && reports.length === 2, `${link.state} ${reports.length}`)
+
+  link.ice('disconnected')
+  t += 7999
+  link.poll()
+  check('a second outage starts its own grace', link.state === 'degraded' && reports.length === 3, `${link.state} ${reports.length}`)
+  t += 1
+  link.poll()
+  check(
+    'and is down once the grace runs out, saying for how long',
+    link.state === 'down' && reports.length === 4 && reports[3].state === 'down' && reports[3].reason === 'ice disconnected for 8 s',
+    JSON.stringify(reports[3]),
+  )
+  link.ice('connected')
+  link.closed()
+  link.poll()
+  check('down is the end of that link', link.state === 'down' && reports.length === 4, `${link.state} ${reports.length}`)
+
+  const failed: LinkReport[] = []
+  const f = createLinkMonitor({ grace: 8000, now: () => 0, onChange: (r) => failed.push(r) })
+  f.ice('connected')
+  f.ice('failed')
+  check('ICE failing is down at once', f.state === 'down' && failed.length === 1 && failed[0].reason === 'ice failed', JSON.stringify(failed))
+
+  const closed: LinkReport[] = []
+  const c = createLinkMonitor({ grace: 8000, now: () => 0, onChange: (r) => closed.push(r) })
+  c.ice('connected')
+  c.closed()
+  check('the channel closing is down at once', c.state === 'down' && closed.length === 1 && closed[0].reason === 'channel closed', JSON.stringify(closed))
+}
+
 function testOneFrameDepictsOneInstant(): void {
   section('Everything drawn in a frame agrees on one instant')
 
@@ -7208,6 +7279,7 @@ testTheMatchEndsOnEveryMachine()
 testTheStepClockNeverLosesTime()
 testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()
+testALinkThatDropsIsNoticed()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)
