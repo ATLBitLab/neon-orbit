@@ -18,6 +18,15 @@
  * first version folded both into one message and the person testing it could
  * not tell us which had failed.
  *
+ * After the channel opens the ICE state keeps changing — a link that drops is
+ * reported here as `disconnected`, and the channel stays `open` while it is —
+ * so those changes go to `LinkHooks.onIce` rather than to the join stages,
+ * along with the candidate pair the connection settled on (`onRoute`: host,
+ * srflx or relay, either end), which is the one fact that says what path two
+ * machines actually took. What to do about a drop is `link.ts`, headless.
+ * Closing the channel closes the peer connection with it, so the far side
+ * hears the close promptly instead of waiting on ICE to time out.
+ *
  * ICE servers: STUN by default, which is enough between two homes. Two
  * browsers on one machine, or behind a symmetric NAT, need a TURN relay —
  * configured through `VITE_TURN_URL` / `VITE_TURN_USERNAME` /
@@ -47,7 +56,7 @@ const DATA_CHANNEL_LABEL = 'neon'
 const DATA_CHANNEL_OPTIONS: RTCDataChannelInit = { ordered: false, maxRetransmits: 0 }
 const HANDSHAKE_TIMEOUT_MS = 45000
 
-export function channelFrom(dc: RTCDataChannel): Channel {
+export function channelFrom(dc: RTCDataChannel, pc?: RTCPeerConnection): Channel {
   dc.binaryType = 'arraybuffer'
   const handlers: ((b: Uint8Array) => void)[] = []
   const closers: (() => void)[] = []
@@ -84,6 +93,7 @@ export function channelFrom(dc: RTCDataChannel): Channel {
     },
     close() {
       dc.close()
+      pc?.close()
       closed()
     },
   }
@@ -91,13 +101,62 @@ export function channelFrom(dc: RTCDataChannel): Channel {
 
 export type Status = (stage: string) => void
 
+/** What happens to a connection after it has opened. */
+export interface LinkHooks {
+  /** Every ICE connection state after the channel opened. */
+  onIce?: (state: RTCIceConnectionState) => void
+  /** The candidate pair in use, whenever it is (re)established; see `describeRoute`. */
+  onRoute?: (route: string) => void
+}
+
+/**
+ * The candidate pair the connection is using, as one line:
+ * `host/udp 192.168.1.20:51234 ↔ srflx 203.0.113.9:3478`. Empty when the
+ * stats do not name one yet.
+ */
+export async function describeRoute(pc: RTCPeerConnection): Promise<string> {
+  let stats: RTCStatsReport
+  try {
+    stats = await pc.getStats()
+  } catch {
+    return ''
+  }
+  type Stat = Record<string, unknown>
+  const all = [...stats.values()] as Stat[]
+  const transport = all.find((s) => s.type === 'transport' && typeof s.selectedCandidatePairId === 'string')
+  const pair = (transport
+    ? (stats.get(transport.selectedCandidatePairId as string) as Stat | undefined)
+    : all.find((s) => s.type === 'candidate-pair' && s.nominated === true && s.state === 'succeeded')) as Stat | undefined
+  if (!pair) return ''
+  const end = (id: unknown): string => {
+    const c = typeof id === 'string' ? (stats.get(id) as Stat | undefined) : undefined
+    if (!c) return '?'
+    const protocol = typeof c.protocol === 'string' ? `/${c.protocol}` : ''
+    return `${String(c.candidateType ?? '?')}${protocol} ${String(c.address ?? c.ip ?? '?')}:${String(c.port ?? '?')}`
+  }
+  return `${end(pair.localCandidateId)} ↔ ${end(pair.remoteCandidateId)}`
+}
+
 /** Reject with a named reason when ICE gives up, and resolve when the channel opens. */
-function watch(pc: RTCPeerConnection, dc: Promise<RTCDataChannel>, status: Status): Promise<Channel> {
+function watch(pc: RTCPeerConnection, dc: Promise<RTCDataChannel>, status: Status, hooks: LinkHooks): Promise<Channel> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('timed out waiting for the connection')), HANDSHAKE_TIMEOUT_MS)
+    let opened = false
+    const route = () => {
+      void describeRoute(pc).then((r) => {
+        if (r) hooks.onRoute?.(r)
+      })
+    }
     pc.oniceconnectionstatechange = () => {
-      status(`ice ${pc.iceConnectionState}`)
-      if (pc.iceConnectionState === 'failed') {
+      const state = pc.iceConnectionState
+      if (opened) {
+        // The join is over; this is the link's business now.
+        hooks.onIce?.(state)
+        if (state === 'connected' || state === 'completed') route()
+        return
+      }
+      status(`ice ${state}`)
+      if (state === 'failed') {
         clearTimeout(timer)
         reject(new Error('no route between browsers (ICE failed) — a TURN relay would be needed'))
       }
@@ -105,8 +164,10 @@ function watch(pc: RTCPeerConnection, dc: Promise<RTCDataChannel>, status: Statu
     dc.then((channel) => {
       const done = () => {
         clearTimeout(timer)
+        opened = true
         status('connected')
-        resolve(channelFrom(channel))
+        resolve(channelFrom(channel, pc))
+        route()
       }
       if (channel.readyState === 'open') done()
       else channel.addEventListener('open', done)
@@ -119,7 +180,7 @@ function watch(pc: RTCPeerConnection, dc: Promise<RTCDataChannel>, status: Statu
 }
 
 /** The joining side: offer, trickle, take the answer, connect. */
-export function connectAsClient(signal: Signal, status: Status = () => {}): Promise<Channel> {
+export function connectAsClient(signal: Signal, status: Status = () => {}, hooks: LinkHooks = {}): Promise<Channel> {
   const pc = new RTCPeerConnection({ iceServers: iceServers() })
   const dc = pc.createDataChannel(DATA_CHANNEL_LABEL, DATA_CHANNEL_OPTIONS)
   let host: string | null = null
@@ -176,14 +237,24 @@ export function connectAsClient(signal: Signal, status: Status = () => {}): Prom
     await signal.send({ type: 'offer', sdp: pc.localDescription!.sdp })
     await answered
     status('connecting')
-    return watch(pc, Promise.resolve(dc), status)
+    return watch(pc, Promise.resolve(dc), status, hooks)
   })()
 
-  return connected.finally(stop)
+  return connected
+    .catch((error: unknown) => {
+      pc.close()
+      throw error
+    })
+    .finally(stop)
 }
 
 /** The hosting side: answer one offer, trickle, resolve when its channel opens. */
-export function acceptAsHost(signal: Signal, offer: Extract<SignalMessage, { type: 'offer' }>, status: Status = () => {}): Promise<Channel> {
+export function acceptAsHost(
+  signal: Signal,
+  offer: Extract<SignalMessage, { type: 'offer' }>,
+  status: Status = () => {},
+  hooks: LinkHooks = {},
+): Promise<Channel> {
   const pc = new RTCPeerConnection({ iceServers: iceServers() })
   const peer = offer.from
 
@@ -212,8 +283,13 @@ export function acceptAsHost(signal: Signal, offer: Extract<SignalMessage, { typ
     await pc.setLocalDescription(await pc.createAnswer())
     status('answer sent')
     await signal.send({ type: 'answer', to: peer, sdp: pc.localDescription!.sdp })
-    return watch(pc, dc, status)
+    return watch(pc, dc, status, hooks)
   })()
 
-  return connected.finally(stop)
+  return connected
+    .catch((error: unknown) => {
+      pc.close()
+      throw error
+    })
+    .finally(stop)
 }

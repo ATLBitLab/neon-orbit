@@ -21,9 +21,10 @@ import type { Game, MatchSetup } from '../game/game'
 import type { Controls } from '../game/ship'
 import type { ShipId } from '../ships/specs'
 import type { Channel } from './channel'
+import { createLinkMonitor, LINK_GRACE_MS, type LinkReport } from './link'
 import { createClient, createHost, type Client, type Host } from './session'
 import { createNostrSignal, newJoinCode, type Signal } from './signal'
-import { acceptAsHost, connectAsClient, type Status } from './webrtc'
+import { acceptAsHost, connectAsClient, type LinkHooks, type Status } from './webrtc'
 
 export type NetMode = { kind: 'solo' } | { kind: 'host'; guest: ShipId } | { kind: 'join'; code: string }
 
@@ -59,13 +60,18 @@ export function openLobby(status: Status = () => {}): Lobby {
   const stop = signal.listen((message) => {
     if (message.type !== 'offer' || answered.has(message.from)) return
     answered.add(message.from)
-    status(`peer ${message.from.slice(0, 6)}: offer received`)
-    acceptAsHost(signal, message, (stage) => status(`peer ${message.from.slice(0, 6)}: ${stage}`))
+    const who = `peer ${message.from.slice(0, 6)}`
+    status(`${who}: offer received`)
+    const hooks: LinkHooks = {
+      onIce: (state) => status(`${who}: ice ${state}`),
+      onRoute: (route) => status(`${who}: route ${route}`),
+    }
+    acceptAsHost(signal, message, (stage) => status(`${who}: ${stage}`), hooks)
       .then((channel) => {
         if (handler) handler(channel)
         else held.push(channel)
       })
-      .catch((error) => status(`peer ${message.from.slice(0, 6)} failed: ${error instanceof Error ? error.message : error}`))
+      .catch((error) => status(`${who} failed: ${error instanceof Error ? error.message : error}`))
   })
 
   return {
@@ -114,20 +120,74 @@ export interface Joining {
   stop(): void
 }
 
+/** What a link looks like from the join screen: the monitor's verdict plus the route it was on. */
+export interface LinkStatus extends LinkReport {
+  route: string
+}
+
+export interface JoinHandlers {
+  /** Each stage of the handshake, until the channel opens. */
+  status: Status
+  onWelcome(seat: number): void
+  /** The host had no seat for us. The channel is closed before this is called. */
+  onRefused(): void
+  /**
+   * The link after it opened: degraded when ICE drops, up again if it recovers
+   * inside `LINK_GRACE_MS`, down — channel closed, seat freed at the host once
+   * it notices — when it does not, or when ICE fails outright.
+   */
+  onLink(link: LinkStatus): void
+}
+
 /** Connect to a host by code. Resolves once the data channel is open; the welcome follows on it. */
-export async function joinMatch(game: Game, code: string, status: Status, onWelcome: (seat: number) => void): Promise<Joining> {
+export async function joinMatch(game: Game, code: string, handlers: JoinHandlers): Promise<Joining> {
   const signal = createNostrSignal(code)
-  let channel: Channel
+  let channel: Channel | null = null
+  let route = ''
+  let poll = 0
+  const monitor = createLinkMonitor({
+    grace: LINK_GRACE_MS,
+    now: () => performance.now(),
+    onChange(report) {
+      if (report.state === 'down') {
+        window.clearInterval(poll)
+        channel?.close()
+      }
+      handlers.onLink({ ...report, route })
+    },
+  })
+  const hooks: LinkHooks = {
+    onIce: (state) => monitor.ice(state),
+    onRoute: (r) => {
+      route = r
+      console.log('[neon-orbit] link route:', r)
+    },
+  }
   try {
-    channel = await connectAsClient(signal, status)
+    channel = await connectAsClient(signal, handlers.status, hooks)
   } finally {
     signal.close()
   }
-  status('connected — waiting for the host to launch')
-  const client = createClient({ game, channel, onWelcome })
+  const open = channel
+  open.onClose(() => monitor.closed())
+  poll = window.setInterval(() => monitor.poll(), 500)
+  handlers.status('connected — waiting for the host to launch')
+  const client = createClient({
+    game,
+    channel: open,
+    onWelcome: handlers.onWelcome,
+    onRefused: () => {
+      window.clearInterval(poll)
+      open.close()
+      handlers.onRefused()
+    },
+  })
   return {
     client,
     tick: (local) => client.tick(local),
-    stop: () => channel.close(),
+    stop() {
+      window.clearInterval(poll)
+      open.close()
+    },
   }
 }

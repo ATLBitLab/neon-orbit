@@ -21,6 +21,7 @@ import { createHud } from './game/hud'
 import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
 import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, type Joining, type Lobby } from './net/browser'
+import { LINK_GRACE_MS } from './net/link'
 import { createHangar } from './ui/hangar'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
 import { createScreens } from './ui/screens'
@@ -193,41 +194,76 @@ function boot() {
     input.requestPointerLock()
   }
 
+  /**
+   * The join is over and did not end in a seat — or the seat is gone. Say why,
+   * and offer the two ways out. Whatever was flying stays on screen behind the
+   * panel; RETRY starts a fresh join on the same code, and the welcome restarts
+   * the match.
+   */
+  function offerRetry(code: string, heading: string, reason: string, note = '') {
+    joining?.stop()
+    joining = null
+    // Pointer lock would swallow the click on the button.
+    document.exitPointerLock?.()
+    netStatus(
+      `${heading} <b>${code}</b><div style="color:#ff3b4e">${reason}</div>` +
+        (note ? `<div style="opacity:.7">${note}</div>` : '') +
+        `<button id="retryjoin" style="font:inherit;margin:6px 4px 0;cursor:pointer">RETRY</button>` +
+        `<button id="solojoin" style="font:inherit;margin:6px 4px 0;cursor:pointer">PLAY SOLO</button>`,
+    )
+    document.getElementById('retryjoin')?.addEventListener('click', () => startJoining(code))
+    document.getElementById('solojoin')?.addEventListener('click', () => {
+      mode = { kind: 'solo' }
+      netPanel.style.display = 'none'
+      openHangar()
+    })
+  }
+
   function startJoining(code: string) {
+    joining?.stop()
+    joining = null
     hangar.close()
     pause.hide()
     debrief.hide()
     pilot.reset()
     audio.setMusic('combat')
+    const waiting = 'connected — waiting for the host to launch'
     netStatus(`JOINING <b>${code}</b><div>looking for the host…</div>`)
-    joinMatch(
-      game,
-      code,
-      (stage) => netStatus(`JOINING <b>${code}</b><div>${stage}</div>`),
-      (seat) => {
+    joinMatch(game, code, {
+      status: (stage) => netStatus(`JOINING <b>${code}</b><div>${stage}</div>`),
+      onWelcome: (seat) => {
         netPanel.style.display = 'none'
         screens.moveTo('flight')
         hud.callout(`SEAT ${seat + 1}`, '#6be6ff', 1.5)
         input.requestPointerLock()
       },
-    )
+      onRefused: () =>
+        offerRetry(
+          code,
+          'COULD NOT JOIN',
+          'the host has no seat free',
+          'if this is a reconnect, the old seat frees once the host notices the drop — give it a few seconds',
+        ),
+      onLink: (link) => {
+        const route = link.route ? `<div style="opacity:.7">route ${link.route}</div>` : ''
+        if (link.state === 'degraded') {
+          netStatus(
+            `LINK LOST <b>${code}</b><div style="color:#ffb547">${link.reason} — waiting up to ${LINK_GRACE_MS / 1000} s for it to recover</div>${route}`,
+          )
+        } else if (link.state === 'up') {
+          if ((joining?.client.seat ?? -1) >= 0) netPanel.style.display = 'none'
+          else netStatus(`JOINING <b>${code}</b><div>${waiting}</div>`)
+        } else {
+          offerRetry(code, 'CONNECTION LOST', link.reason, link.route ? `route was ${link.route}` : '')
+        }
+      },
+    })
       .then((j) => {
         joining = j
       })
       .catch((error) => {
         console.error(error)
-        const reason = error instanceof Error ? error.message : String(error)
-        netStatus(
-          `COULD NOT JOIN <b>${code}</b><div style="color:#ff3b4e">${reason}</div>` +
-            `<button id="retryjoin" style="font:inherit;margin:6px 4px 0;cursor:pointer">RETRY</button>` +
-            `<button id="solojoin" style="font:inherit;margin:6px 4px 0;cursor:pointer">PLAY SOLO</button>`,
-        )
-        document.getElementById('retryjoin')?.addEventListener('click', () => startJoining(code))
-        document.getElementById('solojoin')?.addEventListener('click', () => {
-          mode = { kind: 'solo' }
-          netPanel.style.display = 'none'
-          openHangar()
-        })
+        offerRetry(code, 'COULD NOT JOIN', error instanceof Error ? error.message : String(error))
       })
   }
 

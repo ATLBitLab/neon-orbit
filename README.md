@@ -210,7 +210,16 @@ over Nostr ephemeral events on public relays, so there is nothing to run — SDP
 which is named in the file rather than solved). **Try it:** open `?host` — the join code and a
 COPY LINK button are on screen from the hangar onwards — and open the link on **another device**.
 `?host=drone` picks the guest's hull. The join screen reports each stage (offer sent, answer
-received, ice checking, connected) and names the failing one.
+received, ice checking, connected) and names the failing one. Once connected, the route the two
+browsers settled on (`host/udp 192.168.1.20:51234 ↔ srflx 203.0.113.9:3478` — host, srflx or
+relay at either end) is logged to the console on both machines, which is the first thing to read
+when a two-device test misbehaves. A link that drops afterwards is not left to hang: the join
+screen shows LINK LOST while ICE has up to `LINK_GRACE_MS` (8 s) to recover, then CONNECTION LOST
+with the reason and the route it was on, closes the peer connection (so the host frees the seat),
+and offers RETRY — a fresh join on the same code — or PLAY SOLO. A host with no seat free says so
+(REFUSED) instead of leaving the joiner "waiting for the host to launch". `net/link.ts` is that
+policy, headless; `simcheck` walks it through a drop inside the grace, a recovery, a second
+outage that runs out, ICE failing, and the channel closing.
 
 **Two tabs on one machine will usually not connect, and that is WebRTC, not this code.** Chrome
 hides its LAN address behind an mDNS name and the only other route is back through your own

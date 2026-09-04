@@ -461,6 +461,38 @@ const MUTATIONS = [
     to: '    bolts,',
   },
 
+  /* ---- Link monitor: a dropped link is noticed ---------------------------- */
+  {
+    name: 'a dropped link is down at once, with no grace',
+    file: 'src/net/link.ts',
+    from: "      if (held >= grace) move('down', `ice disconnected for ${Math.round(held / 1000)} s`)",
+    to: "      if (held >= 0) move('down', `ice disconnected for ${Math.round(held / 1000)} s`)",
+  },
+  {
+    name: 'a recovered link stays degraded',
+    file: 'src/net/link.ts',
+    from: "      if (ice === 'connected' || ice === 'completed') {\n        move('up', `ice ${ice}`)",
+    to: "      if (ice === 'connected' || ice === 'completed') {\n        // recovered, but nobody is told",
+  },
+  {
+    name: 'a link that went down can come back up',
+    file: 'src/net/link.ts',
+    from: "    if (state === 'down' || next === state) return",
+    to: "    if (next === state) return",
+  },
+  {
+    name: 'the channel closing is not the link going down',
+    file: 'src/net/link.ts',
+    from: "    closed() {\n      move('down', 'channel closed')\n    },",
+    to: "    closed() {},",
+  },
+  {
+    name: 'a second outage inherits the first one\'s clock',
+    file: 'src/net/link.ts',
+    from: "        if (state === 'up') degradedAt = now()",
+    to: "        if (degradedAt === 0) degradedAt = now()",
+  },
+
   /* ---- Scoring attribution ----------------------------------------------- */
   {
     name: 'every hit is credited to seat 0',
@@ -801,7 +833,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 608
+const EXPECTED_ASSERTIONS = 618
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 
