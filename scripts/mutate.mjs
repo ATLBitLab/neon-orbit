@@ -377,8 +377,14 @@ const MUTATIONS = [
   {
     name: 'the host never tells its peers the match ended',
     file: 'src/net/session.ts',
-    from: '        if (result && result !== resultSent) {',
+    from: '        if (++sinceResult >= HELLO_EVERY) {',
     to: '        if (false) {',
+  },
+  {
+    name: 'the result is said once and never again',
+    file: 'src/net/session.ts',
+    from: '          sinceResult = 0\n          const bytes = encodeResult(result)',
+    to: '          sinceResult = Number.NEGATIVE_INFINITY\n          const bytes = encodeResult(result)',
   },
   {
     name: 'the host snapshots a roster of nobody on the resolving tick',
@@ -459,13 +465,13 @@ const MUTATIONS = [
   {
     name: 'every hit is credited to seat 0',
     file: 'src/game/game.ts',
-    from: '      const scorer = seatOf(seats, from)\n      if (!scorer) return\n      creditHit(scorer, amount)',
-    to: '      const scorer = seats[0]\n      if (!scorer) return\n      creditHit(scorer, amount)',
+    from: '      const direct = seatOf(seats, from)\n      if (direct) {',
+    to: '      const direct = seats[0]\n      if (direct) {',
   },
   {
     name: 'every kill is credited to seat 0',
     file: 'src/game/game.ts',
-    from: '    return seatOf(seats, from) ?? seats[0] ?? null',
+    from: '    return seatOf(seats, from) ?? lastHitter.get(victim) ?? soleSeat()',
     to: '    return seats[0] ?? null',
   },
   {
@@ -499,8 +505,8 @@ const MUTATIONS = [
   {
     name: 'finish waits only for flying seats, not for wrecks',
     file: 'src/game/game.ts',
-    from: '    if (!matchStillRunning()) finish(pendingResult ?? sealResult(false))',
-    to: '    if (!anySeatFlying()) finish(pendingResult ?? sealResult(false))',
+    from: '    if (!matchStillRunning()) resolveMatch(false)',
+    to: '    if (!anySeatFlying()) resolveMatch(false)',
   },
   {
     /*
@@ -511,8 +517,8 @@ const MUTATIONS = [
      */
     name: "a teammate's win overwrites the drawn seat's sealed loss",
     file: 'src/game/game.ts',
-    from: '      finish(pendingResult ?? sealResult(true))',
-    to: '      finish(sealResult(true))',
+    from: '    const report = pendingResult\n      ? { ...pendingResult, match: match.lines.length > 1 ? match : undefined }\n      : line',
+    to: '    const report = line',
   },
   {
     name: 'a win is reported over a wreck',
@@ -795,7 +801,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 607
+const EXPECTED_ASSERTIONS = 608
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

@@ -5335,6 +5335,8 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
     wrecked: boolean
     scoreAtDeath: number
     scoreAtEnd: number
+    timeAtDeath: number
+    timeAtEnd: number
   } {
     const field = aimedMinefield()
     let ended: RunResult | null = null
@@ -5362,6 +5364,7 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
     let wrecked = false
     let deaths = 0
     let scoreAtDeath = -1
+    let timeAtDeath = -1
     for (let i = 0; i < 60; i++) {
       const view = game.snapshot(0)
       if (!view) break
@@ -5370,6 +5373,7 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
         wrecked = true
         // Read on the first tick the wreck is visible, which is the tick after the seal.
         scoreAtDeath = view.score
+        timeAtDeath = view.elapsed
         break
       }
       game.step(hands)
@@ -5377,17 +5381,19 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
 
     field.aim((r) => r === SENTINEL)
     let scoreAtEnd = scoreAtDeath
+    let timeAtEnd = timeAtDeath
     for (let i = 0; i < sequence + 240 && (ended as RunResult | null) === null; i++) {
       const view = game.snapshot(0)
       if (!view) break
       deaths = Math.max(deaths, view.deaths)
       scoreAtEnd = view.score
+      timeAtEnd = view.elapsed
       field.arm()
       game.step(hands)
     }
 
     game.dispose()
-    return { result: ended as RunResult | null, deaths, wrecked, scoreAtDeath, scoreAtEnd }
+    return { result: ended as RunResult | null, deaths, wrecked, scoreAtDeath, scoreAtEnd, timeAtDeath, timeAtEnd }
   }
 
   const asVictim = playFrom(0)
@@ -5428,6 +5434,18 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
     'and its result is the scoreline it died with',
     asVictim.result?.score === asVictim.scoreAtDeath,
     `reported ${asVictim.result?.score}, had ${asVictim.scoreAtDeath} at death`,
+  )
+  /*
+   * And the clock it died on, not the clock the match ended on. This is what tells a
+   * result sealed at death from the same seat's line read off the board at resolution:
+   * the board also says it lost with that score, so score and verdict alone cannot.
+   */
+  check(
+    'and its run ended when it died, not when the match did',
+    asVictim.result !== null &&
+      Math.abs(asVictim.result.time - asVictim.timeAtDeath) <= STEP &&
+      asVictim.result.time < asVictim.timeAtEnd - DEATH_SEQUENCE / 2,
+    `reported ${asVictim.result?.time}s, died at ${asVictim.timeAtDeath}s, match ended at ${asVictim.timeAtEnd}s`,
   )
   check(
     'and mines clearing the squadron after its death paid a seat that never fired nothing',
