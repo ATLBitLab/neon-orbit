@@ -122,4 +122,10 @@ export const STREAM = {
    * somebody does.
    */
   respawn: 0xb0c4,
+  /**
+   * The autopilot flying a seat nobody has taken, offset by seat index. Seat 0
+   * is never backfilled, so the bare label goes unused; clear of `pilot` and its
+   * offsets by thousands, for the reason `enemyGuns` gives.
+   */
+  wingman: 0x7a70,
 } as const

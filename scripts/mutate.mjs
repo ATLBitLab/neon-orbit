@@ -223,6 +223,37 @@ const MUTATIONS = [
     to: '      id: 0,\n      spec: pilot.ship.spec.id,',
   },
 
+  /* ---- Backfill: a seat with no peer is flown --------------------------- */
+  {
+    name: 'an empty seat holds instead of being flown',
+    file: 'src/net/session.ts',
+    from: '        if (!peer && auto) {\n',
+    to: '        if (false && !peer && auto) {\n',
+  },
+  {
+    name: 'the autopilot keeps flying a seat a peer has taken',
+    file: 'src/net/session.ts',
+    from: '        if (!peer && auto) {\n',
+    to: '        if (auto) {\n',
+  },
+  {
+    name: 'a peer taking a seat over starts from launch throttle',
+    file: 'src/net/session.ts',
+    from: '      if (auto) holds[seat].throttle = auto.controls.throttle\n',
+    to: '',
+  },
+  {
+    name: 'the seat autopilot never fires',
+    file: 'src/game/autopilot.ts',
+    from: '      controls.fire = t.range < FIRE_RANGE && Math.abs(t.pitch) < FIRE_CONE && Math.abs(t.yaw) < FIRE_CONE\n',
+    to: '      controls.fire = false\n',
+  },
+  {
+    name: 'the seat autopilot steers away from its target',
+    file: 'src/game/autopilot.ts',
+    from: '      controls.pitch = clamp(t.pitch * STEER_GAIN + (closing ? jinkPitch : 0))\n      controls.yaw = clamp(t.yaw * STEER_GAIN + (closing ? jinkYaw : 0))\n',
+    to: '      controls.pitch = clamp(-t.pitch * STEER_GAIN + (closing ? jinkPitch : 0))\n      controls.yaw = clamp(-t.yaw * STEER_GAIN + (closing ? jinkYaw : 0))\n',
+  },
   /* ---- Transport: the session protocol ------------------------------------ */
   {
     name: 'the host flies whatever seat an intent claims',
@@ -833,7 +864,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 618
+const EXPECTED_ASSERTIONS = 629
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

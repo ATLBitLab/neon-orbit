@@ -221,6 +221,21 @@ and offers RETRY — a fresh join on the same code — or PLAY SOLO. A host with
 policy, headless; `simcheck` walks it through a drop inside the grace, a recovery, a second
 outage that runs out, ICE failing, and the channel closing.
 
+**A seat nobody is in is flown, not parked.** A host's match has a seat per hull, and a seat with
+no peer — before anyone has joined, or after a player dropped — used to fly a neutral stick in a
+straight line: a ghost the squadron shot for free. `game/autopilot.ts` flies it now, on the host
+only: a proportional controller with a seeded jink that steers from the same `RunSnapshot` a
+scripted pilot gets (bearing and range to the lock, hull, heat), fires down its nose inside a cone,
+detours to a repair pod when hurt, and turns hard off the star. It sees nothing a console cannot
+and goes through the same seat admission a peer does. A peer that arrives takes the seat over
+mid-flight — the host seeds the seat's throttle hold from what the autopilot was flying, so the
+hull does not lurch on the tick a person takes the stick — and one that drops hands it back the
+next tick. Seeded per seat (`STREAM.wingman`), so a seed replays the same match whether or not
+anyone joined. `simcheck` flies a peer-less seat for twenty seconds and asks for hits, an arena
+never left, the same match twice from one seed, a takeover with no shots from the autopilot after
+and no jump in throttle or position across it, and the autopilot back on the stick after a drop.
+`createHost({ backfill: false })` keeps the old hold for the wire checks that measure it.
+
 **Two tabs on one machine will usually not connect, and that is WebRTC, not this code.** Chrome
 hides its LAN address behind an mDNS name and the only other route is back through your own
 router, which most do not allow; a plain two-tab WebRTC test with no relay in between sits in
