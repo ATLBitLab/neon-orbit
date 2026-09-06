@@ -15,6 +15,17 @@ import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { MatchResult, RunResult, SeatLine } from '../src/core/scores'
+import {
+  blastFraction,
+  BLAST_DAMAGE,
+  BLAST_RADIUS,
+  BFG_CHARGES,
+  createBfg,
+  ROUND_LIFETIME,
+  SELF_DAMAGE,
+  SPOOL_TIME,
+  type BfgEvent,
+} from '../src/game/bfg'
 import { createBolts, FACTION_AI, FACTION_ENVIRONMENT, FACTION_PLAYER, humanFaction, type Faction } from '../src/game/bolts'
 import { createStepClock } from '../src/core/loop'
 import { createPilot, type Pilot } from '../src/game/controls'
@@ -105,6 +116,9 @@ function silentAudio(): Audio & { laserCount: number } {
     pickup() {},
     overheat() {},
     alarm() {},
+    charge() {},
+    siege() {},
+    detonation() {},
     uiSelect() {},
     uiLaunch() {},
     fanfare() {},
@@ -121,6 +135,7 @@ function controls(overrides: Partial<Controls> = {}): Controls {
     throttle: 0,
     fire: false,
     dash: false,
+    secondary: false,
     aim: null,
     spread: 0,
     ...overrides,
@@ -998,6 +1013,7 @@ function stubInput(): Input & { write: InputState } {
     throttleDown: false,
     fire: false,
     dash: false,
+    secondary: false,
   }
   const noop = () => {}
   return {
@@ -1768,6 +1784,324 @@ function testPickups(): void {
   guardedDrone.dispose()
   field.dispose()
   mines.dispose()
+}
+
+function testBfg(): void {
+  section('The BFG is a moment, not a button')
+
+  const forward = new THREE.Vector3(0, 0, -1)
+
+  const owner = new Ship(SHIPS.hornet, FACTION_PLAYER)
+  owner.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  owner.warpTimer = 0
+
+  const near = new Ship(SHIPS.wasp, FACTION_AI)
+  near.spawn(new THREE.Vector3(0, 0, -600), new THREE.Vector3(0, 0, -4000))
+  near.warpTimer = 0
+
+  const grazed = new Ship(SHIPS.hornet, FACTION_AI)
+  grazed.spawn(new THREE.Vector3(200, 0, -600), new THREE.Vector3(0, 0, -4000))
+  grazed.warpTimer = 0
+
+  const clear = new Ship(SHIPS.hornet, FACTION_AI)
+  clear.spawn(new THREE.Vector3(520, 0, -600), new THREE.Vector3(0, 0, -4000))
+  clear.warpTimer = 0
+
+  const bfg = createBfg()
+  const ships = [owner, near, grazed, clear]
+
+  function frame(hold: boolean): BfgEvent[] {
+    owner.position.set(0, 0, 0)
+    near.position.set(0, 0, -600)
+    grazed.position.set(200, 0, -600)
+    clear.position.set(520, 0, -600)
+    for (const ship of ships) ship.velocity.set(0, 0, 0)
+    return bfg.update(STEP, {
+      owner,
+      forward,
+      hold,
+      targets: ships,
+      hazards: [],
+      minefield: null,
+      arenaLimit: ARENA_HARD_LIMIT,
+    })
+  }
+
+  const early = Math.floor((SPOOL_TIME / STEP) * 0.6)
+  for (let i = 0; i < early; i++) frame(true)
+  check('holding the trigger spools rather than firing', bfg.spool > 0.5 && bfg.spool < 1)
+  check('nothing has launched yet', bfg.roundsInFlight === 0 && bfg.charges === BFG_CHARGES)
+
+  const aborted = frame(false)
+  check('letting go aborts the charge', aborted.some((e) => e.kind === 'abort'))
+  check('an aborted charge is not spent', bfg.charges === BFG_CHARGES, `charges=${bfg.charges}`)
+  check('the spool resets to empty', bfg.spool === 0)
+
+  for (let i = 0; i < Math.ceil((SPOOL_TIME + 1) / STEP); i++) frame(false)
+  let launched: BfgEvent | undefined
+  for (let i = 0; i < Math.ceil((SPOOL_TIME + 0.2) / STEP) && !launched; i++) {
+    launched = frame(true).find((e) => e.kind === 'launch')
+  }
+  check('a full charge launches a round', launched !== undefined)
+  check('the launch spends a charge', bfg.charges === BFG_CHARGES - 1, `charges=${bfg.charges}`)
+  check('the round is in flight', bfg.roundsInFlight === 1)
+  check('the AI is told to steer around it', bfg.avoidance.length === 1)
+  check(
+    'its avoid bubble covers the blast',
+    (bfg.avoidance[0]?.avoidRange ?? 0) >= BLAST_RADIUS,
+    `avoidRange=${bfg.avoidance[0]?.avoidRange}`,
+  )
+
+  const nearHull = near.hull
+  const grazedHull = grazed.hull
+  let blast: Extract<BfgEvent, { kind: 'detonate' }> | undefined
+  for (let i = 0; i < Math.ceil(ROUND_LIFETIME / STEP) && !blast; i++) {
+    blast = frame(false).find((e) => e.kind === 'detonate') as typeof blast
+  }
+
+  check('the round detonates on contact', blast !== undefined)
+  check('the hull it hit is destroyed', !near.alive, `hull=${near.hull.toFixed(0)}/${nearHull}`)
+  check(
+    'a hull at the edge of the sphere is hurt, not deleted',
+    grazed.alive && grazed.hull < grazedHull,
+    `hull=${grazed.hull.toFixed(0)}/${grazedHull}`,
+  )
+  check(
+    'damage falls off with distance',
+    grazed.hull > grazedHull - BLAST_DAMAGE * 0.5,
+    `took ${(grazedHull - grazed.hull).toFixed(0)}`,
+  )
+  check('a hull outside the sphere is untouched', clear.hull === clear.spec.maxHull, `hull=${clear.hull}`)
+  check(
+    'the blast reports its casualties',
+    blast?.kills === 1 && blast?.enemiesHit === 2,
+    `kills=${blast?.kills}, hit=${blast?.enemiesHit}`,
+  )
+  check('the shockwave shoves what it does not kill', grazed.velocity.length() > 0, `speed=${grazed.velocity.length().toFixed(0)}`)
+  check('a spent round stops steering the AI', bfg.avoidance.length === 0 && bfg.roundsInFlight === 0)
+
+  check('the blast is lethal at the centre', blastFraction(0) === 1)
+  check('and nothing at all at the edge', blastFraction(BLAST_RADIUS) === 0)
+  check(
+    'with a small lethal core rather than a uniform sphere',
+    blastFraction(BLAST_RADIUS / 2) < 0.4,
+    `half-radius fraction ${blastFraction(BLAST_RADIUS / 2).toFixed(2)}`,
+  )
+
+  bfg.dispose()
+  for (const ship of ships) ship.dispose()
+}
+
+function testBfgHurtsThePilot(): void {
+  section('The BFG does not care who fired it')
+
+  const forward = new THREE.Vector3(0, 0, -1)
+
+  const owner = new Ship(SHIPS.drone, FACTION_PLAYER)
+  owner.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  owner.warpTimer = 0
+
+  const victim = new Ship(SHIPS.hornet, FACTION_AI)
+  const victimAt = new THREE.Vector3(0, 0, -190)
+  victim.spawn(victimAt, new THREE.Vector3(0, 0, -4000))
+  victim.warpTimer = 0
+
+  const bfg = createBfg()
+  const ships = [owner, victim]
+  let blast: Extract<BfgEvent, { kind: 'detonate' }> | undefined
+
+  for (let i = 0; i < Math.ceil((SPOOL_TIME + ROUND_LIFETIME + 1) / STEP) && !blast; i++) {
+    owner.position.set(0, 0, 0)
+    owner.velocity.set(0, 0, 0)
+    victim.position.copy(victimAt)
+    victim.velocity.set(0, 0, 0)
+    blast = bfg
+      .update(STEP, {
+        owner,
+        forward,
+        hold: true,
+        targets: ships,
+        hazards: [],
+        minefield: null,
+        arenaLimit: ARENA_HARD_LIMIT,
+      })
+      .find((e) => e.kind === 'detonate') as typeof blast
+  }
+
+  const selfDamage = owner.spec.maxHull - owner.hull
+  const enemyDamage = victim.spec.maxHull - victim.hull
+
+  check('a point-blank shot catches the pilot', selfDamage > 0, `took ${selfDamage.toFixed(0)}`)
+  check('the blast reports the self-hit', blast?.selfHit === true)
+  check(
+    'the pilot takes a discounted share, not the full blast',
+    Math.abs(selfDamage / Math.max(1, enemyDamage) - SELF_DAMAGE) < 0.25,
+    `self ${selfDamage.toFixed(0)} vs enemy ${enemyDamage.toFixed(0)}`,
+  )
+  check(
+    'a Wasp would not survive its own round at this range',
+    selfDamage > SHIPS.wasp.maxHull * 0.5,
+    `${selfDamage.toFixed(0)} damage`,
+  )
+
+  bfg.dispose()
+  owner.dispose()
+  victim.dispose()
+}
+
+function testBfgAmmoAndChaining(): void {
+  section('Two rounds a run, and the shockwave sets off mines')
+
+  const forward = new THREE.Vector3(0, 0, -1)
+  const owner = new Ship(SHIPS.hornet, FACTION_PLAYER)
+  owner.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  owner.warpTimer = 0
+
+  const field = buildMinefield({
+    count: 1,
+    arenaRadius: 800,
+    hazards: [],
+    spawn: new THREE.Vector3(0, 0, 4000),
+  })
+  const mine = field.mines[0]
+  const bfg = createBfg()
+
+  let launches = 0
+  let chained = 0
+  function tick(hold: boolean): void {
+    owner.position.set(0, 0, 0)
+    owner.velocity.set(0, 0, 0)
+    forward.copy(mine.position).normalize()
+    for (const event of bfg.update(STEP, {
+      owner,
+      forward,
+      hold,
+      targets: [owner],
+      hazards: [],
+      minefield: field,
+      arenaLimit: ARENA_HARD_LIMIT,
+    })) {
+      if (event.kind === 'launch') launches++
+      if (event.kind === 'detonate') chained += event.minesChained
+    }
+  }
+
+  const holdBudget = Math.ceil((SPOOL_TIME + 2) / STEP)
+  for (let i = 0; i < holdBudget; i++) tick(true)
+  check('holding through a launch does not spend the second round', launches === 1, `launched ${launches}`)
+  check('the second charge is still aboard', bfg.charges === BFG_CHARGES - 1, `charges=${bfg.charges}`)
+
+  for (let i = 0; i < Math.ceil(1 / STEP); i++) tick(false)
+  for (let i = 0; i < holdBudget; i++) tick(true)
+  check(`a release then a second hold yields the second round`, launches === BFG_CHARGES, `launched ${launches}`)
+  check('charges bottom out at zero', bfg.charges === 0)
+
+  const wait = Math.ceil((ROUND_LIFETIME * 2 + 1) / STEP)
+  for (let i = 0; i < wait; i++) tick(false)
+  check('the shockwave chain-detonates mines', chained > 0, `chained ${chained}`)
+  check('a chained mine is actually dead', !mine.live)
+
+  bfg.reset()
+  check('a new run re-arms the weapon', bfg.charges === BFG_CHARGES && bfg.roundsInFlight === 0)
+
+  bfg.dispose()
+  owner.dispose()
+  field.dispose()
+}
+
+function testSpoolingSilencesTheGuns(): void {
+  section('Spooling the BFG costs you the guns')
+
+  const game = createGame({
+    scene: new THREE.Scene(),
+    camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
+    environment: stubEnvironment(),
+    input: stubInput(),
+    audio: silentAudio(),
+    hud: stubHud(),
+    bestScoreFor: () => 0,
+    onEnd: () => {},
+  })
+
+  game.start({ ships: ['hornet'] })
+
+  // Warp-in locks the guns for 0.85s. The first-frame leak only shows after
+  // that window: a test that starts charging on tick 0 is hidden by it.
+  for (let i = 0; i < Math.ceil(1 / STEP); i++) game.step([controls()])
+  check('warp-in has cleared before the charge', game.snapshot()?.elapsed! >= 1)
+
+  const charging = controls({ fire: true, secondary: true, throttle: 1, dash: true })
+  game.step([charging])
+  check(
+    'the first charge frame does not leak a gun shot',
+    game.snapshot()?.shotsFired === 0,
+    `shots=${game.snapshot()?.shotsFired}`,
+  )
+  check('wouldCharge is true on that same frame', (game.snapshot()?.bfgSpool ?? 0) > 0, `spool=${game.snapshot()?.bfgSpool}`)
+
+  const spoolFrames = Math.floor((SPOOL_TIME / STEP) * 0.8)
+  for (let i = 0; i < spoolFrames; i++) game.step([charging])
+
+  const mid = game.snapshot()
+  check('the guns stay cold for the whole charge', mid?.shotsFired === 0, `shots=${mid?.shotsFired}`)
+  check('the spool is visibly filling', (mid?.bfgSpool ?? 0) > 0.5, `spool=${mid?.bfgSpool?.toFixed(2)}`)
+  check('both rounds are still aboard', mid?.bfgCharges === BFG_CHARGES)
+
+  for (let i = 0; i < Math.ceil(0.6 / STEP); i++) game.step([charging])
+  const fired = game.snapshot()
+  check('the round launches at full charge', fired?.bfgCharges === BFG_CHARGES - 1, `charges=${fired?.bfgCharges}`)
+
+  const guns = controls({ fire: true, throttle: 1 })
+  for (let i = 0; i < Math.ceil(1.2 / STEP); i++) game.step([guns])
+  const shooting = game.snapshot()
+  check('releasing it hands the guns back', (shooting?.shotsFired ?? 0) > 0, `shots=${shooting?.shotsFired}`)
+
+  game.dispose()
+}
+
+function testBfgPiercesShield(): void {
+  section('A Shield does not make the BFG free')
+
+  const forward = new THREE.Vector3(0, 0, -1)
+  const owner = new Ship(SHIPS.drone, FACTION_PLAYER)
+  owner.spawn(new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1000))
+  owner.warpTimer = 0
+  owner.engageShield(SHIELD_DURATION)
+
+  const victim = new Ship(SHIPS.hornet, FACTION_AI)
+  const victimAt = new THREE.Vector3(0, 0, -190)
+  victim.spawn(victimAt, new THREE.Vector3(0, 0, -4000))
+  victim.warpTimer = 0
+  victim.engageShield(SHIELD_DURATION)
+
+  const bfg = createBfg()
+  let blast: Extract<BfgEvent, { kind: 'detonate' }> | undefined
+  for (let i = 0; i < Math.ceil((SPOOL_TIME + ROUND_LIFETIME + 1) / STEP) && !blast; i++) {
+    owner.position.set(0, 0, 0)
+    owner.velocity.set(0, 0, 0)
+    victim.position.copy(victimAt)
+    victim.velocity.set(0, 0, 0)
+    blast = bfg
+      .update(STEP, {
+        owner,
+        forward,
+        hold: true,
+        targets: [owner, victim],
+        hazards: [],
+        minefield: null,
+        arenaLimit: ARENA_HARD_LIMIT,
+      })
+      .find((e) => e.kind === 'detonate') as typeof blast
+  }
+
+  check('the shielded pilot still takes their own blast', owner.hull < owner.spec.maxHull, `hull=${owner.hull.toFixed(0)}`)
+  check('the Shield is still up afterwards', owner.shielded, `timer=${owner.shieldTimer.toFixed(2)}`)
+  check('a shielded hostile is not safe inside the sphere either', victim.hull < victim.spec.maxHull, `hull=${victim.hull.toFixed(0)}`)
+  check('the blast still reports the self-hit', blast?.selfHit === true)
+
+  bfg.dispose()
+  owner.dispose()
+  victim.dispose()
 }
 
 /**
@@ -2629,15 +2963,18 @@ function testIntentIsAdmittedNotTrusted(): void {
   check('fire: 1 does not', admit({ fire: 1 }).fire === false)
   check('dash: true dashes', admit({ dash: true }).dash === true)
   check("dash: 'false' does not", admit({ dash: 'false' }).dash === false)
+  check('secondary: true spools', admit({ secondary: true }).secondary === true)
+  check("secondary: 'yes' does not", admit({ secondary: 'yes' }).secondary === false)
 
   /* Two fields never survive. */
   check('an aim override is dropped', admit({ aim: new THREE.Vector3(0, 0, -1) }).aim === null)
   check('a spread is zeroed', admit({ spread: 0.7 }).spread === 0)
 
   /* A late tick holds the last intent, except for the triggers. The held intent
-     has both triggers *down*, or "dropped" and "held" would read the same. */
+     has all three triggers *down*, or "dropped" and "held" would read the same. */
   held.fire = true
   held.dash = true
+  held.secondary = true
   for (const [label, late] of [['undefined', undefined], ['null', null], ['a number', 42]] as const) {
     const a = admit(late)
     check(
@@ -2645,11 +2982,12 @@ function testIntentIsAdmittedNotTrusted(): void {
       a.pitch === 0.4 && a.yaw === -0.2 && a.roll === 1 && a.throttle === 0.6,
       `got ${a.pitch}/${a.yaw}/${a.roll}/${a.throttle}`,
     )
-    check(`and ${label} does not keep firing or dashing`, a.fire === false && a.dash === false)
+    check(`and ${label} does not keep firing, dashing or spooling`, a.fire === false && a.dash === false && a.secondary === false)
   }
 
   held.fire = false
   held.dash = false
+  held.secondary = false
 
   /* Nothing in the packet is retained. */
   const packet = { pitch: 0.5, throttle: 0.6, fire: true }
@@ -3221,7 +3559,7 @@ function testAnIntentFrameEndsInAdmission(): void {
 
   const held = controls({ throttle: 0.5 })
   const out = controls({ pitch: 0.123 })
-  const sent = controls({ pitch: 0.25, yaw: -1, roll: 1, throttle: 0.51, fire: true, dash: true })
+  const sent = controls({ pitch: 0.25, yaw: -1, roll: 1, throttle: 0.51, fire: true, dash: true, secondary: true })
   const bytes = encodeIntent(2, 4242, sent)
   check('an intent frame is fixed-size', bytes.length === INTENT_FRAME_BYTES, `${bytes.length}`)
 
@@ -3229,7 +3567,7 @@ function testAnIntentFrameEndsInAdmission(): void {
   check('seat and tick come back', frame.seat === 2 && frame.tick === 4242)
   check(
     'the controls come back through admission',
-    out.pitch === 0.25 && out.yaw === -1 && out.roll === 1 && out.throttle === Math.fround(0.51) && out.fire && out.dash,
+    out.pitch === 0.25 && out.yaw === -1 && out.roll === 1 && out.throttle === Math.fround(0.51) && out.fire && out.dash && out.secondary,
     JSON.stringify(out),
   )
   check('the decoded intent is the out struct, not a fresh one', frame.controls === out)
@@ -7601,6 +7939,11 @@ testSolarSear()
 testBoltPoolDoesNotLeak()
 testMines()
 testPickups()
+testBfg()
+testBfgHurtsThePilot()
+testBfgAmmoAndChaining()
+testSpoolingSilencesTheGuns()
+testBfgPiercesShield()
 testARunCanBeWon()
 testDeathPlaysBeforeTheDebrief()
 testASeededRunReproduces()

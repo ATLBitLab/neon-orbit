@@ -162,10 +162,10 @@ export class ByteReader {
 /* ---- Intent frames ------------------------------------------------------- */
 
 /** The one wire format for a client's intent. Bumped when the layout changes. */
-export const INTENT_VERSION = 1
+export const INTENT_VERSION = 2
 
-/** Fixed size: version, seat, tick, four floats, two flags. */
-export const INTENT_FRAME_BYTES = 1 + 1 + 4 + 4 * 4 + 2
+/** Fixed size: version, seat, tick, four floats, three flags. */
+export const INTENT_FRAME_BYTES = 1 + 1 + 4 + 4 * 4 + 3
 
 /**
  * What a client says about one tick.
@@ -187,7 +187,7 @@ export function encodeIntent(seat: number, tick: number, c: Controls, w = new By
   w.u8(seat)
   w.u32(tick)
   w.f32(c.pitch).f32(c.yaw).f32(c.roll).f32(c.throttle)
-  w.bool(c.fire).bool(c.dash)
+  w.bool(c.fire).bool(c.dash).bool(c.secondary)
   return w.bytes()
 }
 
@@ -217,6 +217,7 @@ export function decodeIntent(bytes: Uint8Array, held: Controls, dt: number, out:
     throttle: r.f32(),
     fire: r.bool(),
     dash: r.bool(),
+    secondary: r.bool(),
   }
   r.finish()
   return { seat, tick, controls: admitIntent(claim, held, dt, out) }
