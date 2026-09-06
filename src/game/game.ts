@@ -28,6 +28,7 @@ import { STREAM, subRng, type Rng } from '../core/rng'
 import type { MatchResult, RunResult, SeatLine } from '../core/scores'
 import { otherShips, SHIPS, type ShipId } from '../ships/specs'
 import {
+  ARENA_HARD_LIMIT,
   ARENA_RADIUS,
   PLAYER_SPAWN_LOOK,
   type Environment,
@@ -44,6 +45,7 @@ import {
   type PickupKind,
 } from '../world/pickups'
 import { EnemyPilot } from './ai'
+import { BLAST_RADIUS, createBfg, SPOOL_THROTTLE_CAP, type Bfg } from './bfg'
 import { createBolts, FACTION_AI, FACTION_ENVIRONMENT, FACTION_PLAYER, type Bolts, type Faction } from './bolts'
 import { FEED_RING, NOBODY, THE_ARENA, type KillEvent, type LockRef, type SeatState, type ShipState, type SquadronState, type WorldSnapshot } from '../net/snapshot'
 import { createChaseCamera, type ChaseCamera } from './chase'
@@ -174,6 +176,10 @@ const WRECK_SPARK_RATE = 26
  * The big one at `WRECK_TUMBLE` is the moment the ship itself goes; the two
  * after it are cook-offs in the debris.
  */
+const BFG_FLASH = new THREE.Color(0x9dff3b)
+/** How often the spool ratchet ticks at empty charge. Tightens as it fills. */
+const CHARGE_TICK = 0.17
+
 const DEATH_BLASTS: { at: number; scale: number; spread: number; shake: number; big: boolean }[] = [
   { at: 0, scale: 0.55, spread: 10, shake: 1, big: false },
   { at: 0.26, scale: 0.7, spread: 14, shake: 1.1, big: false },
@@ -443,6 +449,10 @@ export interface RunSnapshot {
    * question from "where is my next gun buff".
    */
   pickups: Record<PickupKind, { yaw: number; pitch: number; range: number } | null>
+  /** BFG rounds left for this seat. */
+  bfgCharges: number
+  /** BFG spool progress, 0..1. */
+  bfgSpool: number
 }
 
 export interface GameDeps {
@@ -462,6 +472,19 @@ export function createGame(deps: GameDeps): Game {
   const bolts: Bolts = createBolts()
   const fx: Fx = createFx()
   scene.add(bolts.mesh, fx.group)
+
+  /**
+   * One BFG per seat, created in `start`. Player-only in the original sense:
+   * humans have it, the squadron does not. Each seat carries its own two
+   * charges so a second stick is not sharing the first one's magazine.
+   */
+  let bfgs: Bfg[] = []
+  let chargeTimer = 0
+  /**
+   * True while a BFG blast is applying damage, so a sphere that catches three
+   * hulls counts as one accuracy hit rather than three.
+   */
+  let resolvingBlast = false
 
   const chase: ChaseCamera = createChaseCamera(camera)
 
@@ -821,7 +844,11 @@ export function createGame(deps: GameDeps): Game {
       const direct = seatOf(seats, from)
       if (direct) {
         lastHitter.set(self, direct)
-        creditHit(direct, amount)
+        // A BFG blast that catches three hulls is one shot, not three. Points
+        // still land per hull; the accuracy numerator is bumped once in
+        // `resolveBfg` after the sphere has finished.
+        if (resolvingBlast) creditDamage(direct, amount)
+        else creditHit(direct, amount)
         return
       }
       const owed = hitCredit(from, self)
@@ -973,6 +1000,117 @@ export function createGame(deps: GameDeps): Game {
   }
 
   /* ------------------------------------------------------------------------ */
+  /* BFG                                                                      */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Spooling the BFG costs you everything else. Cold guns, no dash and a
+   * throttle ceiling is what turns "press the big button" into a decision
+   * about where you are willing to be for the next second and a half.
+   *
+   * Gated on the *current* trigger via `wouldCharge`, not last tick's
+   * `spooling` flag. `Ship.step` runs before `resolveBfg`, so a first-frame
+   * check against `spooling` alone lets a ready gun fire — and a Hornet can
+   * dash on that same frame.
+   */
+  function applyBfgInterlock(seat: Participant, flown: { fire: boolean; dash: boolean; throttle: number; secondary: boolean }): void {
+    const bfg = bfgs[seat.index]
+    if (!bfg) return
+    if (!bfg.wouldCharge(flown.secondary, seat.ship)) return
+    flown.fire = false
+    flown.dash = false
+    flown.throttle = Math.min(flown.throttle, SPOOL_THROTTLE_CAP)
+  }
+
+  /**
+   * Runs the secondary weapon and turns its events into noise, light and score.
+   * Kept here rather than inside the weapon so `bfg.ts` stays pure maths and
+   * runs headless.
+   */
+  function resolveBfg(): void {
+    resolvingBlast = true
+    for (let i = 0; i < seats.length; i++) {
+      const seat = seats[i]
+      const bfg = bfgs[i]
+      if (!bfg || seat.phase.kind !== 'flying') continue
+      const ship = seat.ship
+      ship.forward(_forward)
+      const events = bfg.update(STEP, {
+        owner: ship.alive ? ship : null,
+        forward: _forward,
+        hold: seat.lastControls.secondary,
+        targets: boltTargets,
+        hazards: environment.hazards,
+        minefield: environment.minefield,
+        arenaLimit: ARENA_HARD_LIMIT,
+      })
+
+      const mine = seat === local()
+      for (const event of events) {
+        switch (event.kind) {
+          case 'spool': {
+            if (!mine) break
+            chargeTimer -= STEP
+            if (chargeTimer <= 0) {
+              audio.charge(event.progress)
+              chargeTimer = CHARGE_TICK * (1 - event.progress * 0.6)
+            }
+            break
+          }
+          case 'abort': {
+            if (mine) chargeTimer = 0
+            break
+          }
+          case 'launch': {
+            // A launch is one shot for accuracy. Left out, a pilot could farm
+            // the stat by opening every fight with a round they never aimed.
+            ship.shotsFired++
+            if (mine) {
+              chargeTimer = 0
+              audio.siege()
+              fx.spark(event.position, BFG_FLASH, 30)
+              chase.shake(0.5)
+              hud.callout('BFG AWAY', '#9dff3b', 0.9)
+            }
+            break
+          }
+          case 'detonate': {
+            fx.blast(event.position, BFG_FLASH, BLAST_RADIUS)
+            if (mine) audio.detonation()
+
+            const watcher = local()
+            if (watcher) {
+              const distance = event.position.distanceTo(watcher.ship.position)
+              chase.shake(distance < BLAST_RADIUS * 2 ? 3.4 : 1.1)
+            }
+
+            if (event.minesChained > 0) rebuildAvoidList()
+            if (event.enemiesHit > 0) seat.hits++
+
+            if (mine) {
+              if (event.selfHit) hud.callout('CAUGHT THE BLAST', '#ff3b4e', 1.4)
+              else if (event.kills > 1) hud.feed(`MULTIKILL  ×${event.kills}`)
+              else if (event.enemiesHit === 0) hud.feed('BFG  ·  NOTHING IN THE SPHERE')
+            }
+            break
+          }
+        }
+      }
+    }
+    resolvingBlast = false
+  }
+
+  function bfgHazards(): Hazard[] {
+    let extra: Hazard[] | null = null
+    for (const bfg of bfgs) {
+      if (bfg.avoidance.length === 0) continue
+      if (!extra) extra = avoidList.slice()
+      extra.push(...bfg.avoidance)
+    }
+    return extra ?? avoidList
+  }
+
+  /* ------------------------------------------------------------------------ */
   /* Targeting                                                                */
   /* ------------------------------------------------------------------------ */
 
@@ -1085,6 +1223,11 @@ export function createGame(deps: GameDeps): Game {
     }
     seats = []
     localIndex = 0
+    for (const bfg of bfgs) {
+      scene.remove(bfg.group)
+      bfg.dispose()
+    }
+    bfgs = []
     bolts.clear()
     fx.clear()
     boltTargets = []
@@ -1297,6 +1440,8 @@ export function createGame(deps: GameDeps): Game {
       solarExposure: 0,
       overdrive: null,
       shield: null,
+      bfgCharges: bfgs[seat.index]?.charges ?? 0,
+      bfgSpool: 0,
       target: null,
     })
   }
@@ -1494,6 +1639,7 @@ export function createGame(deps: GameDeps): Game {
     const s = seats[seat]
     if (!s || s.phase.kind !== 'flying' || !s.ship.alive) return
     recordControls(s, controls)
+    applyBfgInterlock(s, s.lastControls)
     s.ship.step(s.lastControls, STEP, dryCtx)
   }
 
@@ -1934,6 +2080,7 @@ export function createGame(deps: GameDeps): Game {
       // The hull flies the *record*, not the caller's struct: admission — `aim`
       // dropped, `spread` zeroed — happens in `recordControls`, and flying its
       // output is what makes the record the truth rather than a copy of it.
+      applyBfgInterlock(seat, seat.lastControls)
       seat.ship.step(seat.lastControls, STEP, ctx)
     }
 
@@ -1941,10 +2088,11 @@ export function createGame(deps: GameDeps): Game {
        consumed before the next pilot's turn. */
     squadron.length = 0
     for (const pilot of pilots) squadron.push(pilot.ship)
+    const avoidNow = bfgHazards()
     for (const pilot of pilots) {
       const quarry = nearestSeat(pilot.ship.position)
       if (!quarry) continue
-      const controls = pilot.think(quarry, squadron, avoidList, STEP)
+      const controls = pilot.think(quarry, squadron, avoidNow, STEP)
       pilot.ship.step(controls, STEP, ctx)
     }
 
@@ -1953,6 +2101,11 @@ export function createGame(deps: GameDeps): Game {
       fx.spark(hit.point, hit.color, hit.target ? 16 : 8)
       if (hit.target) audio.hit()
     }
+
+    /* BFG. After everyone has moved, so a round detonates against final
+       positions, and before mines so a chained field is already gone by the
+       time contact is tested. */
+    resolveBfg()
 
     /* Mines. Checked after everyone has moved, so contact is resolved against
        final positions rather than a stale frame. */
@@ -2141,6 +2294,7 @@ export function createGame(deps: GameDeps): Game {
     }
     for (const pilot of pilots) pilot.ship.syncVisual(alpha)
     bolts.render(alpha)
+    for (const bfg of bfgs) bfg.syncVisual(frameDt)
 
     fx.update(frameDt, camera)
     // After `syncVisual`, and at the same blend, so the camera follows the pose
@@ -2221,6 +2375,8 @@ export function createGame(deps: GameDeps): Game {
             expiring: self.shieldTimer <= TIMED_WARN_AT,
           }
         : null,
+      bfgCharges: bfgs[watcher.index]?.charges ?? 0,
+      bfgSpool: bfgs[watcher.index]?.spool ?? 0,
       target: targetReadout(watcher),
     })
     hud.updateContacts(contactBuffer, camera)
@@ -2292,7 +2448,8 @@ export function createGame(deps: GameDeps): Game {
           const direct = seatOf(seats, from)
           if (direct && direct !== seat) {
             lastHitter.set(self, direct)
-            creditHit(direct, amount)
+            if (resolvingBlast) creditDamage(direct, amount)
+            else creditHit(direct, amount)
           }
           // Feedback is the drawn seat's, and only the drawn seat's. Another
           // participant being hit shakes their camera, on their machine.
@@ -2364,6 +2521,14 @@ export function createGame(deps: GameDeps): Game {
       environment.minefield.reset()
       environment.pickups.reset()
       rebuildAvoidList()
+
+      bfgs = seats.map(() => {
+        const bfg = createBfg(BFG_FLASH.getHex())
+        scene.add(bfg.group)
+        return bfg
+      })
+      chargeTimer = 0
+      resolvingBlast = false
 
       hud.setShip(localSpec)
       hud.show()
@@ -2462,6 +2627,8 @@ export function createGame(deps: GameDeps): Game {
         shield: self.shieldTimer,
         target: bearing,
         pickups: nearestPods,
+        bfgCharges: bfgs[seat.index]?.charges ?? 0,
+        bfgSpool: bfgs[seat.index]?.spool ?? 0,
       }
     },
 
@@ -2502,6 +2669,11 @@ export function createGame(deps: GameDeps): Game {
       scene.remove(bolts.mesh, fx.group)
       bolts.dispose()
       fx.dispose()
+      for (const bfg of bfgs) {
+        scene.remove(bfg.group)
+        bfg.dispose()
+      }
+      bfgs = []
     },
   }
 }

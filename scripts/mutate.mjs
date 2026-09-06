@@ -77,22 +77,23 @@ const MUTATIONS = [
   {
     name: 'every seat flies intents[0]',
     file: 'src/game/game.ts',
-    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      seat.ship.step(seat.lastControls, STEP, ctx)',
-    to: '      recordControls(seat, intents[0])\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      applyBfgInterlock(seat, seat.lastControls)\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    to: '      recordControls(seat, intents[0])\n      applyBfgInterlock(seat, seat.lastControls)\n      seat.ship.step(seat.lastControls, STEP, ctx)',
   },
   {
     name: "every seat flies the drawn seat's intent",
     file: 'src/game/game.ts',
-    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      seat.ship.step(seat.lastControls, STEP, ctx)',
-    to: '      recordControls(seat, intents[localIndex])\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      applyBfgInterlock(seat, seat.lastControls)\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    to: '      recordControls(seat, intents[localIndex])\n      applyBfgInterlock(seat, seat.lastControls)\n      seat.ship.step(seat.lastControls, STEP, ctx)',
   },
   {
     name: 'seat i flies intents[i+1], wrapped',
     file: 'src/game/game.ts',
-    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    from: '      recordControls(seat, intents[i])\n      // The hull flies the *record*, not the caller\'s struct: admission — `aim`\n      // dropped, `spread` zeroed — happens in `recordControls`, and flying its\n      // output is what makes the record the truth rather than a copy of it.\n      applyBfgInterlock(seat, seat.lastControls)\n      seat.ship.step(seat.lastControls, STEP, ctx)',
     to:
       '      const j = (i + 1) % seats.length\n' +
       '      recordControls(seat, intents[j])\n' +
+      '      applyBfgInterlock(seat, seat.lastControls)\n' +
       '      seat.ship.step(seat.lastControls, STEP, ctx)',
   },
   {
@@ -171,8 +172,8 @@ const MUTATIONS = [
   {
     name: 'a late packet keeps firing',
     file: 'src/game/intent.ts',
-    from: '    out.fire = false\n    out.dash = false\n    out.aim = null',
-    to: '    out.fire = held.fire\n    out.dash = held.dash\n    out.aim = null',
+    from: '    out.fire = false\n    out.dash = false\n    out.secondary = false\n    out.aim = null',
+    to: '    out.fire = held.fire\n    out.dash = held.dash\n    out.secondary = false\n    out.aim = null',
   },
   {
     name: 'a late packet stalls the throttle',
@@ -183,8 +184,8 @@ const MUTATIONS = [
   {
     name: 'an admitted intent keeps the aim override',
     file: 'src/game/intent.ts',
-    from: '  out.dash = claim.dash === true\n  out.aim = null',
-    to: '  out.dash = claim.dash === true\n  out.aim = claim.aim as THREE.Vector3 | null',
+    from: '  out.dash = claim.dash === true\n  out.secondary = claim.secondary === true\n  out.aim = null',
+    to: '  out.dash = claim.dash === true\n  out.secondary = claim.secondary === true\n  out.aim = claim.aim as THREE.Vector3 | null',
   },
 
   /* ---- Snapshots: the world on the wire ----------------------------------- */
@@ -352,7 +353,7 @@ const MUTATIONS = [
   {
     name: 'predict records the intent but never flies it',
     file: 'src/game/game.ts',
-    from: '    recordControls(s, controls)\n    s.ship.step(s.lastControls, STEP, dryCtx)',
+    from: '    recordControls(s, controls)\n    applyBfgInterlock(s, s.lastControls)\n    s.ship.step(s.lastControls, STEP, dryCtx)',
     to: '    recordControls(s, controls)',
   },
   {
@@ -378,8 +379,8 @@ const MUTATIONS = [
   {
     name: 'the last hitter is never remembered',
     file: 'src/game/game.ts',
-    from: '      if (direct) {\n        lastHitter.set(self, direct)\n        creditHit(direct, amount)\n        return\n      }',
-    to: '      if (direct) {\n        creditHit(direct, amount)\n        return\n      }',
+    from: '      if (direct) {\n        lastHitter.set(self, direct)\n        // A BFG blast that catches three hulls is one shot, not three. Points\n        // still land per hull; the accuracy numerator is bumped once in\n        // `resolveBfg` after the sphere has finished.\n        if (resolvingBlast) creditDamage(direct, amount)\n        else creditHit(direct, amount)\n        return\n      }',
+    to: '      if (direct) {\n        if (resolvingBlast) creditDamage(direct, amount)\n        else creditHit(direct, amount)\n        return\n      }',
   },
   {
     name: "the arena's damage is nobody's, even in a match of one",
@@ -390,7 +391,7 @@ const MUTATIONS = [
   {
     name: 'a hit on a participant pays nothing',
     file: 'src/game/game.ts',
-    from: '            lastHitter.set(self, direct)\n            creditHit(direct, amount)',
+    from: '            lastHitter.set(self, direct)\n            if (resolvingBlast) creditDamage(direct, amount)\n            else creditHit(direct, amount)',
     to: '            lastHitter.set(self, direct)',
   },
   {
@@ -874,6 +875,38 @@ const MUTATIONS = [
       '  return out.applyAxisAngle(_launchAxis, (index / count) * Math.PI * 2)',
     to: '  void count\n  void index\n  return out.copy(PLAYER_SPAWN)',
   },
+
+  /* ---- BFG --------------------------------------------------------------- */
+  {
+    name: 'holding through a BFG launch winds the next round',
+    file: 'src/game/bfg.ts',
+    from: '          recovery = ABORT_RECOVERY\n          needsRelease = true',
+    to: '          recovery = ABORT_RECOVERY\n          needsRelease = false',
+  },
+  {
+    name: 'the BFG interlock waits for last tick\'s spooling flag',
+    file: 'src/game/bfg.ts',
+    from: '      return spoolTimer > 0 || canBegin(hold, owner)',
+    to: '      return spoolTimer > 0',
+  },
+  {
+    name: 'a Shield eats a BFG blast',
+    file: 'src/game/ship.ts',
+    from: '    if (this.shieldTimer > 0 && !pierceShield) {',
+    to: '    if (this.shieldTimer > 0) {',
+  },
+  {
+    name: 'the BFG does not hurt the pilot who fired it',
+    file: 'src/game/bfg.ts',
+    from: 'export const SELF_DAMAGE = 0.6',
+    to: 'export const SELF_DAMAGE = 0',
+  },
+  {
+    name: 'charging the BFG does not silence the guns',
+    file: 'src/game/game.ts',
+    from: '      applyBfgInterlock(seat, seat.lastControls)\n      seat.ship.step(seat.lastControls, STEP, ctx)',
+    to: '      seat.ship.step(seat.lastControls, STEP, ctx)',
+  },
 ]
 
 function dirty() {
@@ -908,7 +941,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 653
+const EXPECTED_ASSERTIONS = 699
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

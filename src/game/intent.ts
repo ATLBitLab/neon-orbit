@@ -120,13 +120,14 @@ export function rampThrottle(held: number, wanted: unknown, dt: number): number 
  * A packet that is not an object at all — `undefined` because the tick never
  * arrived, `null`, a number — is a *late* tick, and the answer to a late tick
  * is to hold the last intent: deflection and throttle carry on, so a hull mid-
- * turn keeps turning for a dropped frame instead of snapping level. The two
- * triggers do **not** carry: a dropped connection must not keep a gun firing or
- * a dash queued on the last thing its owner said before they vanished.
+ * turn keeps turning for a dropped frame instead of snapping level. The three
+ * triggers do **not** carry: a dropped connection must not keep a gun firing, a
+ * dash queued, or a BFG spooling on the last thing its owner said before they
+ * vanished.
  *
- * `fire` and `dash` are admitted only as the literal `true`. A truthy string is
- * not a trigger pull, and the alternative — `Boolean(x)` — would let `"false"`
- * fire.
+ * `fire`, `dash` and `secondary` are admitted only as the literal `true`. A
+ * truthy string is not a trigger pull, and the alternative — `Boolean(x)` —
+ * would let `"false"` fire.
  */
 export function admitIntent(raw: unknown, held: Controls, dt: number, out: Controls): Controls {
   if (typeof raw !== 'object' || raw === null) {
@@ -136,6 +137,7 @@ export function admitIntent(raw: unknown, held: Controls, dt: number, out: Contr
     out.throttle = held.throttle
     out.fire = false
     out.dash = false
+    out.secondary = false
     out.aim = null
     out.spread = 0
     return out
@@ -147,6 +149,7 @@ export function admitIntent(raw: unknown, held: Controls, dt: number, out: Contr
   out.throttle = rampThrottle(held.throttle, claim.throttle, dt)
   out.fire = claim.fire === true
   out.dash = claim.dash === true
+  out.secondary = claim.secondary === true
   out.aim = null
   out.spread = 0
   return out
