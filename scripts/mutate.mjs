@@ -352,8 +352,62 @@ const MUTATIONS = [
   {
     name: 'predict records the intent but never flies it',
     file: 'src/game/game.ts',
-    from: '    recordControls(s, controls)\n    s.ship.step(s.lastControls, STEP, dryCtx)',
-    to: '    recordControls(s, controls)',
+    from: '    s.ship.step(s.lastControls, STEP, watching ? predictionCtx : dryCtx)',
+    to: '',
+  },
+  {
+    name: 'correction replays audible effects',
+    file: 'src/game/game.ts',
+    from: 'audio: { ...audio, laser() {}, dash() {}, overheat() {} },',
+    to: 'audio,',
+  },
+  {
+    name: 'correction leaves the predicted weapon clock running',
+    file: 'src/game/game.ts',
+    from: '    ship.fireTimer = s.fireTimer',
+    to: '',
+  },
+  {
+    name: 'fresh prediction still shoots into nothing',
+    file: 'src/game/game.ts',
+    from: 'bolts: { ...bolts, fire: weapons.fire },',
+    to: 'bolts: { ...bolts, fire() {} },',
+  },
+  {
+    name: 'the delayed local bolts are drawn twice',
+    file: 'src/game/bolts.ts',
+    from: 'if (omitFaction !== undefined && pool[i].faction === omitFaction)',
+    to: 'if (false)',
+  },
+  {
+    name: 'the client draws cosmetic and authoritative local shots together',
+    file: 'src/game/game.ts',
+    from: 'bolts.render(alpha, presentingWeapons ? watcher.faction : undefined)',
+    to: 'bolts.render(alpha)',
+  },
+  {
+    name: 'a correction presents the same volley again',
+    file: 'src/game/weapon-presentation.ts',
+    from: 'fresh = volley > presented',
+    to: 'fresh = true',
+  },
+  {
+    name: 'a joined player hears the remote laser pitch',
+    file: 'src/game/weapon-presentation.ts',
+    from: 'audio.laser(true)',
+    to: 'audio.laser(false)',
+  },
+  {
+    name: 'a cosmetic collision calls authoritative damage',
+    file: 'src/game/weapon-presentation.ts',
+    from: 'bolts.update(dt, visible, hazards)',
+    to: 'bolts.update(dt, targets, hazards)',
+  },
+  {
+    name: 'a fresh match keeps the previous volley watermark',
+    file: 'src/game/weapon-presentation.ts',
+    from: 'clear() { bolts.clear(); presented = 0; volley = 0; fresh = false },',
+    to: 'clear() { bolts.clear() },',
   },
   {
     name: 'the host never acknowledges an intent',
@@ -908,7 +962,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 653
+const EXPECTED_ASSERTIONS = 672
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

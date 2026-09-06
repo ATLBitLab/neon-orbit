@@ -32,7 +32,8 @@ import {
 import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '../src/net/wire'
 import { createLoopback } from '../src/net/channel'
 import { createMatchLobby } from '../src/net/lobby'
-import { decodeHello, decodeLobby, encodeHello, encodeLobby, type LobbyState } from '../src/net/session'
+import { createWeaponPresentation } from '../src/game/weapon-presentation'
+import { decodeHello, decodeLobby, encodeHello, encodeLobby, PROTOCOL_VERSION, type LobbyState } from '../src/net/session'
 import { modeFromLocation } from '../src/net/browser'
 import { createLinkMonitor, type LinkReport } from '../src/net/link'
 import { createClient, createHost, decodeResult, decodeWelcome, encodeResult, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
@@ -2820,6 +2821,7 @@ function shipStateFixture(seed: number): ShipState {
     overdriveTimer: f(21),
     shieldTimer: f(22),
     solarExposure: f(23),
+    fireTimer: f(24),
     shotsFired: seed * 97,
   }
 }
@@ -3866,8 +3868,8 @@ function testTheStickIsAttachedToTheShip(): void {
   check('a seat that does not exist is not predicted, and nothing throws', !threw)
   check('a seat that does is', p1.z !== p0.z || p1.y !== p0.y)
 
-  // Guns into nothing: a predicted shot must leave the bolt pool empty, or the
-  // host's next restore would flicker it out and the truth re-fire it later.
+  // Prediction must leave the authoritative bolt pool empty. Cosmetic tracers
+  // live separately and never appear in a captured world.
   // Past the warp-in first: a hull cannot fire for its first 0.85 s, and a
   // burst shorter than that would prove nothing either way.
   for (let i = 0; i < 120; i++) solo.predict(0, controls({ fire: true, throttle: 1 }))
@@ -3876,7 +3878,7 @@ function testTheStickIsAttachedToTheShip(): void {
   for (let i = 0; i < 30; i++) solo.step([controls({ fire: true, throttle: 1 })])
   const steppedBolts = solo.capture().bolts.length
   check('the predicted trigger was actually pulled', shotsPredicted > 0, `${shotsPredicted} shots`)
-  check('a predicted shot fires no bolt', predictedBolts === 0, `${predictedBolts} bolts in the pool`)
+  check('a predicted shot fires no authoritative bolt', predictedBolts === 0, `${predictedBolts} bolts in the pool`)
   check('while a stepped one does', steppedBolts > 0, `${steppedBolts}`)
   solo.dispose()
 }
@@ -7438,7 +7440,7 @@ function testTheWingLaunchesItsReservations(): void {
   bad.pump()
   check('an old protocol is refused without reserving a seat', reason === 1 && !bad.a.open && badWing.state().seats[1].pilot === 'ai')
   let malformed = 0
-  for (const bytes of [new Uint8Array([FRAME.HELLO, 2, 99]), new Uint8Array([FRAME.HELLO, 2]), new Uint8Array([...encodeHello(), 0])]) {
+  for (const bytes of [new Uint8Array([FRAME.HELLO, PROTOCOL_VERSION, 99]), new Uint8Array([FRAME.HELLO, PROTOCOL_VERSION]), new Uint8Array([...encodeHello(), 0])]) {
     try { decodeHello(bytes) } catch { malformed++ }
   }
   check('unknown, short, and trailing hull claims fail decoding', malformed === 3)
@@ -7460,6 +7462,130 @@ function testTheWingLaunchesItsReservations(): void {
   check('?host=4 makes a four-seat wing', JSON.stringify(modeFromLocation('?host=4')) === '{"kind":"host","guest":"wasp","seats":4}')
   check('invalid host values fall back to a valid two-seat wing', ['99', '-1', 'bogus', '2.5'].every(v =>
     JSON.stringify(modeFromLocation('?host=' + v)) === '{"kind":"host","guest":"wasp","seats":2}'))
+}
+
+/** A tracer is a drawing; even a collision cannot call into authoritative damage. */
+function testPredictedWeaponsAreOnlyPresentation(): void {
+  section('Predicted weapons present a volley once without deciding damage')
+  const audio = silentAudio(), weapons = createWeaponPresentation(audio)
+  const matrix = new THREE.Matrix4()
+  const visible = () => {
+    weapons.render(1)
+    let count = 0
+    for (let i = 0; i < weapons.mesh.count; i++) {
+      weapons.mesh.getMatrixAt(i, matrix)
+      if (matrix.determinant() !== 0) count++
+    }
+    return count
+  }
+  const shot = { origin: new THREE.Vector3(), direction: new THREE.Vector3(0, 0, -1),
+    speed: 100, damage: 99, faction: humanFaction(1), color: new THREE.Color('cyan') }
+  weapons.begin(0)
+  weapons.fire(shot)
+  weapons.fire({ ...shot, origin: new THREE.Vector3(1, 0, 0) })
+  weapons.laser()
+  check('two muzzles make two tracers but one sound', visible() === 2 && audio.laserCount === 1)
+  weapons.begin(0); weapons.fire(shot); weapons.laser()
+  check('revisiting a predicted volley does not repeat its effects', visible() === 2 && audio.laserCount === 1)
+  weapons.confirm(5); weapons.begin(4); weapons.fire(shot); weapons.laser()
+  check('taking over an acknowledged volley does not replay it', visible() === 2 && audio.laserCount === 1)
+  let damageCalls = 0
+  weapons.advance(0.1, [{ position: new THREE.Vector3(0, 0, -5), radius: 3,
+    alive: true, targetable: true, faction: FACTION_AI, takeDamage() { damageCalls++ } }], [])
+  check('a visible collision consumes tracers without calling real damage', visible() === 0 && damageCalls === 0)
+  weapons.clear(); weapons.begin(0); weapons.fire(shot); weapons.laser()
+  check('a new match can present its first volley again', visible() === 1 && audio.laserCount === 2)
+  weapons.advance(3, [], [])
+  check('missed cosmetic tracers expire', visible() === 0)
+  weapons.dispose()
+
+  const bolts = createBolts()
+  bolts.fire(shot); bolts.fire({ ...shot, faction: FACTION_AI })
+  const capture = () => {
+    const live: string[] = []
+    bolts.each((slot, bolt) => live.push(JSON.stringify({ slot, ...bolt })))
+    return live.join('|')
+  }
+  const before = capture()
+  bolts.render(1, humanFaction(1))
+  bolts.mesh.getMatrixAt(0, matrix)
+  const localHidden = matrix.determinant() === 0
+  bolts.mesh.getMatrixAt(1, matrix)
+  check('prediction hides only the delayed local bolts', localHidden && matrix.determinant() !== 0)
+  check('hiding a bolt cannot alter authoritative state', capture() === before)
+  bolts.render(1); bolts.mesh.getMatrixAt(0, matrix)
+  check('a host still draws its authoritative local bolts', matrix.determinant() !== 0)
+  bolts.dispose()
+}
+
+function testClientWeaponsUnderLatency(): void {
+  section('Joined Wasp weapons stay at the muzzle and do not sound on replay')
+  for (const loss of [0, 0.25]) {
+    const scene = new THREE.Scene(), audio = silentAudio(), pitches: boolean[] = []
+    audio.laser = local => { audio.laserCount++; pitches.push(local) }
+    const hostGame = newMatch(), game = newMatch({ scene, audio })
+    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 876, respawn: true }, backfill: false })
+    host.start()
+    const wire = createLoopback({ latency: 6, loss, seed: 123 })
+    const client = createClient({ game, channel: wire.b })
+    host.accept(wire.a)
+    for (let i = 0; i < 7; i++) wire.pump()
+    const mesh = scene.getObjectByName('predicted-bolts') as THREE.InstancedMesh
+    const authority = scene.children.find(o => o instanceof THREE.InstancedMesh && o !== mesh) as THREE.InstancedMesh
+    const hull = new Ship(SHIPS.wasp, humanFaction(1))
+    const seen = new Set<number>(), matrix = new THREE.Matrix4(), origin = new THREE.Vector3()
+    let births = 0, muzzleError = 0, replaySounds = 0, delayedLocal = 0, duplicates = 0
+    for (let i = 0; i < 180; i++) {
+      client.tick(controls({ fire: true, throttle: 1 }))
+      const predicted = game.capture().seats[1]?.ship
+      game.render(1, 0)
+      for (const bolt of game.capture().bolts) {
+        if (bolt.faction !== humanFaction(1)) continue
+        delayedLocal++
+        authority.getMatrixAt(bolt.slot, matrix)
+        if (matrix.determinant() !== 0) duplicates++
+      }
+      if (predicted) {
+        const q = new THREE.Quaternion(predicted.quaternion.x, predicted.quaternion.y, predicted.quaternion.z, predicted.quaternion.w)
+        const p = new THREE.Vector3(predicted.position.x, predicted.position.y, predicted.position.z)
+        for (let slot = 0; slot < mesh.count; slot++) {
+          mesh.getMatrixAt(slot, matrix)
+          if (matrix.determinant() === 0 || seen.has(slot)) continue
+          seen.add(slot); births++
+          origin.setFromMatrixPosition(matrix)
+          muzzleError = Math.max(muzzleError, Math.min(...hull.visual.muzzles.map(m => origin.distanceTo(m.clone().applyQuaternion(q).add(p)))))
+        }
+      }
+      const sounds = audio.laserCount
+      host.tick(controls({ throttle: .6 })); wire.pump()
+      replaySounds += audio.laserCount - sounds
+    }
+    const hostShots = hostGame.snapshot(1)?.shotsFired ?? 0
+    console.log(`  weapons loss=${loss}: host=${hostShots}, sounds=${audio.laserCount}, tracers=${births}, muzzle error=${muzzleError}`)
+    check(`latency/loss ${loss}: firing is audible at the Wasp cadence`, hostShots > 15 && audio.laserCount >= hostShots - 3 && audio.laserCount <= hostShots + 4)
+    check(`latency/loss ${loss}: every sound is a fresh local volley`, pitches.length > 15 && pitches.every(Boolean) && replaySounds === 0)
+    check(`latency/loss ${loss}: every tracer starts at the predicted muzzle`, births > 15 && births === audio.laserCount * SHIPS.wasp.barrels && muzzleError < .001)
+    check(`latency/loss ${loss}: delayed authoritative shots cannot double the picture`, delayedLocal > 15 && duplicates === 0)
+    host.close(); game.dispose(); hostGame.dispose(); hull.dispose()
+  }
+
+  const audio = silentAudio(), game = newMatch({ audio })
+  game.start({ ships: ['hornet', 'wasp'], local: 1, seed: 876 })
+  const state = game.capture()
+  state.seats[1].ship.warpTimer = 0
+  state.seats[1].ship.fireTimer = .1
+  const replay = Array.from({ length: 18 }, () => controls({ fire: true, dash: true }))
+  let dashes = 0, overheats = 0
+  // Supply counters when constructing a second game because contexts bind the methods.
+  const silent = newMatch({ audio: { ...audio, dash() { dashes++ }, overheat() { overheats++ } } })
+  silent.start({ ships: ['hornet', 'wasp'], local: 1, seed: 876 })
+  silent.apply(state); silent.reconcile(1, replay)
+  const first = silent.capture().seats[1].ship
+  silent.apply(state); silent.reconcile(1, replay)
+  const second = silent.capture().seats[1].ship
+  check('correction restores the weapon clock before replay', first.shotsFired > 0 && first.shotsFired === second.shotsFired && first.fireTimer === second.fireTimer)
+  check('replay emits no laser, dash, or overheat audio', audio.laserCount === 0 && dashes === 0 && overheats === 0)
+  game.dispose(); silent.dispose()
 }
 
 console.log('NEON ORBIT — headless simulation checks')
@@ -7522,6 +7648,8 @@ testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()
 testALinkThatDropsIsNoticed()
 testTheWingLaunchesItsReservations()
+testPredictedWeaponsAreOnlyPresentation()
+testClientWeaponsUnderLatency()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

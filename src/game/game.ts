@@ -23,6 +23,7 @@
 
 import * as THREE from 'three'
 import type { Audio } from '../core/audio'
+import { createWeaponPresentation } from './weapon-presentation'
 import type { Input } from '../core/input'
 import { STREAM, subRng, type Rng } from '../core/rng'
 import type { MatchResult, RunResult, SeatLine } from '../core/scores'
@@ -460,8 +461,10 @@ export function createGame(deps: GameDeps): Game {
   const { scene, camera, environment, input, audio, hud } = deps
 
   const bolts: Bolts = createBolts()
+  const weapons = createWeaponPresentation(audio)
+  let presentingWeapons = false
   const fx: Fx = createFx()
-  scene.add(bolts.mesh, fx.group)
+  scene.add(bolts.mesh, weapons.mesh, fx.group)
 
   const chase: ChaseCamera = createChaseCamera(camera)
 
@@ -475,18 +478,19 @@ export function createGame(deps: GameDeps): Game {
     bolts,
     localFaction: FACTION_PLAYER,
   }
-  /**
-   * The context a *predicted* step flies in: the same arena, but the guns fire
-   * into nothing. A client predicts its own flight so the stick feels
-   * immediate; it does not predict its bolts, because the host's snapshot
-   * restores the whole pool every tick and a locally fired bolt would flicker
-   * out and reappear a round trip later. Bolts arrive with the truth.
-   */
+  // Reconciliation advances weapon clocks but must never replay their effects.
   const dryCtx: ShipContext = {
     hazards: environment.hazards,
-    audio,
+    audio: { ...audio, laser() {}, dash() {}, overheat() {} },
     bolts: { ...bolts, fire() {} },
     localFaction: FACTION_PLAYER,
+  }
+  // Only a newly sampled input presents a local shot. Tracers are separate from
+  // the authoritative pool, so snapshot restore cannot erase or duplicate them.
+  const predictionCtx: ShipContext = {
+    ...dryCtx,
+    audio: { ...audio, laser: weapons.laser, overheat: weapons.overheat },
+    bolts: { ...bolts, fire: weapons.fire },
   }
 
   /**
@@ -1086,6 +1090,8 @@ export function createGame(deps: GameDeps): Game {
     seats = []
     localIndex = 0
     bolts.clear()
+    weapons.clear()
+    presentingWeapons = false
     fx.clear()
     boltTargets = []
     contactBuffer.length = 0
@@ -1487,14 +1493,21 @@ export function createGame(deps: GameDeps): Game {
    * What a joined client does with its own intent instead of waiting a round
    * trip to see it: the hull moves now, on the same flight model the host runs,
    * and the host's next snapshot either lands exactly where this predicted —
-   * the normal case, since flight is deterministic — or corrects it. Flight
-   * only: the guns fire into `dryCtx`, and nothing here decides a hit.
+   * the normal case, since flight is deterministic — or corrects it. Fresh
+   * local shots get cosmetic tracers and sound; nothing here decides a hit.
    */
   function predict(seat: number, controls: Controls): void {
     const s = seats[seat]
-    if (!s || s.phase.kind !== 'flying' || !s.ship.alive) return
+    if (!s || paused) return
+    const watching = seat === localIndex
+    if (watching) {
+      presentingWeapons = true
+      weapons.advance(STEP, boltTargets, environment.hazards)
+    }
+    if (s.phase.kind !== 'flying' || !s.ship.alive) return
     recordControls(s, controls)
-    s.ship.step(s.lastControls, STEP, dryCtx)
+    if (watching) weapons.begin(s.ship.shotsFired)
+    s.ship.step(s.lastControls, STEP, watching ? predictionCtx : dryCtx)
   }
 
   /**
@@ -1587,6 +1600,7 @@ export function createGame(deps: GameDeps): Game {
       overdriveTimer: ship.overdriveTimer,
       shieldTimer: ship.shieldTimer,
       solarExposure: ship.solarExposure,
+      fireTimer: ship.fireTimer,
       shotsFired: ship.shotsFired,
     }
   }
@@ -1616,6 +1630,7 @@ export function createGame(deps: GameDeps): Game {
     ship.overdriveTimer = s.overdriveTimer
     ship.shieldTimer = s.shieldTimer
     ship.solarExposure = s.solarExposure
+    ship.fireTimer = s.fireTimer
     ship.shotsFired = s.shotsFired
   }
 
@@ -1748,6 +1763,7 @@ export function createGame(deps: GameDeps): Game {
       const state = s.seats[i]
       const ship = seat.ship
       writeShip(ship, state.ship)
+      if (i === localIndex) weapons.confirm(state.ship.shotsFired)
       // The HUD reads the seat's flown throttle, and a mirror flies nothing.
       seat.lastControls.throttle = state.throttle
       acks[i] = state.ackTick
@@ -2140,7 +2156,8 @@ export function createGame(deps: GameDeps): Game {
       }
     }
     for (const pilot of pilots) pilot.ship.syncVisual(alpha)
-    bolts.render(alpha)
+    bolts.render(alpha, presentingWeapons ? watcher.faction : undefined)
+    weapons.render(alpha)
 
     fx.update(frameDt, camera)
     // After `syncVisual`, and at the same blend, so the camera follows the pose
@@ -2278,6 +2295,8 @@ export function createGame(deps: GameDeps): Game {
       feedSeq = 0
       feedSeen = 0
       ctx.localFaction = seats[localIndex].faction
+      dryCtx.localFaction = ctx.localFaction
+      predictionCtx.localFaction = ctx.localFaction
 
       for (const seat of seats) {
         const ship = seat.ship
@@ -2499,8 +2518,9 @@ export function createGame(deps: GameDeps): Game {
 
     dispose() {
       clearArena()
-      scene.remove(bolts.mesh, fx.group)
+      scene.remove(bolts.mesh, weapons.mesh, fx.group)
       bolts.dispose()
+      weapons.dispose()
       fx.dispose()
     },
   }
