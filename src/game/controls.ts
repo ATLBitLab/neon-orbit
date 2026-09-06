@@ -39,6 +39,7 @@ export function createPilot(): Pilot {
     throttle: LAUNCH_THROTTLE,
     fire: false,
     dash: false,
+    secondary: false,
     aim: null,
     spread: 0,
   }
@@ -66,6 +67,7 @@ export function createPilot(): Pilot {
       controls.roll = state.roll
       controls.fire = state.fire
       controls.dash = state.dash
+      controls.secondary = state.secondary
       return controls
     },
 
@@ -76,6 +78,7 @@ export function createPilot(): Pilot {
       controls.roll = 0
       controls.fire = false
       controls.dash = false
+      controls.secondary = false
     },
   }
 }

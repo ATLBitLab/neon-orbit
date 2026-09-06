@@ -212,7 +212,7 @@ interface Peer {
 }
 
 function neutral(): Controls {
-  return { pitch: 0, yaw: 0, roll: 0, throttle: 0.6, fire: false, dash: false, aim: null, spread: 0 }
+  return { pitch: 0, yaw: 0, roll: 0, throttle: 0.6, fire: false, dash: false, secondary: false, aim: null, spread: 0 }
 }
 
 export function createHost(options: HostOptions): Host {

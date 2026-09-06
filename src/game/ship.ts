@@ -38,6 +38,8 @@ export interface Controls {
   throttle: number
   fire: boolean
   dash: boolean
+  /** BFG trigger — held to spool, released to abort. */
+  secondary: boolean
   /**
    * Fire direction override. The player always shoots along the nose (`null`);
    * the AI shoots along a lead solution, which may be slightly off-nose.
@@ -652,23 +654,27 @@ export class Ship implements BoltTarget {
     return true
   }
 
-  takeDamage(amount: number, from: Faction): void {
+  takeDamage(amount: number, from: Faction, pierceShield = false): void {
     if (!this.alive || amount <= 0) return
 
     /**
      * A held Shield refuses the damage outright — bolts, mines, station
-     * scrapes, the star, all of it.
+     * scrapes, the star, all of it. A BFG blast is the one exception: the
+     * Shield is for the gunfight, and a fusion sphere that a shielded pilot
+     * can stand in for free is a button you press on cooldown. `pierceShield`
+     * is that exception, and the BFG is the only caller.
      *
-     * Three things deliberately do *not* happen here. `sinceHit` is not reset,
-     * because nothing reached the hull and a shielded Drone should keep
-     * repairing. `onDamaged` does not fire, because that callback is what
-     * credits a hit to the shooter, and a bolt that accomplished nothing is not
-     * a hit landed — letting it through would inflate the accuracy stat exactly
-     * the way sear damage used to. And the ship stays `targetable`, so bolts
-     * still arrive and splash rather than passing through: a shield you cannot
-     * see working is a shield the player will not believe in.
+     * Three things deliberately do *not* happen here when the Shield holds.
+     * `sinceHit` is not reset, because nothing reached the hull and a shielded
+     * Drone should keep repairing. `onDamaged` does not fire, because that
+     * callback is what credits a hit to the shooter, and a bolt that
+     * accomplished nothing is not a hit landed — letting it through would
+     * inflate the accuracy stat exactly the way sear damage used to. And the
+     * ship stays `targetable`, so bolts still arrive and splash rather than
+     * passing through: a shield you cannot see working is a shield the player
+     * will not believe in.
      */
-    if (this.shieldTimer > 0) {
+    if (this.shieldTimer > 0 && !pierceShield) {
       this.onShielded?.(this, amount)
       return
     }
