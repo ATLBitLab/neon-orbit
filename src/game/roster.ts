@@ -168,6 +168,7 @@ function freshControls(): Controls {
     throttle: LAUNCH_THROTTLE,
     fire: false,
     dash: false,
+    secondary: false,
     aim: null,
     spread: 0,
   }
@@ -244,6 +245,7 @@ export function recordControls(seat: Participant, c: Controls): void {
   held.throttle = c.throttle
   held.fire = c.fire
   held.dash = c.dash
+  held.secondary = c.secondary
   held.aim = null
   held.spread = 0
 }

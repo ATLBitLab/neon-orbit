@@ -134,6 +134,7 @@ export class EnemyPilot {
     throttle: 0.8,
     fire: false,
     dash: false,
+    secondary: false,
     aim: null,
     spread: 0,
   }

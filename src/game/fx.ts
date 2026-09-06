@@ -53,6 +53,12 @@ export interface Fx {
   warpIn(at: THREE.Vector3, color: THREE.Color): void
   /** A power-up pod being absorbed: one tight ring and a bright puff. */
   collect(at: THREE.Vector3, color: THREE.Color): void
+  /**
+   * BFG detonation: a white core, a coloured fireball and three rings leaving
+   * at different speeds. Stacked rings rather than one big one because a single
+   * expanding circle reads as a decal, and three reads as a pressure wave.
+   */
+  blast(at: THREE.Vector3, color: THREE.Color, radius: number): void
   update(dt: number, camera: THREE.Camera): void
   clear(): void
   dispose(): void
@@ -206,6 +212,22 @@ export function createFx(): Fx {
     collect(at, color) {
       emit(at, color, 34, 130, 4.4, 0.55, 4.2, 10)
       ring(at, color, 100, 0.42)
+    },
+
+    blast(at, color, radius) {
+      // Tight and short. The first cut of this threw 600 particles out past the
+      // kill radius for two and a half seconds, and the reward for landing the
+      // best shot in the game was a screen you could not see out of.
+      const white = new THREE.Color(0xffffff)
+      emit(at, white, 140, radius * 1.2, 7, 0.35, 4, 10)
+      emit(at, color, 220, radius * 0.55, 9, 0.9, 1.8, 18)
+      emit(at, color, 80, radius * 0.22, 15, 1.5, 1, 40)
+      // The middle ring stops exactly on the damage boundary. A shockwave drawn
+      // wider than it kills teaches the wrong distance, and this is a weapon
+      // where the distance you keep is the whole decision.
+      ring(at, white, radius * 0.55, 0.45)
+      ring(at, color, radius, 0.8)
+      ring(at, color, radius * 1.25, 1.2)
     },
 
     update(dt, camera) {

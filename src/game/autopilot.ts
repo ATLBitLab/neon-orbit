@@ -76,6 +76,7 @@ export function createSeatAutopilot(ship: ShipId, rng: Rng): SeatAutopilot {
     throttle: 0.6,
     fire: false,
     dash: false,
+    secondary: false,
     aim: null,
     spread: 0,
   }
