@@ -28,6 +28,13 @@ export type SignalMessage =
   | { type: 'offer'; from: string; sdp: string }
   | { type: 'answer'; from: string; to: string; sdp: string }
   | { type: 'ice'; from: string; to: string; candidate: RTCIceCandidateInit }
+  | RecoveryMessage
+
+export type RecoveryMessage = { from: string; to: string; generation: number } & (
+  | { type: 'restart-request' }
+  | { type: 'restart-offer' | 'restart-answer'; sdp: string }
+  | { type: 'restart-ice'; candidate: RTCIceCandidateInit }
+)
 
 export interface Signal {
   readonly pubkey: string
@@ -53,6 +60,13 @@ function wellFormed(m: unknown): m is SignalMessage {
   if (typeof m !== 'object' || m === null) return false
   const x = m as Record<string, unknown>
   if (typeof x.from !== 'string') return false
+  if (typeof x.type === 'string' && x.type.startsWith('restart-')) {
+    if (typeof x.to !== 'string' || !Number.isSafeInteger(x.generation) || (x.generation as number) < 1) return false
+    if (x.type === 'restart-request') return true
+    if (x.type === 'restart-offer' || x.type === 'restart-answer') return typeof x.sdp === 'string'
+    if (x.type === 'restart-ice') return typeof x.candidate === 'object' && x.candidate !== null
+    return false
+  }
   if (x.type === 'offer') return typeof x.sdp === 'string'
   if (x.type === 'answer') return typeof x.sdp === 'string' && typeof x.to === 'string'
   if (x.type === 'ice') return typeof x.to === 'string' && typeof x.candidate === 'object' && x.candidate !== null

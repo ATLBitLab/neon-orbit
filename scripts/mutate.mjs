@@ -29,6 +29,42 @@ import { readFileSync, writeFileSync } from 'node:fs'
 
 /** @type {{ name: string, file: string, from: string, to: string }[]} */
 const MUTATIONS = [
+  {
+    name: 'recovery offers reuse the old ICE credentials',
+    file: 'src/net/recovery.ts',
+    from: 'pc.createOffer({ iceRestart: true })',
+    to: 'pc.createOffer({ iceRestart: false })',
+  },
+  {
+    name: 'a stranger can answer a recovery offer',
+    file: 'src/net/recovery.ts',
+    from: 'closed || message.from !== peer || message.to !== signal.pubkey',
+    to: 'closed || message.to !== signal.pubkey',
+  },
+  {
+    name: 'lost recovery offers are never resent',
+    file: 'src/net/recovery.ts',
+    from: 'if (now() - sentAt >= 1000) resend()',
+    to: '/* no retry */',
+  },
+  {
+    name: 'recovery waits forever instead of offering manual retry',
+    file: 'src/net/recovery.ts',
+    from: 'if (now() >= deadline) { fail(); return }',
+    to: '/* no deadline */',
+  },
+  {
+    name: 'early restart candidates are discarded at remote description',
+    file: 'src/net/recovery.ts',
+    from: 'for (const candidate of early.get(generation) ?? [])',
+    to: 'for (const candidate of [])',
+  },
+  {
+    name: 'recovery signalling listener survives channel cleanup',
+    file: 'src/net/recovery.ts',
+    from: '    stop()',
+    to: '    /* leave the subscription alive */',
+  },
   /* ---- Wing reservations and launch --------------------------------------- */
   {
     name: 'lobby ignores the requested hull',
@@ -995,7 +1031,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 718
+const EXPECTED_ASSERTIONS = 737
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 
