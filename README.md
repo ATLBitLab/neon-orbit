@@ -255,6 +255,18 @@ and offers RETRY — a fresh join on the same code — or PLAY SOLO. A host with
 policy, headless; `simcheck` walks it through a drop inside the grace, a recovery, a second
 outage that runs out, ICE failing, and the channel closing.
 
+**A dropped route gets one automatic recovery window.** Signalling stays connected for the
+life of the peer. Either browser can notice an outage, but only the joiner creates the ICE
+restart offer, avoiding competing offers. The existing peer connection, data channel, and
+seat stay in place. Restart messages are addressed to the established peer and carry an
+attempt number; early candidates wait for their description, and lost offers/answers are
+retried. After eight seconds without recovery the existing CONNECTION LOST / RETRY flow
+takes over. Closing or leaving also closes recovery listeners and the joiner's signalling.
+This can repair a lost route when another direct path is available; it does not provide a
+TURN relay or keep a match alive after the host leaves. `net/recovery.ts` owns negotiation
+and its deadline; `scripts/recovery-check.ts` exercises loss, ordering, peer binding and
+cleanup as part of the full simulation suite.
+
 **Choose the wing before it flies.** `net/lobby.ts` reserves a seat only after a valid
 protocol-v2 HELLO with a hull choice. Every waiting browser gets a versioned LOBBY roster:
 seat number, hull, human/AI pilot, and which seat is yours. Host hull changes and departures

@@ -12,6 +12,7 @@
  */
 
 import * as THREE from 'three'
+import { testIceRecovery } from './recovery-check'
 import type { Audio } from '../src/core/audio'
 import type { Input, InputState } from '../src/core/input'
 import type { MatchResult, RunResult, SeatLine } from '../src/core/scores'
@@ -7993,6 +7994,7 @@ testALinkThatDropsIsNoticed()
 testTheWingLaunchesItsReservations()
 testPredictedWeaponsAreOnlyPresentation()
 testClientWeaponsUnderLatency()
+await testIceRecovery(check)
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

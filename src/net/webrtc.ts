@@ -37,6 +37,7 @@
 
 import type { Channel } from './channel'
 import type { Signal, SignalMessage } from './signal'
+import { createIceRecovery } from './recovery'
 
 export function iceServers(): RTCIceServer[] {
   const servers: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
@@ -107,6 +108,21 @@ export interface LinkHooks {
   onIce?: (state: RTCIceConnectionState) => void
   /** The candidate pair in use, whenever it is (re)established; see `describeRoute`. */
   onRoute?: (route: string) => void
+}
+
+function recoverable(
+  pc: RTCPeerConnection, channel: Channel, signal: Signal, peer: string,
+  initiator: boolean, hooks: LinkHooks,
+) {
+  pc.onicecandidate = null // recovery candidates carry an attempt number
+  const recovery = createIceRecovery({
+    pc, signal, peer, initiator, now: () => performance.now(),
+    onIce: state => hooks.onIce?.(state),
+    onFailure: () => channel.close(),
+  })
+  const timer = setInterval(() => recovery.poll(), 250)
+  channel.onClose(() => { clearInterval(timer); recovery.close() })
+  return recovery
 }
 
 /**
@@ -184,6 +200,8 @@ export function connectAsClient(signal: Signal, status: Status = () => {}, hooks
   const pc = new RTCPeerConnection({ iceServers: iceServers() })
   const dc = pc.createDataChannel(DATA_CHANNEL_LABEL, DATA_CHANNEL_OPTIONS)
   let host: string | null = null
+  let recovery: ReturnType<typeof createIceRecovery> | undefined
+  const linkHooks: LinkHooks = { ...hooks, onIce: state => recovery ? recovery.ice(state) : hooks.onIce?.(state) }
   const queued: RTCIceCandidateInit[] = []
   /**
    * The host's candidates may reach the relays before its answer does — relays
@@ -237,7 +255,9 @@ export function connectAsClient(signal: Signal, status: Status = () => {}, hooks
     await signal.send({ type: 'offer', sdp: pc.localDescription!.sdp })
     await answered
     status('connecting')
-    return watch(pc, Promise.resolve(dc), status, hooks)
+    const channel = await watch(pc, Promise.resolve(dc), status, linkHooks)
+    recovery = recoverable(pc, channel, signal, host!, true, hooks)
+    return channel
   })()
 
   return connected
@@ -257,6 +277,8 @@ export function acceptAsHost(
 ): Promise<Channel> {
   const pc = new RTCPeerConnection({ iceServers: iceServers() })
   const peer = offer.from
+  let recovery: ReturnType<typeof createIceRecovery> | undefined
+  const linkHooks: LinkHooks = { ...hooks, onIce: state => recovery ? recovery.ice(state) : hooks.onIce?.(state) }
 
   pc.onicecandidate = (ev) => {
     if (ev.candidate) void signal.send({ type: 'ice', to: peer, candidate: ev.candidate.toJSON() })
@@ -283,7 +305,9 @@ export function acceptAsHost(
     await pc.setLocalDescription(await pc.createAnswer())
     status('answer sent')
     await signal.send({ type: 'answer', to: peer, sdp: pc.localDescription!.sdp })
-    return watch(pc, dc, status, hooks)
+    const channel = await watch(pc, dc, status, linkHooks)
+    recovery = recoverable(pc, channel, signal, peer, false, hooks)
+    return channel
   })()
 
   return connected

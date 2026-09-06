@@ -149,9 +149,11 @@ export async function joinMatch(game: Game, code: string, ship: ShipId, handlers
   }
   try {
     channel = await connectAsClient(signal, handlers.status, hooks)
-  } finally {
+  } catch (error) {
     signal.close()
+    throw error
   }
+  channel.onClose(() => signal.close())
   if (!handlers.active()) { channel.close(); throw new Error('join cancelled') }
   const open = channel
   open.onClose(() => monitor.closed())
