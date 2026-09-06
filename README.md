@@ -208,8 +208,9 @@ the client's world equals the host's at whatever tick it last applied). The brow
 policy: `webrtc.ts` (an unordered, no-retransmit `RTCDataChannel`) and `signal.ts` (offer/answer
 over Nostr ephemeral events on public relays, so there is nothing to run — SDP is plaintext there,
 which is named in the file rather than solved). **Try it:** open `?host` — the join code and a
-COPY LINK button are on screen from the hangar onwards — and open the link on **another device**.
-`?host=drone` picks the guest's hull. The join screen reports each stage (offer sent, answer
+COPY LINK button are in the WING panel — and open the link on **another device**.
+`?host=4` opens four seats (two by default); `?host=drone` retains the legacy two-seat AI hull default.
+The joiner picks an airframe and presses JOIN WING before connecting. The join screen reports each stage (offer sent, answer
 received, ice checking, connected) and names the failing one. Once connected, the route the two
 browsers settled on (`host/udp 192.168.1.20:51234 ↔ srflx 203.0.113.9:3478` — host, srflx or
 relay at either end) is logged to the console on both machines, which is the first thing to read
@@ -220,6 +221,27 @@ and offers RETRY — a fresh join on the same code — or PLAY SOLO. A host with
 (REFUSED) instead of leaving the joiner "waiting for the host to launch". `net/link.ts` is that
 policy, headless; `simcheck` walks it through a drop inside the grace, a recovery, a second
 outage that runs out, ICE failing, and the channel closing.
+
+**Choose the wing before it flies.** `net/lobby.ts` reserves a seat only after a valid
+protocol-v2 HELLO with a hull choice. Every waiting browser gets a versioned LOBBY roster:
+seat number, hull, human/AI pilot, and which seat is yours. Host hull changes and departures
+update everyone; revision numbers reject reordered old rosters, and the waiting client's
+repeated HELLO repairs lost messages. Launch builds the match from those reservations and
+keeps seat numbers even if somebody left a gap. AI fills the open seats. Once launched, a
+late join takes the existing ship over without changing its hull. HUD/feed AI labels remain
+unchanged. Different game versions prompt a reload.
+
+LEAVE WING closes the join and returns to solo hull selection. Returning the host to the
+hangar or replaying closes the old wing and makes a fresh code; share that code for the next
+match. Host launch does not wait for all seats to fill. Tab and Space remain available to
+hangar controls; during flight Tab keeps switching targets.
+
+Browser check: open `?host=4`, copy its link, choose Drone in the joining browser and JOIN
+WING. Both rosters should show P2 / Drone / JOINED, with YOU moving between them. Change the
+host hull; both lists should update. Leave from the joiner: P2 becomes AI. Join again, then
+launch from the host: the client enters flight in its reserved hull. A later join occupies an
+AI seat in the already-running match. The headless suite also loses the initial HELLO, a
+roster change and a launch WELCOME, reorders rosters, and launches with a gap at P2.
 
 **A seat nobody is in is flown, not parked.** A host's match has a seat per hull, and a seat with
 no peer — before anyone has joined, or after a player dropped — used to fly a neutral stick in a

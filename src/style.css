@@ -1204,3 +1204,50 @@ body {
     font-size: 10px;
   }
 }
+
+/* The wing shares the hangar's middle band with the live hull preview. */
+#select:has(.wing:not([hidden])) .stage {
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 24px;
+  align-items: end;
+}
+#select:has(.wing:not([hidden])) .readout { grid-column: 2; grid-row: 1; }
+.wing {
+  grid-column: 1;
+  grid-row: 1;
+  width: 100%;
+  padding: 16px;
+  color: #dff6ff;
+  border: 1px solid var(--hair);
+  background: var(--ink-solid);
+  pointer-events: auto;
+  text-align: left;
+}
+.wing[hidden] { display: none; }
+.wing-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.wing h2 { margin: 0; font: 700 18px var(--font-display); color: var(--cyan); }
+.wing-code { font-size: 12px; user-select: text; }
+.wing-seats { margin: 16px 0; padding: 0; list-style: none; font-size: 13px; }
+.wing-seats li { display: grid; grid-template-columns: 80px 1fr auto; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--hair); }
+.wing-seats li.you { color: var(--cyan); }
+.wing-seats strong { font-weight: 400; }
+.wing-status { margin: 12px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.wing-actions { display: flex; gap: 8px; }
+.wing .btn { padding: 10px 12px; min-height: 44px; font-size: 11px; letter-spacing: 0.06em; }
+.wing button[hidden] { display: none; }
+#select button:disabled { cursor: default; }
+#select .btn-launch:disabled { opacity: 0.65; box-shadow: none !important; }
+.wing button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+.wing ::selection { color: var(--bg); background: var(--cyan); }
+@media (max-width: 760px), (max-height: 700px) {
+  #select:has(.wing:not([hidden])) { overflow-y: auto; gap: 20px; }
+  #select:has(.wing:not([hidden])) .stage { flex: none; padding-top: 24px; }
+  #select:has(.wing:not([hidden])) .best { display: none; }
+  #select:has(.wing:not([hidden])) .cards,
+  #select:has(.wing:not([hidden])) footer { flex-shrink: 0; }
+}
+@media (max-width: 600px) {
+  #select:has(.wing:not([hidden])) .stage { grid-template-columns: minmax(0, 1fr); }
+  #select:has(.wing:not([hidden])) .readout { grid-column: 1; grid-row: 1; padding: 16px; background: var(--ink-solid); }
+  .wing { grid-row: 2; }
+}

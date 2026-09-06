@@ -29,6 +29,50 @@ import { readFileSync, writeFileSync } from 'node:fs'
 
 /** @type {{ name: string, file: string, from: string, to: string }[]} */
 const MUTATIONS = [
+  /* ---- Wing reservations and launch --------------------------------------- */
+  {
+    name: 'lobby ignores the requested hull',
+    file: 'src/net/lobby.ts',
+    from: '          ships[seated] = ship',
+    to: "          ships[seated] = 'wasp'",
+  },
+  {
+    name: 'launch compacts reserved seats across a gap',
+    file: 'src/net/lobby.ts',
+    from: '        match.accept(channel, seated)',
+    to: '        match.accept(channel)',
+  },
+  {
+    name: 'departed lobby peer stays human',
+    file: 'src/net/lobby.ts',
+    from: '          peers[seated] = null',
+    to: '          /* keep the old reservation */',
+  },
+  {
+    name: 'hello does not repair a lost roster',
+    file: 'src/net/lobby.ts',
+    from: '          channel.send(encodeLobby(state(seated)))',
+    to: '          /* no roster resend */',
+  },
+  {
+    name: 'older roster overwrites newer hull choice',
+    file: 'src/net/session.ts',
+    from: '        if (roster.revision >= lobbyRevision) {',
+    to: '        if (true) {',
+  },
+  {
+    name: 'closing a lobby leaves its waiting channels open',
+    file: 'src/net/lobby.ts',
+    from: '      for (const channel of channels) channel.close()',
+    to: '      /* leave channels open */',
+  },
+  {
+    name: 'host choice is not propagated to the wing',
+    file: 'src/net/lobby.ts',
+    from: '      ships[0] = ship',
+    to: '      /* ignore host selection */',
+  },
+
   /* ---- Intent routing: which seat flies which controls -------------------- */
   {
     name: 'every seat flies intents[0]',
@@ -282,8 +326,8 @@ const MUTATIONS = [
   {
     name: 'the host seats a peer where there is no seat',
     file: 'src/net/session.ts',
-    from: '      const seat = peers.findIndex((p, i) => i > 0 && p === null)',
-    to: '      const seat = Math.max(1, peers.findIndex((p, i) => i > 0 && p === null))',
+    from: '      const seat = reservedSeat ?? peers.findIndex((p, i) => i > 0 && p === null)\n      if (seat < 1 || seat >= seatCount || peers[seat]) {',
+    to: '      const seat = reservedSeat ?? Math.max(1, peers.findIndex((p, i) => i > 0 && p === null))\n      if (seat < 1 || seat >= seatCount) {',
   },
   {
     name: 'a repeated hello is ignored',
@@ -864,7 +908,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 629
+const EXPECTED_ASSERTIONS = 653
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 
