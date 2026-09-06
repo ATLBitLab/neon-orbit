@@ -3358,6 +3358,130 @@ function testAMatchCrossesTheWire(): void {
 }
 
 /**
+ * An empty seat is flown.
+ *
+ * A host's seat with no peer in it used to fly a neutral stick in a straight
+ * line — before anyone joined, or after a player dropped, forever. Now the
+ * seat's autopilot (`game/autopilot.ts`) flies it from the same view a scripted
+ * pilot gets, a person who arrives takes it over mid-flight without a lurch,
+ * and one who drops hands it back. Seeded, so a seed replays the same match.
+ */
+function testAnEmptySeatIsFlown(): void {
+  section('An empty seat is flown')
+
+  const SEED = 0x1e5a
+  const TICKS = Math.ceil(20 / STEP)
+
+  function alone(backfill: boolean) {
+    const game = newMatch()
+    const host = createHost({ game, setup: { ships: ['hornet', 'wasp'], seed: SEED, respawn: true }, backfill })
+    host.start()
+    const device = stubInput()
+    const pilot = createPilot()
+    let shots = 0
+    let hits = 0
+    let outside = 0
+    let throttle = -1
+    for (let i = 0; i < TICKS; i++) {
+      steer(device, game.snapshot(0)?.target ?? null)
+      host.tick(pilot.advance(device.state, STEP))
+      const s = game.snapshot(1)
+      if (!s) break
+      shots = s.shotsFired
+      hits = s.hits
+      throttle = s.throttle
+      if (Math.hypot(s.position.x, s.position.y, s.position.z) > ARENA_RADIUS) outside++
+    }
+    const print = matchPrint(game)
+    const stats = { ...host.stats }
+    game.dispose()
+    return { shots, hits, outside, throttle, print, stats }
+  }
+
+  const flown = alone(true)
+  check('a seat with no peer fires and lands hits', flown.shots > 0 && flown.hits > 0, `${flown.shots} shots, ${flown.hits} hits`)
+  check('and never leaves the arena', flown.outside === 0, `${flown.outside} ticks outside`)
+  check('every one of its ticks was backfilled and none held', flown.stats.backfilled === TICKS && flown.stats.held === 0, JSON.stringify(flown.stats))
+  const again = alone(true)
+  check('the same seed flies the same match with nobody in the seat', again.print === flown.print)
+  const held = alone(false)
+  check('with backfill off the seat holds: no shots, launch throttle', held.shots === 0 && held.throttle === 0.6 && held.stats.backfilled === 0,
+    `${held.shots} shots, throttle ${held.throttle}, ${JSON.stringify(held.stats)}`)
+  check('and that is a different match', held.print !== flown.print)
+
+  /* A person arrives, then leaves. */
+  const hostGame = newMatch()
+  const clientGame = newMatch()
+  const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0x7a2e, respawn: true } })
+  host.start()
+  const device = stubInput()
+  const pilot = createPilot()
+  function fly(): void {
+    steer(device, hostGame.snapshot(0)?.target ?? null)
+    host.tick(pilot.advance(device.state, STEP))
+  }
+  // Hand over while the autopilot is flying, armed and at speed — a wrecked seat
+  // flies nothing, and a check against its stale throttle sees no hold at all
+  // (the first version handed over to a wreck and passed with the seeding removed).
+  let flownFor = 0
+  for (; flownFor < Math.ceil(20 / STEP); flownFor++) {
+    fly()
+    const s = hostGame.snapshot(1)!
+    if (flownFor > 60 && s.phase === 'flying' && s.deaths === 0 && s.shotsFired > 0 && s.throttle > 0.9) break
+  }
+  const before = hostGame.snapshot(1)!
+  check('the autopilot was flying, armed and at speed when a peer arrived',
+    before.phase === 'flying' && before.shotsFired > 0 && before.throttle > 0.9, `after ${flownFor} ticks: ${before.phase}, ${before.shotsFired} shots, throttle ${before.throttle}`)
+  const wire = createLoopback()
+  const client = createClient({ game: clientGame, channel: wire.b, predict: false })
+  const seat = host.accept(wire.a)
+  wire.pump()
+  // The person holds the stick still, trigger off, launch throttle asked for.
+  const still = controls({ throttle: 0.6 })
+  let prev = before
+  let lowestThrottle = before.throttle
+  let widestThrottleStep = 0
+  let widestStep = 0
+  let widestAt = -1
+  for (let i = 0; i < Math.ceil(5 / STEP); i++) {
+    client.tick(still)
+    fly()
+    wire.pump()
+    const s = hostGame.snapshot(1)!
+    lowestThrottle = Math.min(lowestThrottle, s.throttle)
+    // A hull that flew both ticks: a wreck tumbles and a respawn is a new place.
+    if (prev.phase === 'flying' && s.phase === 'flying' && s.deaths === prev.deaths) {
+      widestThrottleStep = Math.max(widestThrottleStep, Math.abs(s.throttle - prev.throttle))
+      const moved = Math.hypot(s.position.x - prev.position.x, s.position.y - prev.position.y, s.position.z - prev.position.z)
+      const allowed = Math.max(prev.speed, s.speed) * STEP * 1.05 + 1e-6
+      if (moved / allowed > widestStep) {
+        widestStep = moved / allowed
+        widestAt = i
+      }
+    }
+    prev = s
+  }
+  const taken = hostGame.snapshot(1)!
+  check('a peer that arrives takes the seat over and the autopilot lets go',
+    seat === 1 && client.seat === 1 && taken.shotsFired === before.shotsFired && before.shotsFired > 0,
+    `seat ${seat}, ${before.shotsFired} shots before, ${taken.shotsFired} after`)
+  check('the takeover ramps from the throttle the autopilot was flying, not from launch throttle',
+    widestThrottleStep <= THROTTLE_DOWN_RATE * STEP + 1e-9 && lowestThrottle <= 0.6 + 1e-6,
+    `autopilot at ${before.throttle}, widest throttle step ${widestThrottleStep.toFixed(4)} (rate allows ${(THROTTLE_DOWN_RATE * STEP).toFixed(4)}), lowest ${lowestThrottle}`)
+  check('and the hull never jumps across the handover', widestStep > 0 && widestStep <= 1, `widest step ${widestStep.toFixed(3)} of one tick's travel, at tick ${widestAt}`)
+
+  const backfilledAtDrop = host.stats.backfilled
+  wire.a.close()
+  for (let i = 0; i < Math.ceil(10 / STEP); i++) fly()
+  const after = hostGame.snapshot(1)!
+  check('a peer that drops hands the seat back to the autopilot',
+    after.shotsFired > taken.shotsFired && host.stats.backfilled > backfilledAtDrop,
+    `${taken.shotsFired} shots at the drop, ${after.shotsFired} after; backfilled ${backfilledAtDrop} -> ${host.stats.backfilled}`)
+  hostGame.dispose()
+  clientGame.dispose()
+}
+
+/**
  * The wire is bad, and the match survives it.
  *
  * Thirty percent loss, a tick of latency, up to three ticks of jitter (which
@@ -7253,6 +7377,7 @@ testHullsComeAndGoByIdAndBadFramesDoNothing()
 testAnIntentFrameEndsInAdmission()
 testAMatchCrossesTheWire()
 testABadWireIsSurvived()
+testAnEmptySeatIsFlown()
 testThePeerFliesItsOwnSeatOnly()
 testTheStickIsAttachedToTheShip()
 testAJitteryWireIsDrawnSteadily()

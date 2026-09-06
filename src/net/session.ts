@@ -30,7 +30,9 @@
  * this layer never constructs a `Controls` by hand.
  */
 
+import { STREAM, subRng } from '../core/rng'
 import type { MatchResult, SeatLine } from '../core/scores'
+import { createSeatAutopilot, type SeatAutopilot } from '../game/autopilot'
 import { admitIntent } from '../game/intent'
 import { STEP, type Game, type MatchSetup } from '../game/game'
 import type { Controls } from '../game/ship'
@@ -157,6 +159,8 @@ export interface HostStats {
   refused: number
   /** Result frames sent: one per peer when the match resolved, and every half second after. */
   results: number
+  /** Ticks a seat with no peer was flown by its autopilot. */
+  backfilled: number
 }
 
 export interface HostOptions {
@@ -164,6 +168,15 @@ export interface HostOptions {
   setup: MatchSetup & { ships: ShipId[] }
   /** Send a snapshot every this many ticks. 1 is every tick. */
   snapshotEvery?: number
+  /**
+   * Fly every seat that has no peer on an autopilot (`game/autopilot.ts`). On by
+   * default: a seat nobody has taken is otherwise a ghost — a neutral stick in a
+   * straight line before anyone joins, or a dropped player's last stick forever
+   * after. A peer that arrives takes the seat over mid-flight; one that drops
+   * hands it back. Off, an empty seat holds, which is what the wire tests that
+   * measure a held seat need.
+   */
+  backfill?: boolean
 }
 
 export interface Host {
@@ -213,7 +226,12 @@ export function createHost(options: HostOptions): Host {
   const intents: Controls[] = Array.from({ length: seatCount }, () => neutral())
   const holds: Controls[] = Array.from({ length: seatCount }, () => neutral())
   const scratch: Controls = neutral()
-  const stats: HostStats = { wrongSeat: 0, stale: 0, malformed: 0, held: 0, admitted: 0, refused: 0, results: 0 }
+  // One per seat that can be empty, seeded per seat so two wingmen do not fly
+  // the same line and a seed replays the same match. Seat 0 is the host's own.
+  const autopilots: (SeatAutopilot | null)[] = setup.ships.map((ship, seat) =>
+    seat > 0 && (options.backfill ?? true) ? createSeatAutopilot(ship, subRng(seed, STREAM.wingman + seat)) : null,
+  )
+  const stats: HostStats = { wrongSeat: 0, stale: 0, malformed: 0, held: 0, admitted: 0, refused: 0, results: 0, backfilled: 0 }
   let tick = 0
   let sinceSnapshot = 0
   /** The result the peers are being told, and how long since it was last said. */
@@ -274,6 +292,11 @@ export function createHost(options: HostOptions): Host {
         return -1
       }
       const peer: Peer = { channel, seat, lastTick: -1, flownTick: -1, pending: null, pendingTick: -1, held: holds[seat] }
+      // The seat is taken over mid-flight: the peer's first intents ramp from the
+      // throttle the autopilot was flying, not from launch throttle, so the hull
+      // does not lurch on the tick a person takes the stick.
+      const auto = autopilots[seat]
+      if (auto) holds[seat].throttle = auto.controls.throttle
       peers[seat] = peer
       channel.onMessage((bytes) => onFrame(peer, bytes))
       channel.onClose(() => {
@@ -312,6 +335,15 @@ export function createHost(options: HostOptions): Host {
       for (let seat = 1; seat < seatCount; seat++) {
         const peer = peers[seat]
         const held = holds[seat]
+        const auto = autopilots[seat]
+        if (!peer && auto) {
+          // Nobody in the seat: the autopilot flies it, from the same per-seat
+          // view a scripted pilot gets, through the same admission a peer gets.
+          intents[seat] = auto.advance(game.snapshot(seat), STEP)
+          stats.backfilled++
+          game.acknowledge(seat, -1)
+          continue
+        }
         if (peer && peer.pending) {
           Object.assign(held, peer.pending)
           peer.flownTick = peer.pendingTick
