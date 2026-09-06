@@ -166,7 +166,7 @@ export interface Bolts {
    * smoothly — the one thing on screen moving faster than anything else, and
    * the one thing not smoothed.
    */
-  render(alpha: number): void
+  render(alpha: number, omitFaction?: Faction): void
   clear(): void
   dispose(): void
   /**
@@ -394,8 +394,11 @@ export function createBolts(): Bolts {
       return hits
     },
 
-    render(alpha) {
-      for (let i = 0; i < MAX_BOLTS; i++) writeInstance(i, pool[i], alpha)
+    render(alpha, omitFaction) {
+      for (let i = 0; i < MAX_BOLTS; i++) {
+        if (omitFaction !== undefined && pool[i].faction === omitFaction) mesh.setMatrixAt(i, hidden)
+        else writeInstance(i, pool[i], alpha)
+      }
       mesh.instanceMatrix.needsUpdate = true
       mesh.instanceColor!.needsUpdate = true
     },

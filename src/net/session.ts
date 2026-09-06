@@ -41,7 +41,7 @@ import type { Channel } from './channel'
 import { decodeSnapshot, encodeSnapshot, type WorldSnapshot } from './snapshot'
 import { ByteReader, ByteWriter, decodeIntent, encodeIntent } from './wire'
 
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 3
 
 /** Ticks between repeated hellos while a client waits for its welcome. */
 export const HELLO_EVERY = 30

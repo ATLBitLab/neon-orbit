@@ -28,7 +28,7 @@ import { FACTION_AI, type Faction } from '../game/bolts'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { ByteReader, ByteWriter } from './wire'
 
-export const SNAPSHOT_VERSION = 2
+export const SNAPSHOT_VERSION = 3
 
 export interface Vec3 {
   x: number
@@ -62,6 +62,7 @@ export interface ShipState {
   overdriveTimer: number
   shieldTimer: number
   solarExposure: number
+  fireTimer: number
   shotsFired: number
 }
 
@@ -175,7 +176,7 @@ function writeShip(w: ByteWriter, s: ShipState): void {
   w.f32(s.warpTimer).f32(s.flash).f32(s.sinceHit)
   w.f32(s.heat).f32(s.heatLocked).f32(s.dashTimer).f32(s.dashCooldown)
   w.f32(s.overdriveTimer).f32(s.shieldTimer).f32(s.solarExposure)
-  w.u32(s.shotsFired)
+  w.f32(s.fireTimer).u32(s.shotsFired)
 }
 
 function readShip(r: ByteReader): ShipState {
@@ -197,6 +198,7 @@ function readShip(r: ByteReader): ShipState {
     overdriveTimer: r.f32(),
     shieldTimer: r.f32(),
     solarExposure: r.f32(),
+    fireTimer: r.f32(),
     shotsFired: r.u32(),
   }
 }

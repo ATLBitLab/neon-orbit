@@ -302,14 +302,21 @@ None is configured by default, because a relay is exactly the infrastructure thi
 trying not to run.
 
 **A joined player's stick is attached to their ship.** A client flies its own hull the moment
-the stick moves — `Game.predict` steps that one seat locally on the same flight model, guns into
-nothing — and the host's snapshot carries, per seat, the client intent tick it last flew
+the stick moves — `Game.predict` steps that one seat locally on the same flight model —
+and the host's snapshot carries, per seat, the client intent tick it last flew
 (`ackTick`). On every snapshot the client resets to the host's truth and `Game.reconcile`s by
 replaying its unacknowledged intents on top, keeping the previous pose where the hull was last
 drawn so a correction slides over one frame rather than snapping. Flight is deterministic, so on a
 clean wire there is nothing to correct: `simcheck` asserts the host's truth lands within 0.1 units
 of what the client predicted for every acknowledged intent, and that a client with prediction off
-trails by the wire's latency. Bolts and hits are never predicted; they arrive with the truth.
+trails by the wire's latency. Fresh local shots produce cosmetic tracers at the predicted
+muzzle and one local laser sound per volley. Reconciliation is silent; snapshots restore the
+weapon cooldown along with the hull. A volley counter prevents corrections from presenting
+the same shot twice. Delayed authoritative bolts from that seat remain in the snapshot but
+are hidden while prediction is active. Other bolts are drawn from snapshots as before.
+Cosmetic tracers can stop against visible geometry but cannot damage anything: hits, damage,
+and scoring remain entirely authoritative. Protocol and snapshot version 3 carry the cooldown;
+both browsers must load the same version.
 
 **The picture moves to the frame's clock, not the wire's.** A wire delivers to its own rhythm —
 two snapshots in one tick, none the next — and a client that applied each as it arrived drew to
