@@ -66,6 +66,7 @@ export interface Hangar {
   open(initial: ShipId): void
   close(): void
   update(dt: number): void
+  action(label: string | null, locked?: boolean): void
   readonly selected: ShipId
   dispose(): void
 }
@@ -76,6 +77,7 @@ export interface HangarDeps {
   camera: THREE.PerspectiveCamera
   audio: Audio
   onLaunch: (id: ShipId) => void
+  onSelect?: (id: ShipId) => void
 }
 
 export function createHangar(deps: HangarDeps): Hangar {
@@ -84,6 +86,8 @@ export function createHangar(deps: HangarDeps): Hangar {
   let selected: ShipId = 'hornet'
   let orbit = 0
   let open = false
+  let locked = false
+  let actionLabel: string | null = null
 
   /* ---- Preview models --------------------------------------------------- */
 
@@ -188,6 +192,7 @@ export function createHangar(deps: HangarDeps): Hangar {
   }
 
   function select(id: ShipId, chime: boolean) {
+    if (locked) return
     selected = id
     const spec = SHIPS[id]
 
@@ -203,7 +208,8 @@ export function createHangar(deps: HangarDeps): Hangar {
 
     launch.style.background = hex(spec.accent)
     launch.style.boxShadow = `0 0 34px ${hex(spec.accent)}aa`
-    launch.textContent = `Launch ${spec.name}`
+    launch.textContent = actionLabel ?? `Launch ${spec.name}`
+    deps.onSelect?.(id)
 
     if (chime) {
       audio.resume()
@@ -212,6 +218,7 @@ export function createHangar(deps: HangarDeps): Hangar {
   }
 
   function doLaunch() {
+    if (locked) return
     audio.resume()
     audio.uiLaunch()
     deps.onLaunch(selected)
@@ -220,7 +227,9 @@ export function createHangar(deps: HangarDeps): Hangar {
   launch.addEventListener('click', doLaunch)
 
   function onKey(e: KeyboardEvent) {
-    if (!open) return
+    if (!open || locked) return
+    // Focused controls own Enter, including copy/leave in the wing panel.
+    if ((e.target as HTMLElement)?.closest('button, input, a, select')) return
     const index = SHIP_ORDER.indexOf(selected)
     if (e.code === 'Enter' || e.code === 'NumpadEnter') {
       e.preventDefault()
@@ -237,6 +246,13 @@ export function createHangar(deps: HangarDeps): Hangar {
 
   return {
     root,
+    action(label, lock = false) {
+      actionLabel = label
+      locked = lock
+      launch.disabled = lock
+      launch.textContent = label ?? `Launch ${SHIPS[selected].name}`
+      for (const node of cardNodes.values()) node.disabled = lock
+    },
 
     get selected() {
       return selected

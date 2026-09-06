@@ -42,6 +42,8 @@ import {
 } from '../src/net/snapshot'
 import { decodeIntent, encodeIntent, INTENT_FRAME_BYTES, INTENT_VERSION } from '../src/net/wire'
 import { createLoopback } from '../src/net/channel'
+import { createMatchLobby } from '../src/net/lobby'
+import { decodeHello, decodeLobby, encodeHello, encodeLobby, type LobbyState } from '../src/net/session'
 import { modeFromLocation } from '../src/net/browser'
 import { createLinkMonitor, type LinkReport } from '../src/net/link'
 import { createClient, createHost, decodeResult, decodeWelcome, encodeResult, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
@@ -4051,8 +4053,8 @@ function testThePeerFliesItsOwnSeatOnly(): void {
 
   /* The URL decides the mode, and solo is the default the shipped game takes. */
   check('no query is solo', modeFromLocation('').kind === 'solo')
-  check('?host hosts with a wasp in seat 1', JSON.stringify(modeFromLocation('?host')) === '{"kind":"host","guest":"wasp"}')
-  check('?host=drone picks the guest hull', JSON.stringify(modeFromLocation('?host=drone')) === '{"kind":"host","guest":"drone"}')
+  check('?host hosts with a wasp in seat 1', JSON.stringify(modeFromLocation('?host')) === '{"kind":"host","guest":"wasp","seats":2}')
+  check('?host=drone picks the guest hull', JSON.stringify(modeFromLocation('?host=drone')) === '{"kind":"host","guest":"drone","seats":2}')
   check('?join=abc123 joins, upper-cased', JSON.stringify(modeFromLocation('?join=abc123')) === '{"kind":"join","code":"ABC123"}')
 }
 
@@ -7684,6 +7686,120 @@ function testOneFrameDepictsOneInstant(): void {
 
 /* -------------------------------------------------------------------------- */
 
+function testTheWingLaunchesItsReservations(): void {
+  section('The wing reserves hulls, survives loss, and launches the same seats')
+  const game = newMatch()
+  const mirrors = [newMatch(), newMatch(), newMatch(), newMatch()]
+  const wing = createMatchLobby({ game, ships: ['hornet', 'wasp', 'wasp', 'wasp'], seed: 123 })
+  const wires = [createLoopback(), createLoopback(), createLoopback()]
+  const states: (LobbyState | null)[] = [null, null, null]
+  const clients = wires.map((wire, i) => {
+    wing.accept(wire.a)
+    return createClient({ game: mirrors[i], channel: wire.b, ship: i === 0 ? 'drone' : 'hornet',
+      onLobby: (state) => { states[i] = state } })
+  })
+  for (let i = 0; i < 3; i++) wires.forEach(w => w.pump())
+  check('the lobby does not start the game or send a welcome', !game.active && clients.every(c => c.seat === -1))
+  check('each joiner sees its reserved seat and the shared hull choices', states.every((s, i) =>
+    s?.seat === i + 1 && s.seats.map(x => x.ship).join() === 'hornet,drone,hornet,hornet'))
+  check('every occupied seat is human in the lobby', wing.state().seats.every(s => s.pilot === 'human'))
+  const old = states[2]!
+  wing.setShip('wasp')
+  wires.forEach(w => w.pump())
+  check('host hull changes reach every waiting peer', states.every(s => s?.seats[0].ship === 'wasp'))
+  wires[2].a.send(encodeLobby(old))
+  wires[2].pump()
+  check('an older reordered roster cannot undo the host hull change', states[2]?.seats[0].ship === 'wasp')
+  const overflow = createLoopback()
+  let refusal = ''
+  wing.accept(overflow.a)
+  createClient({ game: mirrors[3], channel: overflow.b, onRefused: r => { refusal = r } })
+  overflow.pump()
+  check('a full lobby refuses before launch', refusal === 'full' && !overflow.a.open)
+  wires[0].a.close()
+  wires.forEach(w => w.pump())
+  check('leaving returns a reservation to AI on every roster', wing.state().seats[1].pilot === 'ai' &&
+    states[1]?.seats[1].pilot === 'ai' && states[2]?.seats[1].pilot === 'ai')
+  // Lose one initial welcome. Its repeated HELLO must recover the exact seat.
+  wires[1].setLoss(1)
+  const host = wing.launch()
+  wires[1].setLoss(0)
+  for (let i = 0; i < 35; i++) {
+    clients[1].tick(controls()); clients[2].tick(controls())
+    wires.forEach(w => w.pump())
+  }
+  check('launch preserves a gap instead of shifting the remaining reservations', clients[1].seat === 2 && clients[2].seat === 3)
+  check('lost launch is recovered while the client waits', wires[1].lost > 0 && mirrors[1].active)
+  check('launch uses the selected hulls on host and mirrors', [game, mirrors[1], mirrors[2]].every(g =>
+    g.capture().seats.map(s => s.ship.hull).join() === '70,200,120,120'))
+  wing.setShip('drone')
+  check('the host cannot change a launched hull through the lobby', game.capture().seats[0].ship.hull === 70)
+  const late = createLoopback()
+  wing.accept(late.a)
+  const lateClient = createClient({ game: mirrors[0], channel: late.b, ship: 'wasp' })
+  late.pump()
+  check('late join takes the free AI seat with its existing hull', lateClient.seat === 1 && mirrors[0].capture().seats[1].ship.hull === 200)
+  check('launch is idempotent and does not reset the match', wing.launch() === host)
+  wing.close()
+  check('closing the lobby closes every accepted channel', wires.every(w => !w.a.open) && !late.a.open && host.peers === 0)
+  const afterClose = createLoopback()
+  wing.accept(afterClose.a)
+  check('a connection completing after close cannot take a seat', !afterClose.a.open)
+  game.dispose(); mirrors.forEach(g => g.dispose())
+
+  const retryGame = newMatch(), retryMirror = newMatch()
+  const retryWing = createMatchLobby({ game: retryGame, ships: ['hornet', 'wasp'] })
+  const lost = createLoopback({ loss: 1 })
+  retryWing.accept(lost.a)
+  let roster: LobbyState | null = null
+  const retryClient = createClient({ game: retryMirror, channel: lost.b, ship: 'drone', onLobby: s => { roster = s } })
+  lost.setLoss(0)
+  for (let i = 0; i < 35; i++) { retryClient.tick(controls()); lost.pump() }
+  check('a lost initial hello is retried from the hangar', (roster as LobbyState | null)?.seats[1].ship === 'drone' && lost.lost === 1)
+  const initial = roster
+  lost.setLoss(1)
+  retryWing.setShip('wasp')
+  lost.setLoss(0)
+  for (let i = 0; i < 35; i++) { retryClient.tick(controls()); lost.pump() }
+  check('a lost roster change is repaired by a repeated hello', (roster as LobbyState | null)?.seats[0].ship === 'wasp' && roster !== initial)
+  retryWing.close()
+  check('closing before launch releases a waiting reservation', !lost.a.open)
+  retryGame.dispose(); retryMirror.dispose()
+
+  const badGame = newMatch()
+  const badWing = createMatchLobby({ game: badGame, ships: ['hornet', 'wasp'] })
+  const bad = createLoopback()
+  let reason = -1
+  bad.b.onMessage(bytes => { if (bytes[0] === FRAME.REFUSED) reason = bytes[1] })
+  badWing.accept(bad.a)
+  bad.b.send(new Uint8Array([FRAME.HELLO, 1]))
+  bad.pump()
+  check('an old protocol is refused without reserving a seat', reason === 1 && !bad.a.open && badWing.state().seats[1].pilot === 'ai')
+  let malformed = 0
+  for (const bytes of [new Uint8Array([FRAME.HELLO, 2, 99]), new Uint8Array([FRAME.HELLO, 2]), new Uint8Array([...encodeHello(), 0])]) {
+    try { decodeHello(bytes) } catch { malformed++ }
+  }
+  check('unknown, short, and trailing hull claims fail decoding', malformed === 3)
+  let badRosters = 0
+  const valid = encodeLobby(badWing.state())
+  for (const bytes of [valid.subarray(0, 4), new Uint8Array([...valid, 0]), encodeLobby({ ...badWing.state(), seat: 9 }),
+    encodeLobby({ ...badWing.state(), seats: [] })]) {
+    try { decodeLobby(bytes) } catch { badRosters++ }
+  }
+  check('malformed rosters fail before any UI state is applied', badRosters === 4)
+  const oldHost = createLoopback()
+  let oldRefused = ''
+  createClient({ game: badGame, channel: oldHost.b, onRefused: r => { oldRefused = r } })
+  const oldWelcome = encodeWelcome(1, { ships: ['hornet', 'wasp'], seed: 1 })
+  oldWelcome[1] = 1
+  oldHost.a.send(oldWelcome); oldHost.pump()
+  check('a new client names an old host version instead of waiting forever', oldRefused === 'version' && !badGame.active)
+  badWing.close(); badGame.dispose()
+  check('?host=4 makes a four-seat wing', JSON.stringify(modeFromLocation('?host=4')) === '{"kind":"host","guest":"wasp","seats":4}')
+  check('invalid host values fall back to a valid two-seat wing', ['99', '-1', 'bogus', '2.5'].every(v =>
+    JSON.stringify(modeFromLocation('?host=' + v)) === '{"kind":"host","guest":"wasp","seats":2}'))
+}
+
 console.log('NEON ORBIT — headless simulation checks')
 testPlayerBoltsKillEnemies()
 testHullBarFadeCurve()
@@ -7748,6 +7864,7 @@ testTheStepClockNeverLosesTime()
 testARunMatchesItsRecordedBaseline()
 testOneFrameDepictsOneInstant()
 testALinkThatDropsIsNoticed()
+testTheWingLaunchesItsReservations()
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

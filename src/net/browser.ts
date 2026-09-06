@@ -17,16 +17,17 @@
  * is exercised.
  */
 
-import type { Game, MatchSetup } from '../game/game'
+import type { Game } from '../game/game'
 import type { Controls } from '../game/ship'
-import type { ShipId } from '../ships/specs'
+import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import type { Channel } from './channel'
+import { createMatchLobby } from './lobby'
 import { createLinkMonitor, LINK_GRACE_MS, type LinkReport } from './link'
-import { createClient, createHost, type Client, type Host } from './session'
+import { createClient, type Client, type Host, type LobbyState, type Refusal } from './session'
 import { createNostrSignal, newJoinCode, type Signal } from './signal'
 import { acceptAsHost, connectAsClient, type LinkHooks, type Status } from './webrtc'
 
-export type NetMode = { kind: 'solo' } | { kind: 'host'; guest: ShipId } | { kind: 'join'; code: string }
+export type NetMode = { kind: 'solo' } | { kind: 'host'; guest: ShipId; seats: number } | { kind: 'join'; code: string }
 
 /** Read the mode off the page URL: `?host[=wasp]` or `?join=CODE`. */
 export function modeFromLocation(search: string): NetMode {
@@ -34,31 +35,32 @@ export function modeFromLocation(search: string): NetMode {
   const join = params.get('join')
   if (join) return { kind: 'join', code: join.toUpperCase() }
   if (params.has('host')) {
-    const guest = (params.get('host') || 'wasp') as ShipId
-    return { kind: 'host', guest }
+    const value = params.get('host') ?? ''
+    const guest = SHIP_ORDER.includes(value as ShipId) ? value as ShipId : 'wasp'
+    const seats = /^[2-4]$/.test(value) ? Number(value) : 2
+    return { kind: 'host', guest, seats }
   }
   return { kind: 'solo' }
 }
 
 export interface Lobby {
   readonly code: string
-  /** Channels that opened before the match started, waiting for a seat. */
-  readonly waiting: number
-  /** Hand every open channel, now and later, to the callback. */
-  onChannel(handler: (channel: Channel) => void): void
+  readonly wing: ReturnType<typeof createMatchLobby>
   close(): void
 }
 
-/** Listen on a fresh join code from now on. Peers connect; seating waits for the match. */
-export function openLobby(status: Status = () => {}): Lobby {
+/** Listen from the hangar; reservations and launch live in the headless lobby. */
+export function openLobby(
+  game: Game, ships: ShipId[], onChange: (state: LobbyState) => void,
+  onPeer: (seat: number) => void, status: Status = () => {},
+): Lobby {
   const code = newJoinCode()
   const signal: Signal = createNostrSignal(code)
   const answered = new Set<string>()
-  const held: Channel[] = []
-  let handler: ((channel: Channel) => void) | null = null
-
+  const wing = createMatchLobby({ game, ships, onChange, onPeer })
+  let closed = false
   const stop = signal.listen((message) => {
-    if (message.type !== 'offer' || answered.has(message.from)) return
+    if (closed || message.type !== 'offer' || answered.has(message.from)) return
     answered.add(message.from)
     const who = `peer ${message.from.slice(0, 6)}`
     status(`${who}: offer received`)
@@ -67,25 +69,16 @@ export function openLobby(status: Status = () => {}): Lobby {
       onRoute: (route) => status(`${who}: route ${route}`),
     }
     acceptAsHost(signal, message, (stage) => status(`${who}: ${stage}`), hooks)
-      .then((channel) => {
-        if (handler) handler(channel)
-        else held.push(channel)
-      })
+      .then((channel) => { if (closed) channel.close(); else wing.accept(channel) })
       .catch((error) => status(`${who} failed: ${error instanceof Error ? error.message : error}`))
   })
-
   return {
-    code,
-    get waiting() {
-      return held.length
-    },
-    onChannel(h) {
-      handler = h
-      for (const channel of held.splice(0)) h(channel)
-    },
+    code, wing,
     close() {
+      closed = true
       stop()
       signal.close()
+      wing.close()
     },
   }
 }
@@ -96,22 +89,9 @@ export interface Hosting {
   stop(): void
 }
 
-/** Start a two-seat match on an open lobby; every peer that connects is seated. */
-export function startHosting(lobby: Lobby, game: Game, ship: ShipId, guest: ShipId, onPeer: (seat: number) => void): Hosting {
-  const setup: MatchSetup & { ships: ShipId[] } = { ships: [ship, guest], respawn: true }
-  const host = createHost({ game, setup })
-  host.start()
-  lobby.onChannel((channel) => {
-    const seat = host.accept(channel)
-    if (seat >= 0) onPeer(seat)
-  })
-  return {
-    host,
-    tick: (local) => host.tick(local),
-    stop() {
-      lobby.onChannel(() => {})
-    },
-  }
+export function startHosting(lobby: Lobby): Hosting {
+  const host = lobby.wing.launch()
+  return { host, tick: (local) => host.tick(local), stop: () => lobby.close() }
 }
 
 export interface Joining {
@@ -128,9 +108,11 @@ export interface LinkStatus extends LinkReport {
 export interface JoinHandlers {
   /** Each stage of the handshake, until the channel opens. */
   status: Status
+  active(): boolean
   onWelcome(seat: number): void
   /** The host had no seat for us. The channel is closed before this is called. */
-  onRefused(): void
+  onRefused(reason: Refusal): void
+  onLobby(state: LobbyState): void
   /**
    * The link after it opened: degraded when ICE drops, up again if it recovers
    * inside `LINK_GRACE_MS`, down — channel closed, seat freed at the host once
@@ -140,15 +122,17 @@ export interface JoinHandlers {
 }
 
 /** Connect to a host by code. Resolves once the data channel is open; the welcome follows on it. */
-export async function joinMatch(game: Game, code: string, handlers: JoinHandlers): Promise<Joining> {
+export async function joinMatch(game: Game, code: string, ship: ShipId, handlers: JoinHandlers): Promise<Joining> {
   const signal = createNostrSignal(code)
   let channel: Channel | null = null
   let route = ''
   let poll = 0
+  let stopped = false
   const monitor = createLinkMonitor({
     grace: LINK_GRACE_MS,
     now: () => performance.now(),
     onChange(report) {
+      if (stopped) return
       if (report.state === 'down') {
         window.clearInterval(poll)
         channel?.close()
@@ -168,6 +152,7 @@ export async function joinMatch(game: Game, code: string, handlers: JoinHandlers
   } finally {
     signal.close()
   }
+  if (!handlers.active()) { channel.close(); throw new Error('join cancelled') }
   const open = channel
   open.onClose(() => monitor.closed())
   poll = window.setInterval(() => monitor.poll(), 500)
@@ -175,17 +160,21 @@ export async function joinMatch(game: Game, code: string, handlers: JoinHandlers
   const client = createClient({
     game,
     channel: open,
+    ship,
+    onLobby: handlers.onLobby,
     onWelcome: handlers.onWelcome,
-    onRefused: () => {
+    onRefused: (reason) => {
+      stopped = true
       window.clearInterval(poll)
       open.close()
-      handlers.onRefused()
+      handlers.onRefused(reason)
     },
   })
   return {
     client,
     tick: (local) => client.tick(local),
     stop() {
+      stopped = true
       window.clearInterval(poll)
       open.close()
     },

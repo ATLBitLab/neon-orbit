@@ -23,6 +23,7 @@ import type { ShipId } from './ships/specs'
 import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, type Joining, type Lobby } from './net/browser'
 import { LINK_GRACE_MS } from './net/link'
 import { createHangar } from './ui/hangar'
+import { createWing } from './ui/wing'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
 import { createScreens } from './ui/screens'
 import { buildEnvironment } from './world/environment'
@@ -62,7 +63,7 @@ function boot() {
   const environment = buildEnvironment()
   stage.scene.add(environment.group)
 
-  const input = createInput(canvas)
+  const input = createInput(canvas, () => screens.screen === 'flight')
   const pilot = createPilot()
   const audio = createAudio()
   const hud = createHud(overlay)
@@ -77,6 +78,7 @@ function boot() {
   let hosting: Hosting | null = null
   let joining: Joining | null = null
   let lobby: Lobby | null = null
+  let joinAttempt = 0
 
   /** The one line of network status on screen, in either mode. */
   const netPanel = document.createElement('div')
@@ -92,25 +94,6 @@ function boot() {
     netPanel.innerHTML = html
   }
 
-  if (mode.kind === 'host') {
-    // Listening from page load, so the code can be shared from the hangar and a
-    // peer can connect before the host has even picked a ship.
-    lobby = openLobby((stage) => console.log('[neon-orbit] lobby:', stage))
-    const url = `${location.origin}${location.pathname}?join=${lobby.code}`
-    netStatus(
-      `JOIN CODE <b>${lobby.code}</b> &nbsp; <button id="copyjoin" style="font:inherit;color:#0b0f1a;background:#6be6ff;border:0;padding:2px 8px;cursor:pointer">COPY LINK</button>` +
-        `<div style="opacity:.7;user-select:all">${url}</div>`,
-    )
-    console.log('[neon-orbit] join code', lobby.code, url)
-    document.getElementById('copyjoin')?.addEventListener('click', (ev) => {
-      ev.stopPropagation()
-      navigator.clipboard?.writeText(url).then(
-        () => ((ev.target as HTMLButtonElement).textContent = 'COPIED'),
-        () => ((ev.target as HTMLButtonElement).textContent = 'SELECT + COPY'),
-      )
-    })
-  }
-
   /* ---- Screens ---------------------------------------------------------- */
 
   const hangar = createHangar({
@@ -119,6 +102,16 @@ function boot() {
     camera: stage.camera,
     audio,
     onLaunch: (id) => startRun(id),
+    onSelect: (id) => lobby?.wing.setShip(id),
+  })
+
+  const wing = createWing(hangar.root.querySelector('.stage')!, () => {
+    joinAttempt++
+    joining?.stop()
+    joining = null
+    mode = { kind: 'solo' }
+    netPanel.style.display = 'none'
+    openHangar()
   })
 
   const pause = createPausePanel({
@@ -161,7 +154,32 @@ function boot() {
 
   /* ---- Transitions ------------------------------------------------------ */
 
+  function prepareLobby() {
+    if (mode.kind !== 'host') return
+    hosting?.stop()
+    hosting = null
+    lobby?.close()
+    lobby = openLobby(game, [hangar.selected, ...Array<ShipId>(mode.seats - 1).fill(mode.guest)],
+      (state) => wing.update(state),
+      (seat) => hud.callout(`PLAYER ${seat + 1} JOINED`, '#6be6ff', 1.5),
+      (stage) => console.log('[neon-orbit] lobby:', stage))
+    wing.show(lobby.code, true)
+    wing.update(lobby.wing.state())
+    console.log('[neon-orbit] join code', lobby.code)
+  }
+
   function openHangar() {
+    joinAttempt++
+    joining?.stop()
+    joining = null
+    hosting?.stop()
+    hosting = null
+    lobby?.close()
+    lobby = null
+    game.abandon()
+    netPanel.style.display = 'none'
+    hangar.action(mode.kind === 'join' ? 'JOIN WING' : null)
+    wing.hide()
     screens.moveTo('hangar')
     pause.hide()
     debrief.hide()
@@ -170,9 +188,15 @@ function boot() {
     input.releasePointerLock()
     audio.setMusic('hangar')
     hangar.open(pendingResult?.ship ?? lastShip() ?? 'hornet')
+    if (mode.kind === 'host') prepareLobby()
+    if (mode.kind === 'join') wing.show(mode.code, false)
   }
 
   function startRun(id: ShipId) {
+    if (mode.kind === 'join') { startJoining(mode.code); return }
+    if (mode.kind === 'host' && hosting) prepareLobby()
+    lobby?.wing.setShip(id)
+    wing.hide()
     hangar.close()
     pause.hide()
     debrief.hide()
@@ -184,7 +208,9 @@ function boot() {
     pilot.reset()
     if (mode.kind === 'host' && lobby) {
       hosting?.stop()
-      hosting = startHosting(lobby, game, id, mode.guest, (seat) => hud.callout(`PLAYER ${seat + 1} JOINED`, '#6be6ff', 1.5))
+      hosting = startHosting(lobby)
+      const url = `${location.origin}${location.pathname}?join=${lobby.code}`
+      netStatus(`JOIN CODE <b>${lobby.code}</b> · <a href="${url}" target="_blank" rel="noopener" style="color:inherit">JOIN LINK</a>`)
     } else {
       // One seat, and elimination rather than respawn — the shipped game is a match
       // of one, and its lose condition is the run ending. `MatchSetup.respawn` in
@@ -201,8 +227,10 @@ function boot() {
    * the match.
    */
   function offerRetry(code: string, heading: string, reason: string, note = '') {
+    joinAttempt++
     joining?.stop()
     joining = null
+    wing.status(reason)
     // Pointer lock would swallow the click on the button.
     document.exitPointerLock?.()
     netStatus(
@@ -220,31 +248,53 @@ function boot() {
   }
 
   function startJoining(code: string) {
+    const attempt = ++joinAttempt
     joining?.stop()
     joining = null
-    hangar.close()
+    const current = () => attempt === joinAttempt
+    const ship = hangar.selected
+    rememberShip(ship)
+    game.abandon()
+    screens.moveTo('hangar')
+    hud.hide()
+    input.releasePointerLock()
+    hangar.action('JOIN WING')
+    hangar.open(ship)
+    hangar.action('CONNECTING…', true)
     pause.hide()
     debrief.hide()
     pilot.reset()
-    audio.setMusic('combat')
+    audio.setMusic('hangar')
     const waiting = 'connected — waiting for the host to launch'
-    netStatus(`JOINING <b>${code}</b><div>looking for the host…</div>`)
-    joinMatch(game, code, {
-      status: (stage) => netStatus(`JOINING <b>${code}</b><div>${stage}</div>`),
+    netPanel.style.display = 'none'
+    wing.show(code, false)
+    wing.status('Looking for the host…')
+    joinMatch(game, code, ship, {
+      active: current,
+      status: (stage) => { if (current()) wing.status(stage) },
+      onLobby: (state) => {
+        if (!current()) return
+        wing.update(state)
+        hangar.action('WAITING FOR HOST', true)
+      },
       onWelcome: (seat) => {
+        if (!current()) return
+        wing.hide()
+        hangar.close()
+        audio.setMusic('combat')
         netPanel.style.display = 'none'
         screens.moveTo('flight')
         hud.callout(`SEAT ${seat + 1}`, '#6be6ff', 1.5)
         input.requestPointerLock()
       },
-      onRefused: () =>
-        offerRetry(
-          code,
-          'COULD NOT JOIN',
-          'the host has no seat free',
-          'if this is a reconnect, the old seat frees once the host notices the drop — give it a few seconds',
-        ),
+      onRefused: (reason) => {
+        if (!current()) return
+        offerRetry(code, 'COULD NOT JOIN',
+          reason === 'version' ? 'game versions differ — reload both pages' : 'the host has no seat free',
+          reason === 'full' ? 'A disconnected seat frees when the host notices the drop.' : '')
+      },
       onLink: (link) => {
+        if (!current()) return
         const route = link.route ? `<div style="opacity:.7">route ${link.route}</div>` : ''
         if (link.state === 'degraded') {
           netStatus(
@@ -259,9 +309,11 @@ function boot() {
       },
     })
       .then((j) => {
-        joining = j
+        if (current()) joining = j
+        else j.stop()
       })
       .catch((error) => {
+        if (!current()) return
         console.error(error)
         offerRetry(code, 'COULD NOT JOIN', error instanceof Error ? error.message : String(error))
       })
@@ -347,6 +399,8 @@ function boot() {
       // set of cards — so it runs straight off the frame.
       environment.update(frameSeconds, stage.camera)
       hangar.update(frameSeconds)
+      // Waiting peers still repeat HELLO to recover lost roster / launch frames.
+      for (let i = 0; i < ticks; i++) joining?.tick(intents[0])
     } else {
       for (let i = 0; i < ticks; i++) {
         // Sampled per tick, not per frame: the virtual stick self-centres over
@@ -376,8 +430,7 @@ function boot() {
       splashCleared = true
       splash.classList.add('done')
       window.setTimeout(() => splash.remove(), 600)
-      if (mode.kind === 'join') startJoining(mode.code)
-      else openHangar()
+      openHangar()
     }
 
     requestAnimationFrame(frame)

@@ -41,7 +41,7 @@ import type { Channel } from './channel'
 import { decodeSnapshot, encodeSnapshot, type WorldSnapshot } from './snapshot'
 import { ByteReader, ByteWriter, decodeIntent, encodeIntent } from './wire'
 
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 /** Ticks between repeated hellos while a client waits for its welcome. */
 export const HELLO_EVERY = 30
@@ -53,6 +53,7 @@ export const FRAME = {
   SNAPSHOT: 4,
   REFUSED: 5,
   RESULT: 6,
+  LOBBY: 7,
 } as const
 
 /* ---- Frames --------------------------------------------------------------- */
@@ -64,8 +65,23 @@ function withType(type: number, payload: Uint8Array): Uint8Array {
   return out
 }
 
-export function encodeHello(): Uint8Array {
-  return new Uint8Array([FRAME.HELLO, PROTOCOL_VERSION])
+export function encodeHello(ship: ShipId = 'hornet'): Uint8Array {
+  return new Uint8Array([FRAME.HELLO, PROTOCOL_VERSION, SHIP_ORDER.indexOf(ship)])
+}
+
+export function decodeHello(bytes: Uint8Array): ShipId {
+  if (bytes.length !== 3 || bytes[0] !== FRAME.HELLO || bytes[1] !== PROTOCOL_VERSION) {
+    throw new RangeError('incompatible hello')
+  }
+  const ship = SHIP_ORDER[bytes[2]]
+  if (!ship) throw new RangeError('unknown hull in hello')
+  return ship
+}
+
+export type Refusal = 'full' | 'version'
+export function refuse(channel: Channel, reason: Refusal): void {
+  channel.send(new Uint8Array([FRAME.REFUSED, reason === 'version' ? 1 : 0]))
+  channel.close()
 }
 
 export function encodeWelcome(seat: number, setup: Required<Pick<MatchSetup, 'ships' | 'seed'>> & MatchSetup): Uint8Array {
@@ -101,6 +117,37 @@ export function decodeWelcome(bytes: Uint8Array): Welcome {
   r.finish()
   if (seat >= ships.length) throw new RangeError(`welcomed to seat ${seat} of ${ships.length}`)
   return { seat, setup: { ships, seed, respawn, local: seat } }
+}
+
+export interface LobbyState {
+  revision: number
+  seat: number
+  seats: { ship: ShipId; pilot: 'human' | 'ai' | 'empty' }[]
+}
+
+export function encodeLobby(state: LobbyState): Uint8Array {
+  const w = new ByteWriter(32)
+  w.u8(FRAME.LOBBY).u8(PROTOCOL_VERSION).u32(state.revision).u8(state.seat).u8(state.seats.length)
+  for (const s of state.seats) w.u8(SHIP_ORDER.indexOf(s.ship)).u8(['human', 'ai', 'empty'].indexOf(s.pilot))
+  return w.bytes()
+}
+
+export function decodeLobby(bytes: Uint8Array): LobbyState {
+  const r = new ByteReader(bytes)
+  if (r.u8() !== FRAME.LOBBY || r.u8() !== PROTOCOL_VERSION) throw new RangeError('incompatible lobby')
+  const revision = r.u32()
+  const seat = r.u8()
+  const count = r.u8()
+  if (count < 2 || count > 4 || seat >= count) throw new RangeError('invalid lobby size or seat')
+  const seats: LobbyState['seats'] = []
+  for (let i = 0; i < count; i++) {
+    const ship = SHIP_ORDER[r.u8()]
+    const pilot = (['human', 'ai', 'empty'] as const)[r.u8()]
+    if (!ship || !pilot) throw new RangeError('invalid lobby seat')
+    seats.push({ ship, pilot })
+  }
+  r.finish()
+  return { revision, seat, seats }
 }
 
 export function encodeResult(result: MatchResult): Uint8Array {
@@ -186,12 +233,13 @@ export interface Host {
    * Hand a connected channel a seat. Returns the seat, or -1 if there was none —
    * in which case the peer has been told and the channel closed.
    */
-  accept(channel: Channel): number
+  accept(channel: Channel, reservedSeat?: number): number
   /**
    * Fly one tick: the host's own intent for seat 0, the latest admitted intent
    * (or a hold) for every remote seat, then a snapshot to every peer.
    */
   tick(local: Controls): void
+  close(): void
   readonly stats: HostStats
   readonly peers: number
   readonly seed: number
@@ -245,6 +293,11 @@ export function createHost(options: HostOptions): Host {
     }
     const type = bytes[0]
     if (type === FRAME.HELLO) {
+      try { decodeHello(bytes) } catch {
+        stats.malformed++
+        refuse(peer.channel, 'version')
+        return
+      }
       // The welcome was lost; the peer is still asking. Say it again.
       peer.channel.send(encodeWelcome(peer.seat, setup))
       return
@@ -283,12 +336,11 @@ export function createHost(options: HostOptions): Host {
       resultSent = null
     },
 
-    accept(channel) {
-      const seat = peers.findIndex((p, i) => i > 0 && p === null)
-      if (seat < 0) {
+    accept(channel, reservedSeat) {
+      const seat = reservedSeat ?? peers.findIndex((p, i) => i > 0 && p === null)
+      if (seat < 1 || seat >= seatCount || peers[seat]) {
         stats.refused++
-        channel.send(new Uint8Array([FRAME.REFUSED]))
-        channel.close()
+        refuse(channel, 'full')
         return -1
       }
       const peer: Peer = { channel, seat, lastTick: -1, flownTick: -1, pending: null, pendingTick: -1, held: holds[seat] }
@@ -371,6 +423,9 @@ export function createHost(options: HostOptions): Host {
       }
     },
 
+    close() {
+      for (const peer of peers) peer?.channel.close()
+    },
     get stats() {
       return stats
     },
@@ -427,7 +482,9 @@ export interface ClientOptions {
   /** Called once the host has handed over a seat and the match has started. */
   onWelcome?: (seat: number) => void
   /** Called if the host had no seat. */
-  onRefused?: () => void
+  onRefused?: (reason: Refusal) => void
+  ship?: ShipId
+  onLobby?: (roster: LobbyState) => void
   /**
    * Apply snapshots one per tick of this client's own clock, holding what the
    * wire delivers early and coasting through what it delivers late. On by
@@ -479,7 +536,8 @@ export function createClient(options: ClientOptions): Client {
   /** The host tick the client last coasted from, so a gap is coasted once, not forever. */
   let coastedAt = -2
 
-  channel.send(encodeHello())
+  let lobbyRevision = -1
+  channel.send(encodeHello(options.ship))
 
   function applySnapshot(world: WorldSnapshot): void {
     // A snapshot that throws has changed nothing (`Game.apply`'s contract), and
@@ -558,7 +616,19 @@ export function createClient(options: ClientOptions): Client {
       return
     }
     const type = bytes[0]
+    if (type === FRAME.LOBBY) {
+      if (seat >= 0) return
+      try {
+        const roster = decodeLobby(bytes)
+        if (roster.revision >= lobbyRevision) {
+          lobbyRevision = roster.revision
+          options.onLobby?.(roster)
+        }
+      } catch { stats.malformed++ }
+      return
+    }
     if (type === FRAME.WELCOME) {
+      if (bytes[1] !== PROTOCOL_VERSION) { options.onRefused?.('version'); return }
       if (seat >= 0) return
       let welcome: Welcome
       try {
@@ -573,7 +643,7 @@ export function createClient(options: ClientOptions): Client {
       return
     }
     if (type === FRAME.REFUSED) {
-      options.onRefused?.()
+      options.onRefused?.(bytes[1] === 1 ? 'version' : 'full')
       return
     }
     if (type === FRAME.RESULT) {
@@ -620,7 +690,7 @@ export function createClient(options: ClientOptions): Client {
       if (seat < 0) {
         // Still waiting: the hello, or the welcome, may have been lost. Ask again
         // every half second rather than every tick, so a slow host is not flooded.
-        if (++tick % HELLO_EVERY === 0) channel.send(encodeHello())
+        if (++tick % HELLO_EVERY === 0) channel.send(encodeHello(options.ship))
         return
       }
       // The world first, then this seat's own step on top of it.

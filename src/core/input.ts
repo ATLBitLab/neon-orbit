@@ -47,7 +47,7 @@ export interface Input {
   dispose(): void
 }
 
-export function createInput(canvas: HTMLCanvasElement): Input {
+export function createInput(canvas: HTMLCanvasElement, captureControls: () => boolean = () => true): Input {
   const held = new Set<string>()
   const keyHandlers = new Map<string, (() => void)[]>()
   const lockLostHandlers: (() => void)[] = []
@@ -81,7 +81,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
       if (handlers) for (const h of handlers) h()
     }
 
-    if (TRACKED.has(e.code)) {
+    if (TRACKED.has(e.code) && captureControls()) {
       held.add(e.code)
       e.preventDefault()
     }
@@ -177,7 +177,7 @@ export function createInput(canvas: HTMLCanvasElement): Input {
     update,
     requestPointerLock() {
       // Chrome rejects the promise if lock is requested too soon after an exit.
-      void canvas.requestPointerLock()
+      void canvas.requestPointerLock()?.catch(() => {})
     },
     releasePointerLock() {
       if (document.pointerLockElement === canvas) document.exitPointerLock()
