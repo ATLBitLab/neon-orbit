@@ -16,13 +16,13 @@
   },
   "dependencies": {
     "nostr-tools": "^2.25.2",
-    "three": "^0.185.1"
+    "three": "^0.186.0"
   },
   "devDependencies": {
-    "@types/node": "^26.4.1",
-    "@types/three": "^0.185.4",
+    "@types/node": "^26.6.1",
+    "@types/three": "^0.186.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vite": "^8.2.2"
+    "vite": "^8.3.0"
   }
 }
