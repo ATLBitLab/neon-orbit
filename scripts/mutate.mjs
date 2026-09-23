@@ -30,6 +30,42 @@ import { readFileSync, writeFileSync } from 'node:fs'
 /** @type {{ name: string, file: string, from: string, to: string }[]} */
 const MUTATIONS = [
   {
+    name: 'dedicated P1 never gets AI backfill',
+    file: 'src/net/session.ts',
+    from: 'seat >= firstRemote && (options.backfill ?? true)',
+    to: 'seat > firstRemote && (options.backfill ?? true)',
+  },
+  {
+    name: 'dedicated P1 never flies its remote intent',
+    file: 'src/net/session.ts',
+    from: 'for (let seat = firstRemote; seat < seatCount; seat++)',
+    to: 'for (let seat = Math.max(1, firstRemote); seat < seatCount; seat++)',
+  },
+  {
+    name: 'silent dedicated connections never expire',
+    file: 'src/server/match.ts',
+    from: 'if (ticks >= deadline) channel.close()',
+    to: 'if (ticks >= deadline) { /* keep waiting */ }',
+  },
+  {
+    name: 'dedicated connection admission has no cap',
+    file: 'src/server/match.ts',
+    from: 'channels.size >= MAX_CONNECTIONS',
+    to: 'false',
+  },
+  {
+    name: 'dedicated host seats a foreign protocol',
+    file: 'src/server/match.ts',
+    from: "        try { decodeHello(bytes) } catch { refuse(channel, 'version'); return }",
+    to: '        /* do not check protocol version */',
+  },
+  {
+    name: 'dedicated shutdown permits later ticks and connections',
+    file: 'src/server/match.ts',
+    from: '      closed = true\n      for (const channel of channels)',
+    to: '      /* remain open */\n      for (const channel of channels)',
+  },
+  {
     name: 'recovery offers reuse the old ICE credentials',
     file: 'src/net/recovery.ts',
     from: 'pc.createOffer({ iceRestart: true })',
@@ -363,8 +399,8 @@ const MUTATIONS = [
   {
     name: 'the host seats a peer where there is no seat',
     file: 'src/net/session.ts',
-    from: '      const seat = reservedSeat ?? peers.findIndex((p, i) => i > 0 && p === null)\n      if (seat < 1 || seat >= seatCount || peers[seat]) {',
-    to: '      const seat = reservedSeat ?? Math.max(1, peers.findIndex((p, i) => i > 0 && p === null))\n      if (seat < 1 || seat >= seatCount) {',
+    from: '      const seat = reservedSeat ?? peers.findIndex((p, i) => i >= firstRemote && p === null)\n      if (!Number.isInteger(seat) || seat < firstRemote || seat >= seatCount || peers[seat]) {',
+    to: '      const seat = reservedSeat ?? Math.max(firstRemote, peers.findIndex((p, i) => i >= firstRemote && p === null))\n      if (seat < firstRemote || seat >= seatCount) {',
   },
   {
     name: 'a repeated hello is ignored',
@@ -1031,7 +1067,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 737
+const EXPECTED_ASSERTIONS = 757
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

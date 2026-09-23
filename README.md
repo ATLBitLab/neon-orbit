@@ -456,6 +456,43 @@ shot instead. All of it is in `beginDeathSequence` / `stepDeathSequence` in `src
 
 ## Checks
 
+### Authoritative server foundation (Phase A, first slice)
+
+`src/server/match.ts` runs the real arena and existing host protocol in Node,
+without a browser, renderer, DOM or audio device. Every seat, including P1, is
+remote or AI-driven. A connection must send a compatible HELLO before it gets a
+seat; the server fixes the hulls and seed. Received intents still pass through
+the existing seat binding, replay rejection and input admission. Only the
+server's `step()` advances the match, by 1/60 second. Closing the match closes
+its channels and disposes its simulation and environment.
+
+This is a transport-independent runtime, **not yet a joinable server**. There
+is no network listener, browser server-join flow, authentication, deployment,
+or public matchmaking in this slice. A future transport must enforce packet
+size/rate limits and backpressure before handing bytes to the runtime. The
+runtime caps connections at eight and expires unseated handshakes after 300
+server ticks. The caller owns scheduling, idle policy and match lifetime.
+
+The arena uses the same construction as the browser, including stations, mines
+and pods. It currently allocates three.js geometry even though it never renders;
+this keeps collision and pickup placement identical while establishing the
+boundary. Removing those allocations is a later measured optimization.
+
+Run a reproducible local load measurement:
+
+```bash
+npm run bench:server -- 60  # four synthetic clients, 60 simulated seconds
+```
+
+It prints startup and tick timings, CPU time, process RSS and encoded outbound
+bytes. The benchmark runs faster than real time and excludes sockets, TLS and
+concurrent rooms, so it does not establish hosting capacity. Snapshots still
+contain the full bolt pool at 60 Hz; use the measured traffic before choosing a
+hosting budget. `simcheck` exercises all-remote seating, P1 snapshot mirroring,
+forgery/replay, takeover, bounded handshakes and shutdown.
+
+### Existing checks
+
 ```bash
 npm run check          # typecheck + headless simulation + balance
 npm run check:sim      # simulation only, ~1s

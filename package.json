@@ -12,7 +12,8 @@
     "check:sim": "esbuild scripts/simcheck.ts --bundle --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/simcheck.mjs --log-level=warning && node node_modules/.cache/simcheck.mjs",
     "check:balance": "esbuild scripts/balance.ts --bundle --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/balance.mjs --log-level=warning && node node_modules/.cache/balance.mjs",
     "check:mutants": "node scripts/mutate.mjs",
-    "check": "npm run typecheck && npm run check:sim && npm run check:balance"
+    "check": "npm run typecheck && npm run check:sim && npm run check:balance",
+    "bench:server": "esbuild scripts/server-bench.ts --bundle --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/server-bench.mjs --log-level=warning && node node_modules/.cache/server-bench.mjs"
   },
   "dependencies": {
     "nostr-tools": "^2.25.2",
