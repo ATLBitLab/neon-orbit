@@ -4,7 +4,7 @@ The deployed hostname is `104-131-185-100.sslip.io` on the Neon Orbit droplet
 (`104.131.185.100`). Caddy terminates TLS and forwards WebSocket traffic to
 Node on loopback port 8080. The process admits twelve connected players across
 rooms, with two to four seats per match. Rooms live only in process memory.
-During a running match, a dropped player's seat is held for 12 seconds. The
+Free-room match state lives only in process memory. During a running match, a dropped player's seat is held for 12 seconds. The
 server gives each seat a 256-bit resume token after WELCOME; RETRY sends it
 in the first WebSocket frame to reclaim that seat. The server rotates the token
 after each successful resume. For one release, the previous client can still
@@ -56,6 +56,36 @@ only to loopback, and needs only the firewall's public 80/443 ports. A restart
 ends active rooms. Check `journalctl -u neon-orbit -f` if health fails.
 The [Caddy reverse proxy reference](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
 documents the upstream client-IP header used for per-IP connection limits.
+
+## Pot receive foundation (disabled until payout/refunds ship)
+
+`POT_ENABLED=0` is the service default. Do **not** enable pot rooms from this
+branch: they can receive invoices but deliberately cannot launch yet. The
+client pay screen, authoritative result, payout, and refunds come in later PRs.
+Free rooms keep the existing `/rooms` and WebSocket behavior.
+
+When the complete flow is ready, systemd's optional root-owned
+`/etc/neon-orbit/pot.env` provides `POT_ENABLED=1` and `VOLTAGE_API_KEY`.
+The server uses the dedicated mainnet `neon-orbit-pot` wallet and stores its
+ledger at `/var/lib/neon-orbit/pot-ledger.json` (the service's `StateDirectory`).
+The state directory is mode 0700 and the ledger file is mode 0600. The ledger contains payment IDs, invoice state, and salted hashes of private
+seat claim credentials; it does not store those credentials or the API key.
+Back up the state directory before replacing the droplet. A restart ends live
+matches but keeps payment records for reconciliation and later refunds.
+
+With the flag on, `POST /rooms` accepts an optional
+`{"pot":{"buyInSats":100}}` (1–1000 sats). A seat receives its claim over
+its own WebSocket after HELLO. `POST /pot` with `{"code":"…","seat":0}`
+and `Authorization: Bearer <claim>` submits a fixed BOLT11 receive invoice;
+`GET /pot?room=…&seat=0` with the same header polls settlement. The HTTP
+responses distinguish `receiving` from `completed`; an accepted Voltage 202
+is never treated as payment. An uncertain submit stays tied to its persisted
+UUID and is reconciled by GET, never blindly reposted. A code-only late joiner
+cannot inherit a claimed pot seat. These private controls are server APIs for
+the later client work; they are not yet a user-facing pot mode.
+
+Run `npm run check:pot` for loopback-only mocked Voltage and listener tests.
+They use a fake key and make no mainnet requests.
 
 ## Client preview
 
