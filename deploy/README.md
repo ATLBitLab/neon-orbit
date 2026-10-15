@@ -57,11 +57,12 @@ ends active rooms. Check `journalctl -u neon-orbit -f` if health fails.
 The [Caddy reverse proxy reference](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
 documents the upstream client-IP header used for per-IP connection limits.
 
-## Pot receive foundation (disabled until payout/refunds ship)
+## Pot payment lobby (disabled until payout/refunds ship)
 
 `POT_ENABLED=0` is the service default. Do **not** enable pot rooms from this
 branch: they can receive invoices but deliberately cannot launch yet. The
-client pay screen, authoritative result, payout, and refunds come in later PRs.
+client shows a pot choice, invoice QR and copy control, and settled-seat status;
+authoritative results, payout, and refunds come in the next PR.
 Free rooms keep the existing `/rooms` and WebSocket behavior.
 
 When the complete flow is ready, systemd's optional root-owned
@@ -81,8 +82,12 @@ and `Authorization: Bearer <claim>` submits a fixed BOLT11 receive invoice;
 responses distinguish `receiving` from `completed`; an accepted Voltage 202
 is never treated as payment. An uncertain submit stays tied to its persisted
 UUID and is reconciled by GET, never blindly reposted. A code-only late joiner
-cannot inherit a claimed pot seat. These private controls are server APIs for
-the later client work; they are not yet a user-facing pot mode.
+cannot inherit a claimed pot seat. The browser keeps its private seat claim in
+local storage and proves it in the first WebSocket frame when reclaiming a
+vacated paid seat. After creating a pot room, the host address becomes its
+join link so reloading returns to that room. Room links contain the code and
+server address, not the claim. Even after every seat pays, LAUNCH remains
+disabled until payout and refund handling is ready.
 
 Run `npm run check:pot` for loopback-only mocked Voltage and listener tests.
 They use a fake key and make no mainnet requests.

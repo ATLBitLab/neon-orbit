@@ -22,6 +22,7 @@ const MAX_MESSAGES_PER_SECOND = 120
 const MAX_TICK_LEAD = 600
 const IDLE_MS = 30 * 60_000
 const EMPTY_ROOM_MS = 60_000
+const EMPTY_POT_ROOM_MS = 10 * 60_000
 const END_GRACE_MS = 10_000
 const RESUME_GRACE_MS = 12_000
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -143,7 +144,13 @@ function broadcast(room: Room): void {
     member.channel.send(encodeLobby({ revision: room.revision, seat: member.seat, seats }))
     member.channel.control({ type: 'room', code: room.code, seats: room.seats,
       players: room.members.length, state: room.state, creator: member === lead,
-      launcherSeat: lead?.seat ?? -1 })
+      launcherSeat: lead?.seat ?? -1,
+      ...(room.potBuyInSats === null ? {} : { pot: {
+        buyInSats: room.potBuyInSats,
+        paidSeats: potLedger?.getRoom(room.code)?.entries
+          .filter(entry => entry.state === 'completed').map(entry => entry.seat) ?? [],
+      } }),
+    })
   }
 }
 
@@ -196,9 +203,15 @@ function guardRoom(room: Room, phase: string, operation: () => void): void {
 
 function startRoom(room: Room): string | null {
   if (room.state !== 'lobby') return null
-  // Pot launch/payout arrives in the later PRs. Never let a paid room run
-  // until the whole money path is present and reviewed.
-  if (room.potBuyInSats !== null) return 'pot matches are not ready to launch'
+  if (room.potBuyInSats !== null) {
+    if (room.members.some(member => member.hello &&
+        potLedger?.getRoom(room.code)?.entries.find(entry => entry.seat === member.seat)?.state !== 'completed')) {
+      return 'every player must pay before launch'
+    }
+    // Winner payout and refunds arrive in PR (c). Even if every seat paid,
+    // this receive-only branch must never strand a live pot.
+    return 'pot matches are awaiting payout support'
+  }
   if (room.members.filter(member => member.hello).length < 2) {
     return 'at least two players must join before launch'
   }
@@ -237,7 +250,8 @@ function startRoom(room: Room): string | null {
 const server = createServer((req, res) => {
   if (req.method === 'OPTIONS') { reply(res, 204, {}); return }
   if (req.method === 'GET' && req.url === '/health') {
-    reply(res, 200, { ok: true, rooms: rooms.size, players: totalPlayers() }); return
+    reply(res, 200, { ok: true, rooms: rooms.size, players: totalPlayers(),
+      ...(POT_ENABLED ? { potEnabled: true } : {}) }); return
   }
   if (req.url?.startsWith('/pot?') && req.method === 'GET') {
     if (!potLedger || !voltage) { reply(res, 404, { error: 'not found' }); return }
@@ -246,9 +260,11 @@ const server = createServer((req, res) => {
     const seat = Number(url.searchParams.get('seat'))
     const claim = req.headers.authorization?.replace(/^Bearer /, '') ?? ''
     if (!potLedger.ownsSeat(code, seat, claim)) { reply(res, 403, { error: 'invalid claim' }); return }
-    void voltage.poll(code, seat).then(entry => reply(res, 200, {
-      paymentId: entry.paymentId, state: entry.state, invoice: entry.invoice,
-    })).catch(() => reply(res, 503, { error: 'payment status unavailable' }))
+    void voltage.poll(code, seat).then(entry => {
+      const room = rooms.get(code)
+      if (room?.state === 'lobby') broadcast(room)
+      reply(res, 200, { paymentId: entry.paymentId, state: entry.state, invoice: entry.invoice })
+    }).catch(() => reply(res, 503, { error: 'payment status unavailable' }))
     return
   }
   if (req.url === '/pot' && req.method === 'POST') {
@@ -341,6 +357,12 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
     const ip = clientIp(request)
     const sameIp = members().filter(member => member.ip === ip)
     const resumeToken = url.searchParams.get('resume')
+    const potSeatParam = url.searchParams.get('potSeat')
+    const potSeat = potSeatParam !== null && /^\d$/.test(potSeatParam) ? Number(potSeatParam) : null
+    const potClaim = !!(room && room.state === 'lobby' && room.potBuyInSats !== null &&
+      potSeat !== null && potSeat < room.seats &&
+      potLedger?.getRoom(room.code)?.entries.some(entry => entry.seat === potSeat) &&
+      !room.members.some(member => member.seat === potSeat))
     // Query-token admission remains for one release while the already-deployed
     // client rolls forward. New clients prove ownership in their first WS frame.
     const reservation = room?.state === 'running' && resumeToken
@@ -349,7 +371,8 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
     if (url.pathname !== '/ws' || !room ||
         (room.state !== 'lobby' && !reservation && !frameResume) ||
         (room.state === 'lobby' && resumeToken !== null) ||
-        (room.state === 'lobby' && availableSeat(room) === undefined) ||
+        (room.state === 'lobby' && availableSeat(room) === undefined && !potClaim) ||
+        (potSeatParam !== null && !potClaim) ||
         room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
         sameIp.length + [...pendingResumes.values()].filter(value => value === ip).length >= MAX_CONNECTIONS_PER_IP ||
         sameIp.filter(member => !member.hello).length +
@@ -366,7 +389,7 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
     wss.handleUpgrade(request, socket, head, ws => {
       clientIps.set(ws, ip)
       socketRoom.set(ws, room)
-      wss.emit('connection', ws, room, reservation, frameResume)
+      wss.emit('connection', ws, room, reservation, frameResume, potClaim ? potSeat : undefined)
     })
   } catch {
     if (claimed) claimed.claiming = false
@@ -377,8 +400,9 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
   }
 })
 
-function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReservation): void {
-  const seat = reservation?.seat ?? availableSeat(room)!
+function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReservation,
+  potReclaimSeat?: number): void {
+  const seat = reservation?.seat ?? potReclaimSeat ?? availableSeat(room)!
   const messages: ((bytes: Uint8Array) => void)[] = []
   const closers: (() => void)[] = []
   let closed = false
@@ -440,7 +464,7 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
     clearTimeout(helloTimeout)
     room.lastActivity = Date.now()
     broadcast(room)
-    if (firstHello && room.potBuyInSats !== null && potLedger) {
+    if (firstHello && potReclaimSeat === undefined && room.potBuyInSats !== null && potLedger) {
       void potLedger.prepareSeat(room.code, seat).then(({ entry, claim }) => {
         if (member.channel.open) channel.control({ type: 'pot', seat, buyInSats: room.potBuyInSats,
           paymentId: entry.paymentId, claim })
@@ -501,7 +525,7 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
       if (index >= 0) room.members.splice(index, 1)
       if (reservation && !member.hello) reservation.claiming = false
       else if (code !== 1008 && code !== 1009) reserveSeat(room, member)
-      if (room.members.length === 0 && room.resumes.size === 0) closeRoom(room)
+      if (room.members.length === 0 && room.resumes.size === 0 && room.potBuyInSats === null) closeRoom(room)
       else if (room.state === 'lobby') broadcast(room)
     })
   })
@@ -533,9 +557,32 @@ function awaitResume(socket: WebSocket, room: Room): void {
   })
 }
 
+function awaitPotClaim(socket: WebSocket, room: Room, seat: number): void {
+  const ip = clientIps.get(socket) ?? 'unknown'
+  pendingResumes.set(socket, ip)
+  const timeout = setTimeout(() => socket.close(1008, 'pot claim timeout'), 5000)
+  const cleanup = () => { clearTimeout(timeout); pendingResumes.delete(socket) }
+  socket.once('close', cleanup)
+  socket.on('error', () => socket.terminate())
+  socket.once('message', (data, binary) => {
+    guardRoom(room, 'pot claim admission', () => {
+      const bytes = Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data as ArrayBuffer)
+      const claim = bytes.subarray(2).toString('ascii')
+      if (!binary || bytes.length !== 45 || bytes[0] !== 9 || bytes[1] !== seat ||
+          !potLedger?.ownsSeat(room.code, seat, claim) || !rooms.has(room.code) ||
+          room.state !== 'lobby' || room.members.some(member => member.seat === seat)) {
+        socket.close(1008, 'invalid pot claim'); return
+      }
+      cleanup()
+      connectSocket(socket, room, undefined, seat)
+    })
+  })
+}
+
 wss.on('connection', (socket: WebSocket, room: Room, reservation?: ResumeReservation,
-  frameResume?: boolean) => {
+  frameResume?: boolean, potReclaimSeat?: number) => {
   if (frameResume) guardRoom(room, 'resume admission', () => awaitResume(socket, room))
+  else if (potReclaimSeat !== undefined) guardRoom(room, 'pot claim admission', () => awaitPotClaim(socket, room, potReclaimSeat))
   else guardRoom(room, 'connection', () => connectSocket(socket, room, reservation))
   // A failure before the new socket joins room.members still has to close it.
   if (!rooms.has(room.code)) {
@@ -549,7 +596,9 @@ setInterval(() => {
   for (const room of rooms.values()) {
     guardRoom(room, 'idle cleanup', () => {
       if (room.state === 'lobby' && Date.now() - room.lastActivity >
-          (room.members.length === 0 ? EMPTY_ROOM_MS : IDLE_MS)) closeRoom(room)
+          (room.members.length === 0
+            ? (room.potBuyInSats === null ? EMPTY_ROOM_MS : EMPTY_POT_ROOM_MS)
+            : IDLE_MS)) closeRoom(room)
     })
   }
 }, 5_000).unref()

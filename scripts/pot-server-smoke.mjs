@@ -8,6 +8,7 @@ import WebSocket from 'ws'
 
 const dir = await mkdtemp(join(tmpdir(), 'neon-pot-server-'))
 let postCount = 0
+const settled = new Set()
 const mock = createServer(async (req, res) => {
   assert.equal(req.headers['x-api-key'], 'mock-key')
   if (req.method === 'POST') {
@@ -26,7 +27,7 @@ const mock = createServer(async (req, res) => {
     id, wallet_id: '5272faf9-4644-4478-bc21-9f4b57b420a0',
     organization_id: '5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29',
     environment_id: '638fcc72-5f4b-4734-a2d6-8d0ef939b750',
-    direction: 'receive', type: 'bolt11', status: 'receiving',
+    direction: 'receive', type: 'bolt11', status: settled.has(id) ? 'completed' : 'receiving',
     requested_amount: { currency: 'btc', amount: 100000 },
     data: { payment_request: 'lnbc1mockinvoice' },
   }))
@@ -98,20 +99,54 @@ try {
   assert.equal(postCount, 1, 'one payment ID is submitted only once')
   first.socket.send(JSON.stringify({ type: 'start' }))
   await wait(() => first.controls.some(item => item.type === 'error'))
+  assert.equal(first.controls.find(item => item.type === 'error').message,
+    'every player must pay before launch')
+  settled.add(first.pot.paymentId)
+  const paid = await fetch(`${url}/pot?room=${code}&seat=0`, { headers: {
+    authorization: `Bearer ${first.pot.claim}`,
+  } })
+  assert.equal((await paid.json()).state, 'completed')
+  await wait(() => second.controls.some(item => item.type === 'room' && item.pot?.paidSeats?.includes(0)))
+  const secondInvoice = await fetch(`${url}/pot`, { method: 'POST', headers: {
+    authorization: `Bearer ${second.pot.claim}`, 'content-type': 'application/json',
+  }, body: JSON.stringify({ code, seat: 1 }) })
+  assert.equal(secondInvoice.status, 200)
+  settled.add(second.pot.paymentId)
+  const secondPaid = await fetch(`${url}/pot?room=${code}&seat=1`, { headers: {
+    authorization: `Bearer ${second.pot.claim}`,
+  } })
+  assert.equal((await secondPaid.json()).state, 'completed')
+  first.socket.send(JSON.stringify({ type: 'start' }))
+  await wait(() => first.controls.some(item => item.type === 'error' &&
+    item.message === 'pot matches are awaiting payout support'))
   assert.equal((await fetch(`${url}/health`).then(r => r.json())).rooms, 2,
     'pot launch remains disabled in receive-only slice')
   first.socket.close()
   await new Promise(resolve => first.socket.once('close', resolve))
-  const replacement = new WebSocket(`ws://127.0.0.1:${port}/ws?room=${code}`)
-  // Paid seat 0 stays locked; a new code-only guest cannot inherit it.
+  // Paid seat 0 stays locked to the claim, not merely the room code.
+  const codeOnly = new WebSocket(`ws://127.0.0.1:${port}/ws?room=${code}`)
   const rejected = await new Promise((resolve, reject) => {
-    replacement.once('unexpected-response', (_request, response) => resolve(response.statusCode))
-    replacement.once('open', () => reject(new Error('paid seat taken by room code')))
-    replacement.once('error', reject)
+    codeOnly.once('unexpected-response', (_request, response) => resolve(response.statusCode))
+    codeOnly.once('open', () => reject(new Error('paid seat taken by room code')))
+    codeOnly.once('error', reject)
   })
   assert.equal(rejected, 429)
+  const badClaim = new WebSocket(`ws://127.0.0.1:${port}/ws?room=${code}&potSeat=0`)
+  await new Promise((resolve, reject) => { badClaim.once('open', resolve); badClaim.once('error', reject) })
+  sockets.push(badClaim)
+  const badClose = new Promise(resolve => badClaim.once('close', resolve))
+  badClaim.send(Buffer.concat([Buffer.from([9, 0]), Buffer.from(second.pot.claim, 'ascii')]))
+  assert.equal(await badClose, 1008, 'another seat claim cannot take the paid seat')
+  const replacement = new WebSocket(`ws://127.0.0.1:${port}/ws?room=${code}&potSeat=0`)
+  const frames = []
+  replacement.on('message', (data, binary) => { if (binary) frames.push(Buffer.from(data)) })
+  await new Promise((resolve, reject) => { replacement.once('open', resolve); replacement.once('error', reject) })
+  sockets.push(replacement)
+  replacement.send(Buffer.concat([Buffer.from([9, 0]), Buffer.from(first.pot.claim, 'ascii')]))
+  replacement.send(Buffer.from([1, 3, 0]))
+  await wait(() => frames.some(frame => frame[0] === 7 && frame[6] === 0))
   const disk = JSON.parse(await readFile(join(dir, 'ledger.json'), 'utf8'))
-  assert.equal(disk.rooms.find(room => room.code === code).entries[0].state, 'receiving')
+  assert.equal(disk.rooms.find(room => room.code === code).entries[0].state, 'completed')
   assert(!JSON.stringify(disk).includes(first.pot.claim))
   console.log('pot listener + mocked Voltage smoke passes')
 } finally {

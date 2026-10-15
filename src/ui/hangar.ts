@@ -66,6 +66,7 @@ export interface Hangar {
   open(initial: ShipId): void
   close(): void
   hostOptions(visible: boolean): void
+  potOptions(visible: boolean): void
   update(dt: number): void
   action(label: string | null, locked?: boolean): void
   readonly selected: ShipId
@@ -78,7 +79,7 @@ export interface HangarDeps {
   camera: THREE.PerspectiveCamera
   audio: Audio
   onLaunch: (id: ShipId) => void
-  onHost?: (seats: number) => void
+  onHost?: (seats: number, buyInSats?: number) => void
   onSelect?: (id: ShipId) => void
 }
 
@@ -193,7 +194,29 @@ export function createHangar(deps: HangarDeps): Hangar {
   seatsLabel.append(seats)
   const hostButton = el('button', 'btn host-button', 'Host game') as HTMLButtonElement
   hostButton.type = 'button'
-  host.append(seatsLabel, hostButton)
+  const potChoice = el('label', 'pot-choice')
+  potChoice.hidden = true
+  const potToggle = el('input') as HTMLInputElement
+  potToggle.type = 'checkbox'
+  potChoice.append(potToggle, document.createTextNode('Pot match'))
+  const potAmount = el('label', 'pot-amount')
+  potAmount.hidden = true
+  potAmount.textContent = 'Buy-in · sats'
+  const sats = el('input') as HTMLInputElement
+  sats.type = 'number'
+  sats.min = '1'
+  sats.max = '1000'
+  sats.step = '1'
+  sats.value = '100'
+  potAmount.append(sats)
+  const potFee = el('p', 'pot-fee', 'Winner receives the pot minus Lightning routing fees.')
+  potFee.hidden = true
+  potToggle.addEventListener('change', () => {
+    potAmount.hidden = !potToggle.checked
+    potFee.hidden = !potToggle.checked
+    hostButton.textContent = potToggle.checked ? 'Host pot match' : 'Host game'
+  })
+  host.append(seatsLabel, potChoice, potAmount, potFee, hostButton)
   actions.append(host, launch)
   footer.append(legend, actions)
 
@@ -248,7 +271,14 @@ export function createHangar(deps: HangarDeps): Hangar {
     if (!open || locked) return
     audio.resume()
     audio.uiSelect()
-    deps.onHost?.(Number(seats.value))
+    const buyIn = potToggle.checked ? Number(sats.value) : undefined
+    if (buyIn !== undefined && (!Number.isInteger(buyIn) || buyIn < 1 || buyIn > 1000)) {
+      sats.setCustomValidity('Choose 1 to 1,000 sats')
+      sats.reportValidity()
+      return
+    }
+    sats.setCustomValidity('')
+    deps.onHost?.(Number(seats.value), buyIn)
   })
 
   function onKey(e: KeyboardEvent) {
@@ -273,6 +303,15 @@ export function createHangar(deps: HangarDeps): Hangar {
     root,
     hostOptions(visible) {
       host.hidden = !visible || !deps.onHost
+    },
+    potOptions(visible) {
+      potChoice.hidden = !visible
+      if (!visible) {
+        potToggle.checked = false
+        potAmount.hidden = true
+        potFee.hidden = true
+        hostButton.textContent = 'Host game'
+      }
     },
     action(label, lock = false) {
       actionLabel = label
