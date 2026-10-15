@@ -24,7 +24,7 @@ import {
   type Hazard,
 } from '../world/environment'
 import { OVERDRIVE_RATE_MULT } from '../world/pickups'
-import { FACTION_ENVIRONMENT, type BoltTarget, type Bolts, type Faction } from './bolts'
+import { FACTION_AI, FACTION_ENVIRONMENT, type BoltTarget, type Bolts, type Faction } from './bolts'
 import { bound } from './intent'
 
 export interface Controls {
@@ -93,6 +93,9 @@ const _normal = new THREE.Vector3()
 const _outNormal = new THREE.Vector3()
 const _aim = new THREE.Vector3()
 const _jitter = new THREE.Vector3()
+const _shotDirection = new THREE.Vector3()
+const _fanAxis = new THREE.Vector3()
+const _localUp = new THREE.Vector3(0, 1, 0)
 
 export class Ship implements BoltTarget {
   readonly spec: ShipSpec
@@ -604,16 +607,27 @@ export class Ship implements BoltTarget {
     // bolt in the game carries the damage its airframe's spec sheet says it
     // does, boosted or not, which is what keeps alpha strike — and therefore
     // every one-volley-kill threshold the balance harness pins — invariant.
+    const boltsPerMuzzle = this.spec.barrels / this.visual.muzzles.length
+    _fanAxis.copy(_localUp).applyQuaternion(this.quaternion)
     for (const local of this.visual.muzzles) {
       _muzzle.copy(local).applyQuaternion(this.quaternion).add(this.position)
-      ctx.bolts.fire({
-        origin: _muzzle,
-        direction,
-        speed: boltSpeed,
-        damage: this.spec.damage,
-        faction: this.faction,
-        color: this.accent,
-      })
+      for (let bolt = 0; bolt < boltsPerMuzzle; bolt++) {
+        // A narrow horizontal fan makes the Drone's two cannons read as a
+        // barrage. Keep the center bolt on aim so spread never changes AI lead.
+        const angle = (bolt - (boltsPerMuzzle - 1) / 2) * this.spec.salvoSpread
+        _shotDirection.copy(direction).applyAxisAngle(_fanAxis, angle)
+        ctx.bolts.fire({
+          origin: _muzzle,
+          direction: _shotDirection,
+          speed: boltSpeed,
+          damage: this.spec.damage,
+          faction: this.faction,
+          color: this.accent,
+          lifetime: this.spec.boltLifetime,
+          cosmeticTracers: this.spec.id === 'drone' && this.faction !== FACTION_AI ? 1 : 0,
+          tracerAxis: _fanAxis,
+        })
+      }
     }
 
     // Carry the overshoot. `fireTimer` stops decrementing once it passes zero,
@@ -730,6 +744,12 @@ export class Ship implements BoltTarget {
     this.visual.hullMesh.visible = !phasing
     this.visual.trimMat.opacity = phasing ? 0.55 : warp < 1 ? 0.4 + warp * 0.55 : 0.95
 
+    // Driven from the weapon clock, so both authoritative and mirrored Drones
+    // flash without putting another effect in a network snapshot.
+    const interval = this.overdriven ? this.spec.fireInterval / OVERDRIVE_RATE_MULT : this.spec.fireInterval
+    const muzzleLit = this.shotsFired > 0 && this.fireTimer > interval - 0.075
+    for (const flash of this.visual.muzzleFlashes) flash.visible = muzzleLit
+
     // Throttle drives exhaust length and brightness, with a little flicker so
     // it never looks like a static cone bolted to the tail.
     const t = this.speedFraction
@@ -767,4 +787,3 @@ export class Ship implements BoltTarget {
     disposeShipVisual(this.visual)
   }
 }
-

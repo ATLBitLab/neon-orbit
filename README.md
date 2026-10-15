@@ -50,8 +50,8 @@ bottom-right panel. The fade window is `DAMAGE_BAR_FADE` in `src/game/hud.ts`.
 | Hull | 70 | 120 | 200 |
 | Top speed | 470 | 355 | 250 |
 | Turn rate | 1.95 rad/s | 1.45 rad/s | 0.95 rad/s |
-| Guns | 5 dmg @ 0.085s | 10 dmg × 2 @ 0.30s | 20 dmg × 2 @ 0.86s |
-| Sustained DPS | 47 | 67 | 47 |
+| Guns | 5 dmg @ 0.085s | 10 dmg × 2 @ 0.30s | 9 dmg × 4 @ 0.30s |
+| Sustained DPS | 47 | 67 | 120 on a broadside Drone target |
 | Quirk | Guns overheat and lock out | Phase dash — untargetable mid-dash | Hull self-repairs after 6.5s |
 
 Whichever you pick, three of each of the other two types make up the opposing squadron. Clear
@@ -65,6 +65,16 @@ feathers it out-damages a pilot who holds it down by roughly half. Let it redlin
 lock out for 2.9 seconds, which costs a third of your output. The card bars in the hangar are
 *derived* from these numbers rather than typed in, so they cannot drift away from the flight
 model — see `sustainedDps` in `src/ships/specs.ts`.
+
+**The Drone's two cannons throw a four-bolt fan every 0.3 seconds.** Its bolts
+travel at 1700 units/sec and stay live for one second (about 1700 units of
+reach), giving the slow hull a real ranged threat without filling every server
+snapshot with spent shots. The broadside does about 1.8× the Hornet's sustained
+damage against a large target. A small
+Wasp catches fewer of the outer bolts at range and survives a pinned barrage
+for about a second, giving its pilot a chance to break away.
+Enemy NPC Drones keep their original twin cannons and reload; the player buff
+does not raise the solo campaign's incoming Drone firepower.
 
 ## The BFG
 
@@ -482,7 +492,9 @@ Run a reproducible local load measurement:
 ```bash
 npm run bench:server -- 60 4 1  # former 60 Hz snapshots
 npm run bench:server -- 60 4 2  # dedicated server's 30 Hz snapshots
-npm run check:bandwidth        # 130 KB/s per client budget in the fixed four-seat run
+npm run bench:server -- 60 4 2 --all-drone  # four Drone pilots at 30 Hz
+npm run bench:server -- 60 4 2 --all-hornet # four Hornet pilots at 30 Hz
+npm run check:bandwidth        # all three four-seat rosters checked
 ```
 
 It prints startup and tick timings, CPU time, process RSS and encoded outbound
@@ -490,6 +502,10 @@ bytes. The benchmark runs faster than real time and excludes sockets, TLS and
 concurrent rooms, so it does not establish hosting capacity. The dedicated
 listener still simulates and accepts input at 60 Hz but sends complete snapshots
 at 30 Hz; browser-hosted WebRTC keeps its existing cadence and protocol.
+All three rosters must stay under 160 KB/s per client (about 1.3 Mbps).
+Main's all-Hornet roster already used about 138 KB/s at 30 Hz, above the old
+130 KB/s gate that measured only the mixed roster; this explicit ceiling covers
+all three without lowering the snapshot cadence.
 `simcheck` exercises all-remote seating, P1 snapshot mirroring,
 forgery/replay, takeover, bounded handshakes and shutdown.
 

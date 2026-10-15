@@ -4,7 +4,8 @@
  * Every number here is tuned against an arena radius of ~3400 units and ships
  * roughly 30 units long, so speeds read as "fast" without the planet whipping
  * past. Balance intent: Wasp wins by never being where you aimed, Drone wins by
- * absorbing a mistake you cannot, Hornet wins by making fewer compromises.
+ * absorbing a mistake you cannot and laying down a barrage, Hornet wins by
+ * making fewer compromises.
  */
 
 export type ShipId = 'wasp' | 'drone' | 'hornet'
@@ -63,10 +64,14 @@ export interface ShipStats {
   fireInterval: number
   damage: number
   boltSpeed: number
-  /** 1 = centreline gun, 2 = wing pair. */
+  /** Seconds a bolt remains in flight. */
+  boltLifetime: number
+  /** Bolts in one salvo, across all physical muzzles. */
   barrels: number
   /** Half-distance between wing barrels. */
   barrelSpread: number
+  /** Radians between adjacent bolts in a muzzle's horizontal fan. */
+  salvoSpread: number
 
   /** Collision sphere, units. */
   radius: number
@@ -102,8 +107,10 @@ const STATS: Record<ShipId, ShipStats> = {
     fireInterval: 0.085,
     damage: 5,
     boltSpeed: 1450,
+    boltLifetime: 2.6,
     barrels: 1,
     barrelSpread: 0,
+    salvoSpread: 0,
     radius: 9,
     bounty: 150,
     /**
@@ -127,7 +134,7 @@ const STATS: Record<ShipId, ShipStats> = {
     id: 'drone',
     name: 'Drone',
     callsign: 'BX-40 Bulwark',
-    tagline: 'A gun platform that happens to fly. Nothing here is in a hurry.',
+    tagline: 'Four bolts per salvo. Slow to turn, impossible to ignore.',
     accent: 0xffb020,
     hullColor: 0x453521,
     maxHull: 200,
@@ -136,16 +143,18 @@ const STATS: Record<ShipId, ShipStats> = {
     turnRate: 0.95,
     rollRate: 1.35,
     grip: 1.5,
-    fireInterval: 0.86,
-    damage: 20,
-    boltSpeed: 980,
-    barrels: 2,
+    fireInterval: 0.3,
+    damage: 9,
+    boltSpeed: 1700,
+    boltLifetime: 1,
+    barrels: 4,
     barrelSpread: 7.5,
+    salvoSpread: 0.013,
     radius: 14,
     bounty: 200,
     quirk: { kind: 'regen', delay: 6.5, rate: 9 },
-    strengths: ['Triple the Wasp hull', 'Twin siege cannons — two volleys end a Wasp'],
-    weaknesses: ['Slowest airframe, wallows through turns', 'Long reload punishes every miss'],
+    strengths: ['Triple the Wasp hull', 'Four-bolt cannon barrage — highest fleet firepower'],
+    weaknesses: ['Slowest airframe, wallows through turns', 'Wide salvo needs a steady aim at range'],
   },
 
   hornet: {
@@ -162,17 +171,16 @@ const STATS: Record<ShipId, ShipStats> = {
     rollRate: 2.25,
     grip: 2.6,
     /**
-     * The fleet standard is not supposed to also be the best gun in the fleet.
-     * At 12 x 2 per 0.22s it did 109 DPS — 2.3x the Drone's siege cannons and
-     * 5x the Wasp's, with no heat, no reload tell and a dash on top. A steadier
-     * 10 x 2 per 0.30s keeps the twin-laser rhythm and puts it 1.4x over the
-     * Drone instead: better than both, dominant over neither.
+     * The fleet standard keeps steady twin lasers and a dash. The Drone now
+     * owns the heavy-gun role, trading mobility for a four-bolt barrage.
      */
     fireInterval: 0.3,
     damage: 10,
     boltSpeed: 1180,
+    boltLifetime: 2.6,
     barrels: 2,
     barrelSpread: 5.4,
+    salvoSpread: 0,
     radius: 11,
     bounty: 120,
     quirk: { kind: 'dash', cooldown: 5, duration: 0.55, impulse: 900 },
@@ -241,6 +249,20 @@ const FLEET = Object.values(STATS)
 export const SHIPS: Record<ShipId, ShipSpec> = Object.fromEntries(
   Object.entries(STATS).map(([id, spec]) => [id, { ...spec, bars: deriveBars(spec, FLEET) }]),
 ) as Record<ShipId, ShipSpec>
+
+/** NPC Drones retain their original gun so the player buff does not retune PvE. */
+export const NPC_DRONE_GUN: Pick<ShipStats, 'fireInterval' | 'damage' | 'boltSpeed' | 'boltLifetime' | 'barrels' | 'salvoSpread'> = {
+  fireInterval: 0.86,
+  damage: 20,
+  boltSpeed: 980,
+  boltLifetime: 2.6,
+  barrels: 2,
+  salvoSpread: 0,
+}
+
+export function enemyShipSpec(id: ShipId): ShipSpec {
+  return id === 'drone' ? { ...SHIPS.drone, ...NPC_DRONE_GUN } : SHIPS[id]
+}
 
 export const SHIP_ORDER: ShipId[] = ['wasp', 'hornet', 'drone']
 

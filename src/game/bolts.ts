@@ -120,6 +120,11 @@ export interface FireRequest {
   damage: number
   faction: Faction
   color: THREE.Color
+  /** Optional shorter reach for dense salvos, in seconds of flight. */
+  lifetime?: number
+  /** Extra visual-only tracers for the local presentation pool. */
+  cosmeticTracers?: number
+  tracerAxis?: THREE.Vector3
 }
 
 export interface BoltHit {
@@ -130,7 +135,7 @@ export interface BoltHit {
   color: THREE.Color
 }
 
-const MAX_BOLTS = 420
+export const MAX_BOLTS = 420
 const BOLT_LIFETIME = 2.6
 const BOLT_RADIUS = 0.55
 const BOLT_LENGTH = 26
@@ -323,7 +328,7 @@ export function createBolts(): Bolts {
         bolt.pos.copy(req.origin)
         bolt.prev.copy(req.origin)
         bolt.vel.copy(req.direction).normalize().multiplyScalar(req.speed)
-        bolt.life = BOLT_LIFETIME
+        bolt.life = req.lifetime ?? BOLT_LIFETIME
         bolt.damage = req.damage
         bolt.faction = req.faction
         bolt.color.copy(req.color)

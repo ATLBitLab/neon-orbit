@@ -12,10 +12,10 @@
  *
  * Every duel is pinned: both hulls held in place at a fixed range with the
  * attacker's nose already on the target. That deliberately removes flying from
- * the question. These are ceilings — the damage an airframe lands if every
- * bolt connects — and the whole point of the Wasp is that nobody ever gets to
- * shoot it under laboratory conditions. Read the matrix as "who wins the
- * exchange neither pilot can dodge", not as "who wins".
+ * the question. The DPS dummy is a broadside Drone, so every bolt of its fan
+ * can connect. The matchup matrix also measures how many bolts a smaller hull
+ * actually catches. Read it as "who wins the exchange neither pilot can
+ * dodge", not as "who wins".
  *
  * Trigger policies:
  *   held       — trigger down and left down. Overheats, eats the lockout.
@@ -25,7 +25,7 @@
 
 import * as THREE from 'three'
 import type { Audio } from '../src/core/audio'
-import { createBolts, FACTION_AI, FACTION_PLAYER } from '../src/game/bolts'
+import { createBolts, FACTION_AI, FACTION_PLAYER, MAX_BOLTS } from '../src/game/bolts'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
 import {
   blastFraction,
@@ -36,10 +36,12 @@ import {
   SPOOL_TIME,
 } from '../src/game/bfg'
 import {
+  NPC_DRONE_GUN,
   SHIPS,
   SHIP_ORDER,
   alphaStrike,
   burstDps,
+  enemyShipSpec,
   sustainedDps,
   type ShipId,
   type ShipSpec,
@@ -299,7 +301,7 @@ function best(id: ShipId): number {
 }
 
 console.log('\nNEON ORBIT — balance harness')
-console.log(`  ${WINDOW}s samples, pinned at ${RANGE} units, every bolt on target.`)
+console.log(`  ${WINDOW}s samples, pinned at ${RANGE} units, Drone-sized DPS dummy.`)
 
 section('Guns')
 console.log(
@@ -438,6 +440,39 @@ for (const id of SHIP_ORDER) {
 
 section('Balance contract')
 
+/** The NPC keeps the original siege gun; PvE difficulty is a separate decision. */
+const npcDrone = enemyShipSpec('drone')
+check(
+  'NPC Drone keeps its original twin siege cannons',
+  npcDrone.barrels === 2 && npcDrone.damage === 20 && npcDrone.fireInterval === 0.86 && npcDrone.boltSpeed === 980,
+  `${npcDrone.barrels} × ${npcDrone.damage} every ${npcDrone.fireInterval}s at ${npcDrone.boltSpeed} units/s`,
+)
+
+/** A salvo must divide evenly across the visible muzzles on every airframe. */
+for (const id of SHIP_ORDER) {
+  const ship = new Ship(SHIPS[id], FACTION_PLAYER)
+  check(
+    `${SHIPS[id].name} divides its bolts across its muzzles`,
+    SHIPS[id].barrels % ship.visual.muzzles.length === 0,
+    `${SHIPS[id].barrels} bolts / ${ship.visual.muzzles.length} muzzles`,
+  )
+  ship.dispose()
+}
+
+/** Even a four-seat Overdrive Drone lobby plus three boosted NPC Drones fits. */
+const boostedPlayerBolts = Math.ceil(
+  SHIPS.drone.barrels / SHIPS.drone.fireInterval * OVERDRIVE_RATE_MULT * SHIPS.drone.boltLifetime,
+)
+const boostedNpcBolts = Math.ceil(
+  NPC_DRONE_GUN.barrels / NPC_DRONE_GUN.fireInterval * OVERDRIVE_RATE_MULT * NPC_DRONE_GUN.boltLifetime,
+)
+const peakDroneBolts = boostedPlayerBolts * 4 + boostedNpcBolts * 3
+check(
+  'four boosted Drone pilots and three boosted NPC Drones fit the bolt pool',
+  peakDroneBolts < MAX_BOLTS,
+  `${peakDroneBolts} live bolts / ${MAX_BOLTS} slots`,
+)
+
 /**
  * The design claim behind the heat quirk is that letting go of the trigger is a
  * skill. Before this harness existed it was the opposite: heat outran the vent
@@ -477,23 +512,26 @@ for (const id of SHIP_ORDER) {
 }
 
 /**
- * A fleet standard that also owns the best gun is not a choice, it is a default.
- * 1.6x top to bottom leaves room for a real firepower ranking without one
- * airframe deleting the other two; the Hornet sat at 2.3x over the Drone and
- * 5.2x over the Wasp before this.
+ * The slowest airframe now owns the largest gun: about 1.8x the Hornet's
+ * sustained DPS. Keep a cap on the fleet spread so the Drone cannot grow past
+ * the tradeoff its speed pays for. The old 1.6x cap protected a flatter fleet.
  */
 const gunSpread = Math.max(...SHIP_ORDER.map(best)) / Math.min(...SHIP_ORDER.map(best))
 check(
-  'no airframe runs away with the firepower ranking',
-  gunSpread < 1.6,
+  'the Drone leads by at least 50% over the Hornet',
+  best('drone') > best('hornet') * 1.5,
+  `Drone ${best('drone').toFixed(1)} vs Hornet ${best('hornet').toFixed(1)} DPS`,
+)
+check(
+  'the heavy-gun tradeoff stays below 3x fleet spread',
+  gunSpread < 3,
   `best-to-worst DPS spread is ${gunSpread.toFixed(2)}x`,
 )
 
 /**
  * Bars are derived, so this only fails if someone hand-writes them back in.
- * Pairs inside 5% of each other are exempt: the Wasp and the Drone currently
- * land within a percent, and which one sorts first is noise rather than a
- * claim. A card only has to be right about differences a pilot could feel.
+ * Pairs inside 5% of each other are exempt because that difference is too
+ * small for a player to feel. Larger gaps must match the cards.
  */
 for (const a of SHIP_ORDER) {
   for (const b of SHIP_ORDER) {
@@ -524,6 +562,17 @@ for (const [matchup, t] of ttk) {
     `${t.toFixed(2)}s`,
   )
 }
+
+/**
+ * Four fast bolts are a real threat, but the narrow fan keeps the Wasp from
+ * catching the full broadside at the standard duel range. Preserve the second
+ * it has to break away; the general 0.6s floor alone is too weak for this gun.
+ */
+check(
+  'a Wasp survives the Drone barrage for about a second',
+  ttk.get('drone>wasp')! >= 1,
+  `${ttk.get('drone>wasp')!.toFixed(2)}s`,
+)
 
 /**
  * The BFG is a moment, not a build. Two rounds spread over even a short

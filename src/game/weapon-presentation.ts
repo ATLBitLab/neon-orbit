@@ -1,4 +1,5 @@
 /** Local predicted tracers and sound. Never part of a snapshot or a damage decision. */
+import * as THREE from 'three'
 import type { Audio } from '../core/audio'
 import { createBolts, type BoltTarget, type FireRequest } from './bolts'
 import type { Hazard } from '../world/environment'
@@ -9,6 +10,9 @@ export function createWeaponPresentation(audio: Audio) {
   let presented = 0
   let volley = 0
   let fresh = false
+  let tracer = 0
+  const ghostDirection = new THREE.Vector3()
+  const up = new THREE.Vector3(0, 1, 0)
 
   return {
     mesh: bolts.mesh,
@@ -17,9 +21,18 @@ export function createWeaponPresentation(audio: Audio) {
     begin(shots: number) {
       volley = shots + 1
       fresh = volley > presented
+      tracer = 0
     },
     fire(request: FireRequest) {
-      if (fresh) bolts.fire({ ...request, damage: 0 })
+      if (!fresh) return
+      bolts.fire({ ...request, damage: 0 })
+      // One wider, non-damaging tracer beside each real Drone bolt sells the
+      // barrage locally without adding a single slot to the network snapshot.
+      for (let i = 0; i < (request.cosmeticTracers ?? 0); i++) {
+        const angle = (tracer++ % 2 === 0 ? -1 : 1) * 0.022
+        ghostDirection.copy(request.direction).applyAxisAngle(request.tracerAxis ?? up, angle)
+        bolts.fire({ ...request, direction: ghostDirection, damage: 0 })
+      }
     },
     laser() {
       if (!fresh) return
