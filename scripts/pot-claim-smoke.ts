@@ -8,6 +8,11 @@ import { PotLedger } from '../src/server/pot-ledger'
 
 const temp = await mkdtemp(join(tmpdir(), 'neon-pot-claim-'))
 const ledger = await PotLedger.open(join(temp, 'ledger.json'))
+const org = '5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29'
+const environment = '638fcc72-5f4b-4734-a2d6-8d0ef939b750'
+const wallet = '5272faf9-4644-4478-bc21-9f4b57b420a0'
+const paymentsPath = `/v1/organizations/${org}/environments/${environment}/payments`
+const walletPath = `/v1/organizations/${org}/wallets/${wallet}`
 await ledger.createRoom('REF123', 2, 100)
 const { claim } = await ledger.prepareSeat('REF123', 0)
 const other = await ledger.prepareSeat('REF123', 1)
@@ -25,6 +30,10 @@ await ledger.noteSendNotFound('REVIEW', 0, reviewSend.id)
 ledger.getRoom('REVIEW')!.entries[0].entitlement!.expiresAt = Date.now() - 1
 await ledger.noteSendNotFound('REVIEW', 0, reviewSend.id,
   reviewSend.notFoundSince! + 30 * 60_000 + 1)
+await ledger.createRoom('STRAND', 2, 100)
+const stranded = await ledger.prepareSeat('STRAND', 0)
+await ledger.update('STRAND', 0, 'uncertain')
+await ledger.interrupt('STRAND')
 // The listener process starts with no in-memory room and must convert this
 // persisted running match to two refunds before answering any claim request.
 const grossMsat = 100_000
@@ -37,7 +46,7 @@ let failNext = false
 let failedId = ''
 const mock = createServer(async (req, res) => {
   assert.equal(req.headers['x-api-key'], 'fake-only')
-  if (req.url?.endsWith('/wallets/5272faf9-4644-4478-bc21-9f4b57b420a0')) {
+  if (req.url === walletPath) {
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
       id: '5272faf9-4644-4478-bc21-9f4b57b420a0', network: 'mainnet',
       balances: [{ currency: 'btc', available: { amount: 100000, unit: 'msats', negative: false } }],
@@ -45,6 +54,7 @@ const mock = createServer(async (req, res) => {
     return
   }
   if (req.method === 'POST') {
+    assert.equal(req.url, paymentsPath, 'send POST retains the exact /v1 API path')
     postCount++
     const body = await new Promise<string>(resolve => {
       let value = ''
@@ -58,7 +68,11 @@ const mock = createServer(async (req, res) => {
     res.writeHead(202).end()
     return
   }
-  if (req.url?.endsWith(reviewSend.id)) { res.writeHead(404).end(); return }
+  assert.match(req.url ?? '', /^\/v1\/organizations\/5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29\/environments\/638fcc72-5f4b-4734-a2d6-8d0ef939b750\/payments\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    'send/receive GET retains /v1 and the payment UUID')
+  if (req.url?.endsWith(reviewSend.id) || req.url?.endsWith(stranded.entry.paymentId)) {
+    res.writeHead(404).end(); return
+  }
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
     id: req.url?.split('/').at(-1) ?? paymentId,
     wallet_id: '5272faf9-4644-4478-bc21-9f4b57b420a0',
@@ -110,6 +124,20 @@ try {
   }
   assert.equal((await fetch(`${base}/health`)).status, 200, 'bad HTTP bodies do not crash the server')
   const headers = { Authorization: `Bearer ${claim}` }
+  const strandedStatus = await fetch(`${base}/pot?room=STRAND&seat=0`, {
+    headers: { Authorization: `Bearer ${stranded.claim}` },
+  }).then(response => response.json()) as { state: string; invoice: string | null }
+  assert.deepEqual(strandedStatus, { paymentId: stranded.entry.paymentId,
+    state: 'uncertain', invoice: null }, 'restart leaves an unpaid receive inert')
+  const strandedDisk = JSON.parse(await readFile(join(temp, 'ledger.json'), 'utf8')) as {
+    rooms: { code: string; phase: string; entries: { entitlement?: unknown }[] }[]
+  }
+  const strandedRoom = strandedDisk.rooms.find(room => room.code === 'STRAND')!
+  assert.equal(strandedRoom.phase, 'refunding')
+  assert.equal(strandedRoom.entries[0].entitlement, undefined,
+    'an uncreated receive creates no refund liability after restart')
+  assert(!stderr.includes('pot reconciliation failed'),
+    'an uncreated receive does not error during startup reconciliation')
   const reviewStatus = await fetch(`${base}/pot/claim?room=REVIEW&seat=0`, {
     headers: { Authorization: `Bearer ${reviewSeat.claim}` },
   }).then(response => response.json()) as { state: string; expiresAt: number | null; lnurl?: string }

@@ -9,9 +9,11 @@ import WebSocket from 'ws'
 const dir = await mkdtemp(join(tmpdir(), 'neon-pot-server-'))
 let postCount = 0
 const settled = new Set()
+const paymentsPath = '/v1/organizations/5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29/environments/638fcc72-5f4b-4734-a2d6-8d0ef939b750/payments'
 const mock = createServer(async (req, res) => {
   assert.equal(req.headers['x-api-key'], 'mock-key')
   if (req.method === 'POST') {
+    assert.equal(req.url, paymentsPath, 'receive POST retains the /v1 API prefix')
     postCount++
     const body = JSON.parse(await new Promise(resolve => {
       let value = ''
@@ -23,6 +25,7 @@ const mock = createServer(async (req, res) => {
     return
   }
   const id = req.url.split('/').at(-1)
+  assert.equal(req.url, `${paymentsPath}/${id}`, 'receive GET uses the exact payment-ID path')
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
     id, wallet_id: '5272faf9-4644-4478-bc21-9f4b57b420a0',
     organization_id: '5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29',

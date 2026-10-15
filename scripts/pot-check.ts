@@ -5,10 +5,20 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PotLedger } from '../src/server/pot-ledger'
 import { VoltageReceive } from '../src/server/voltage-receive'
+import { voltageUrl } from '../src/server/voltage-url'
 
 const org = '5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29'
 const environment = '638fcc72-5f4b-4734-a2d6-8d0ef939b750'
 const wallet = '5272faf9-4644-4478-bc21-9f4b57b420a0'
+const paymentsPath = `/v1/organizations/${org}/environments/${environment}/payments`
+assert.equal(voltageUrl('https://voltageapi.com/v1',
+  `organizations/${org}/environments/${environment}/payments`),
+`https://voltageapi.com${paymentsPath}`, 'production API base retains /v1')
+assert.equal(voltageUrl('https://voltageapi.com/v1/',
+  `organizations/${org}/environments/${environment}/payments`),
+`https://voltageapi.com${paymentsPath}`, 'trailing slash does not duplicate /v1')
+assert.throws(() => voltageUrl('https://voltageapi.com/v1', '/organizations/x'),
+  /relative/, 'an absolute path cannot silently discard /v1')
 const dir = await mkdtemp(join(tmpdir(), 'neon-pot-'))
 const path = join(dir, 'ledger.json')
 let postCount = 0
@@ -16,9 +26,11 @@ let paymentStatus = 'generating'
 let amount = 100000
 let firstId = ''
 let dropPost = false
+let postStatus = 202
 const mock = createServer(async (req, res) => {
   assert.equal(req.headers['x-api-key'], 'mock-key')
   if (req.method === 'POST') {
+    assert.equal(req.url, paymentsPath, 'receive POST retains the /v1 API prefix')
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(Buffer.from(chunk))
     const body = JSON.parse(Buffer.concat(chunks).toString())
@@ -33,10 +45,11 @@ const mock = createServer(async (req, res) => {
     postCount++
     firstId = body.id
     if (dropPost) { req.socket.destroy(); return }
-    res.writeHead(202).end()
+    res.writeHead(postStatus).end()
     return
   }
   const id = req.url?.split('/').at(-1)
+  assert.equal(req.url, `${paymentsPath}/${firstId}`, 'receive GET uses the exact payment-ID path')
   assert.equal(id, firstId)
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
     id, wallet_id: wallet, organization_id: org, environment_id: environment,
@@ -92,6 +105,20 @@ try {
   assert.equal(afterRestart.getRoom('TEST43')!.entries[0].state, 'uncertain')
   assert.equal((await new VoltageReceive(afterRestart, config).poll('TEST43', 0)).state, 'completed')
   assert.equal(postCount, 2, 'uncertain write reconciled without a second POST')
+
+  await afterRestart.createRoom('TEST44', 2, 100)
+  await afterRestart.prepareSeat('TEST44', 0)
+  postStatus = 503
+  const logged: unknown[][] = []
+  const originalError = console.error
+  console.error = (...values: unknown[]) => { logged.push(values) }
+  try {
+    assert.equal((await new VoltageReceive(afterRestart, config).submit('TEST44', 0)).state,
+      'uncertain', 'a non-202/409 POST outcome stays uncertain')
+  } finally { console.error = originalError }
+  assert.equal((logged[0]?.[1] as { status?: number })?.status, 503,
+    'receive POST logs the unexpected HTTP status')
+  assert(!JSON.stringify(logged).includes('mock-key'), 'receive error log excludes the API key')
   console.log('pot ledger + mocked Voltage receive checks pass')
 } finally {
   mock.close()
