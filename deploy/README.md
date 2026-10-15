@@ -4,6 +4,12 @@ The deployed hostname is `104-131-185-100.sslip.io` on the Neon Orbit droplet
 (`104.131.185.100`). Caddy terminates TLS and forwards WebSocket traffic to
 Node on loopback port 8080. The process admits twelve connected players across
 rooms, with two to four seats per match. Rooms live only in process memory.
+During a running match, a dropped player's seat is held for 12 seconds. The
+server gives each seat a 256-bit resume token after WELCOME; RETRY sends it
+back to reclaim that seat. A room code alone cannot join a running match.
+The AI flies the seat while it is vacant, and a seat whose token expires stays
+AI. If all players drop, the room closes when the last grace window expires.
+Restarting the process ends all rooms and invalidates all tokens.
 
 The match and client input run at 60 Hz. This listener sends a full world
 snapshot every second tick (30 Hz), with no change to the browser-hosted WebRTC
@@ -62,8 +68,10 @@ when `VITE_SERVER_URL` is configured.
 and returns a code. WebSocket clients connect to `/ws?room=CODE`; game frames
 use the existing binary session protocol, while JSON control frames handle
 room launch and hull changes. A finished room closes ten seconds after its
-result, and an empty room closes immediately. An unjoined room expires after
+result. An empty running room waits for its last resume window before closing;
+an unjoined room expires after
 about one minute; occupied lobbies expire after 30 minutes of inactivity.
 One IP may create at most three rooms and hold six connections, while the
 server allows twelve players globally so a shared Wi-Fi can fill a room
-without excluding other IPs. There is no reconnect in this slice.
+without excluding other IPs. A resume token is private to its seat and is never
+included in the copied room link.

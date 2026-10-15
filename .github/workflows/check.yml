@@ -34,6 +34,20 @@ jobs:
 
       - run: npm run build
 
+      - run: npm run build:server
+
+      - name: Dedicated socket and resume regressions
+        run: |
+          PORT=8080 node dist-server/listener.mjs &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then break; fi
+            sleep 0.1
+          done
+          npm run check:server
+          npm run check:server-resume
+
       - run: npm run check:server-isolation
 
   # Separate job: it runs the whole simulation suite once per mutation, so it is

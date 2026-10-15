@@ -34,10 +34,12 @@ export async function createServerRoom(endpoint: string, seats: number): Promise
 
 export function joinServer(
   game: Game, endpoint: string, code: string, ship: ShipId, handlers: JoinHandlers,
+  resumeToken?: string,
 ): Promise<Joining> {
   const url = new URL('/ws', endpoint)
   url.protocol = url.protocol === 'https:' || url.protocol === 'wss:' ? 'wss:' : 'ws:'
   url.searchParams.set('room', code)
+  if (resumeToken) url.searchParams.set('resume', resumeToken)
   const socket = new WebSocket(url)
   socket.binaryType = 'arraybuffer'
   return new Promise((resolve, reject) => {
@@ -68,7 +70,11 @@ export function joinServer(
       if (typeof event.data === 'string') {
         try {
           const message = JSON.parse(event.data) as {
-            type: string; message?: string; creator?: boolean; launcherSeat?: number
+            type: string; message?: string; creator?: boolean; launcherSeat?: number; token?: string
+          }
+          if (message.type === 'resume' && typeof message.token === 'string' &&
+              /^[A-Za-z0-9_-]{43}$/.test(message.token)) {
+            handlers.onServerResumeToken?.(message.token)
           }
           if (message.type === 'error') {
             const reason = message.message ?? 'server error'
