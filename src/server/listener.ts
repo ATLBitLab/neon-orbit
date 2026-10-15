@@ -195,22 +195,29 @@ function clientIp(request: IncomingMessage): string {
     ? String(request.headers['x-real-ip'] ?? direct) : direct
 }
 server.on('upgrade', (request: IncomingMessage, socket, head) => {
-  const url = new URL(request.url ?? '/', 'http://localhost')
-  const room = rooms.get(url.searchParams.get('room')?.toUpperCase() ?? '')
-  const ip = clientIp(request)
-  const sameIp = members().filter(member => member.ip === ip)
-  if (url.pathname !== '/ws' || !room || room.state !== 'lobby' ||
-      room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
-      sameIp.length >= MAX_CONNECTIONS_PER_IP ||
-      sameIp.filter(member => !member.hello).length >= MAX_PENDING_PER_IP) {
-    socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n')
+  try {
+    const url = new URL(request.url ?? '/', 'http://localhost')
+    const room = rooms.get(url.searchParams.get('room')?.toUpperCase() ?? '')
+    const ip = clientIp(request)
+    const sameIp = members().filter(member => member.ip === ip)
+    if (url.pathname !== '/ws' || !room || room.state !== 'lobby' ||
+        room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
+        sameIp.length >= MAX_CONNECTIONS_PER_IP ||
+        sameIp.filter(member => !member.hello).length >= MAX_PENDING_PER_IP) {
+      socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n')
+      socket.destroy()
+      return
+    }
+    wss.handleUpgrade(request, socket, head, ws => {
+      clientIps.set(ws, ip)
+      wss.emit('connection', ws, room)
+    })
+  } catch {
+    // A malformed request target can make URL parsing throw. Reject just this
+    // connection; an uncaught upgrade error would end every active match.
+    try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n') } catch { /* already closed */ }
     socket.destroy()
-    return
   }
-  wss.handleUpgrade(request, socket, head, ws => {
-    clientIps.set(ws, ip)
-    wss.emit('connection', ws, room)
-  })
 })
 
 function connectSocket(socket: WebSocket, room: Room): void {
@@ -220,6 +227,7 @@ function connectSocket(socket: WebSocket, room: Room): void {
   const closers: (() => void)[] = []
   let closed = false
   let notified = false
+  let policyControlClose = false
   let count = 0
   let second = Math.floor(Date.now() / 1000)
   const channel: Member['channel'] = {
@@ -277,10 +285,22 @@ function connectSocket(socket: WebSocket, room: Room): void {
       channel.receive(new Uint8Array(bytes))
       return
     }
-    let message: { type?: string; ship?: unknown }
-    try { message = JSON.parse(String(data)) } catch { socket.close(1008, 'invalid control'); return }
-    if (message.type === 'ship' && room.state === 'lobby' && member.hello &&
-        SHIP_ORDER.includes(message.ship as ShipId)) {
+    let parsed: unknown
+    try { parsed = JSON.parse(String(data)) } catch {
+      policyControlClose = true
+      socket.close(1008, 'invalid control'); return
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      policyControlClose = true
+      socket.close(1008, 'invalid control'); return
+    }
+    const message = parsed as Record<string, unknown>
+    if ((message.type !== 'ship' && message.type !== 'start') ||
+        (message.type === 'ship' && !SHIP_ORDER.includes(message.ship as ShipId))) {
+      policyControlClose = true
+      socket.close(1008, 'invalid control'); return
+    }
+    if (message.type === 'ship' && room.state === 'lobby' && member.hello) {
       member.ship = message.ship as ShipId
       member.shipChosen = true
       broadcast(room)
@@ -301,7 +321,7 @@ function connectSocket(socket: WebSocket, room: Room): void {
       for (const handler of closers) handler()
       const index = room.members.indexOf(member)
       if (index >= 0) room.members.splice(index, 1)
-      if (room.members.length === 0 || (seat === 0 && room.state === 'lobby')) closeRoom(room)
+      if (room.members.length === 0 || (seat === 0 && room.state === 'lobby' && !policyControlClose)) closeRoom(room)
       else if (room.state === 'lobby') broadcast(room)
     })
   })

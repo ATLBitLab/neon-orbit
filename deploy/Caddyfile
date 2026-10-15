@@ -1,6 +1,16 @@
 104-131-185-100.sslip.io {
     encode zstd gzip
-    reverse_proxy 127.0.0.1:8080 {
-        header_up X-Real-IP {remote_host}
+    # Only well-formed app paths reach Node, including during a future redeploy.
+    @app {
+        path /ws /rooms /health
+        expression "!{http.request.orig_uri}.startsWith(\"//\")"
+    }
+    handle @app {
+        reverse_proxy 127.0.0.1:8080 {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle {
+        respond 404
     }
 }
