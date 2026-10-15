@@ -1173,6 +1173,15 @@ body {
   max-width: min(560px, 90vw);
 }
 
+.pot-claim {
+  pointer-events: auto;
+}
+
+.pot-claim[hidden],
+.pot-claim [hidden] {
+  display: none;
+}
+
 .panel h2 {
   font-family: var(--font-display);
   font-weight: 900;
