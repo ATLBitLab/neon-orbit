@@ -2,7 +2,7 @@
     encode zstd gzip
     # Only well-formed app paths reach Node, including during a future redeploy.
     @app {
-        path /ws /rooms /health
+        path /ws /rooms /pot /health
         expression "!{http.request.orig_uri}.startsWith(\"//\")"
     }
     handle @app {

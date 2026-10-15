@@ -7,6 +7,8 @@ import { decodeResumeToken } from '../net/resume'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { createDedicatedMatch } from './match'
 import { DEDICATED_SNAPSHOT_EVERY } from './snapshot-rate'
+import { PotLedger } from './pot-ledger'
+import { VoltageReceive } from './voltage-receive'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const MAX_ROOMS = 8
@@ -23,6 +25,16 @@ const EMPTY_ROOM_MS = 60_000
 const END_GRACE_MS = 10_000
 const RESUME_GRACE_MS = 12_000
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const POT_ENABLED = process.env.POT_ENABLED === '1'
+const potLedger = POT_ENABLED
+  ? await PotLedger.open(process.env.POT_LEDGER_PATH ?? '/var/lib/neon-orbit/pot-ledger.json') : null
+const voltage = potLedger ? new VoltageReceive(potLedger, {
+  baseUrl: process.env.VOLTAGE_API_URL ?? 'https://voltageapi.com/v1',
+  organizationId: '5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29',
+  environmentId: '638fcc72-5f4b-4734-a2d6-8d0ef939b750',
+  walletId: '5272faf9-4644-4478-bc21-9f4b57b420a0',
+  apiKey: process.env.VOLTAGE_API_KEY ?? '',
+}) : null
 
 interface Member {
   channel: Channel & { receive(bytes: Uint8Array): void; control(value: object): void }
@@ -58,9 +70,11 @@ interface Room {
   timer: ReturnType<typeof setInterval> | null
   expiry: ReturnType<typeof setTimeout> | null
   lastActivity: number
+  potBuyInSats: number | null
 }
 
 const rooms = new Map<string, Room>()
+const creatingRooms = new Map<string, string>()
 const clientIps = new WeakMap<WebSocket, string>()
 const pendingResumes = new Map<WebSocket, string>()
 
@@ -84,12 +98,18 @@ function code(): string {
   for (;;) {
     const bytes = randomBytes(6)
     const next = [...bytes].map(b => CODE_ALPHABET[b % CODE_ALPHABET.length]).join('')
-    if (!rooms.has(next)) return next
+    if (!rooms.has(next) && !creatingRooms.has(next)) return next
   }
 }
 
 function totalPlayers(): number {
   return members().length
+}
+
+function availableSeat(room: Room): number | undefined {
+  return Array.from({ length: room.seats }, (_, i) => i).find(i =>
+    !room.members.some(member => member.seat === i) &&
+    (room.potBuyInSats === null || !potLedger?.getRoom(room.code)?.entries.some(entry => entry.seat === i)))
 }
 
 function reply(res: import('node:http').ServerResponse, status: number, body: object): void {
@@ -98,7 +118,7 @@ function reply(res: import('node:http').ServerResponse, status: number, body: ob
     'Cache-Control': 'no-store',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   })
   res.end(JSON.stringify(body))
 }
@@ -176,6 +196,9 @@ function guardRoom(room: Room, phase: string, operation: () => void): void {
 
 function startRoom(room: Room): string | null {
   if (room.state !== 'lobby') return null
+  // Pot launch/payout arrives in the later PRs. Never let a paid room run
+  // until the whole money path is present and reviewed.
+  if (room.potBuyInSats !== null) return 'pot matches are not ready to launch'
   if (room.members.filter(member => member.hello).length < 2) {
     return 'at least two players must join before launch'
   }
@@ -216,12 +239,46 @@ const server = createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     reply(res, 200, { ok: true, rooms: rooms.size, players: totalPlayers() }); return
   }
+  if (req.url?.startsWith('/pot?') && req.method === 'GET') {
+    if (!potLedger || !voltage) { reply(res, 404, { error: 'not found' }); return }
+    const url = new URL(req.url, 'http://localhost')
+    const code = url.searchParams.get('room') ?? ''
+    const seat = Number(url.searchParams.get('seat'))
+    const claim = req.headers.authorization?.replace(/^Bearer /, '') ?? ''
+    if (!potLedger.ownsSeat(code, seat, claim)) { reply(res, 403, { error: 'invalid claim' }); return }
+    void voltage.poll(code, seat).then(entry => reply(res, 200, {
+      paymentId: entry.paymentId, state: entry.state, invoice: entry.invoice,
+    })).catch(() => reply(res, 503, { error: 'payment status unavailable' }))
+    return
+  }
+  if (req.url === '/pot' && req.method === 'POST') {
+    if (!potLedger || !voltage) { reply(res, 404, { error: 'not found' }); return }
+    let body = ''
+    req.on('data', chunk => { body += String(chunk); if (body.length > 1024) req.destroy() })
+    req.on('end', () => {
+      let code: string, seat: number
+      try {
+        const parsed = JSON.parse(body) as { code: string; seat: number }
+        code = parsed.code; seat = parsed.seat
+      } catch { reply(res, 400, { error: 'invalid request' }); return }
+      const claim = req.headers.authorization?.replace(/^Bearer /, '') ?? ''
+      if (!potLedger.ownsSeat(code, seat, claim)) { reply(res, 403, { error: 'invalid claim' }); return }
+      void (async () => {
+        const current = potLedger.getRoom(code)!.entries.find(item => item.seat === seat)!
+        if (current.state === 'prepared') await voltage.submit(code, seat)
+        const entry = await voltage.pollUntilInvoice(code, seat)
+        reply(res, 200, { paymentId: entry.paymentId, state: entry.state, invoice: entry.invoice })
+      })().catch(() => reply(res, 503, { error: 'payment unavailable' }))
+    })
+    return
+  }
   if (req.method === 'POST' && req.url === '/rooms') {
     const ip = clientIp(req)
-    if ([...rooms.values()].filter(room => room.creatorIp === ip).length >= MAX_ROOMS_PER_IP) {
+    if ([...rooms.values()].filter(room => room.creatorIp === ip).length +
+        [...creatingRooms.values()].filter(value => value === ip).length >= MAX_ROOMS_PER_IP) {
       reply(res, 429, { error: 'too many rooms from this IP' }); return
     }
-    if (rooms.size >= MAX_ROOMS || totalPlayers() >= MAX_PLAYERS) {
+    if (rooms.size + creatingRooms.size >= MAX_ROOMS || totalPlayers() >= MAX_PLAYERS) {
       reply(res, 503, { error: 'server full' }); return
     }
     let body = ''
@@ -230,23 +287,38 @@ const server = createServer((req, res) => {
       if (body.length > 1024) req.destroy()
     })
     req.on('end', () => {
-      let seats: number
-      try { seats = JSON.parse(body).seats } catch { reply(res, 400, { error: 'invalid request' }); return }
+      let seats: number, potBuyInSats: number | null
+      try {
+        const parsed = JSON.parse(body) as { seats: number; pot?: { buyInSats: number } }
+        seats = parsed.seats
+        potBuyInSats = parsed.pot === undefined ? null : (parsed.pot?.buyInSats ?? NaN)
+      } catch { reply(res, 400, { error: 'invalid request' }); return }
       if (!Number.isInteger(seats) || seats < 2 || seats > 4) {
         reply(res, 400, { error: 'seats must be 2 to 4' }); return
       }
+      if (potBuyInSats !== null && (!potLedger || !Number.isInteger(potBuyInSats) ||
+          potBuyInSats < 1 || potBuyInSats > 1000)) {
+        reply(res, 400, { error: 'pot unavailable or invalid buy-in' }); return
+      }
       // Recheck after reading the body because another request may have created a room.
-      if ([...rooms.values()].filter(room => room.creatorIp === ip).length >= MAX_ROOMS_PER_IP) {
+      if ([...rooms.values()].filter(room => room.creatorIp === ip).length +
+          [...creatingRooms.values()].filter(value => value === ip).length >= MAX_ROOMS_PER_IP) {
         reply(res, 429, { error: 'too many rooms from this IP' }); return
       }
-      if (rooms.size >= MAX_ROOMS || totalPlayers() >= MAX_PLAYERS) {
+      if (rooms.size + creatingRooms.size >= MAX_ROOMS || totalPlayers() >= MAX_PLAYERS) {
         reply(res, 503, { error: 'server full' }); return
       }
       const room: Room = { code: code(), creatorIp: ip, seats, members: [], resumes: new Map(), state: 'lobby',
         revision: 0, nextJoinOrder: 0,
-        match: null, timer: null, expiry: null, lastActivity: Date.now() }
-      rooms.set(room.code, room)
-      reply(res, 201, { code: room.code, seats })
+        match: null, timer: null, expiry: null, lastActivity: Date.now(), potBuyInSats }
+      creatingRooms.set(room.code, ip)
+      void (async () => {
+        if (potBuyInSats !== null) await potLedger!.createRoom(room.code, seats, potBuyInSats)
+        creatingRooms.delete(room.code)
+        rooms.set(room.code, room)
+        reply(res, 201, { code: room.code, seats,
+          ...(potBuyInSats === null ? {} : { pot: { buyInSats: potBuyInSats } }) })
+      })().catch(() => { creatingRooms.delete(room.code); reply(res, 503, { error: 'room unavailable' }) })
     })
     return
   }
@@ -277,6 +349,7 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
     if (url.pathname !== '/ws' || !room ||
         (room.state !== 'lobby' && !reservation && !frameResume) ||
         (room.state === 'lobby' && resumeToken !== null) ||
+        (room.state === 'lobby' && availableSeat(room) === undefined) ||
         room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
         sameIp.length + [...pendingResumes.values()].filter(value => value === ip).length >= MAX_CONNECTIONS_PER_IP ||
         sameIp.filter(member => !member.hello).length +
@@ -305,8 +378,7 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
 })
 
 function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReservation): void {
-  const seat = reservation?.seat ?? Array.from({ length: room.seats }, (_, i) => i).find(i =>
-    !room.members.some(m => m.seat === i))!
+  const seat = reservation?.seat ?? availableSeat(room)!
   const messages: ((bytes: Uint8Array) => void)[] = []
   const closers: (() => void)[] = []
   let closed = false
@@ -362,11 +434,18 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
     let ship: ShipId
     try { ship = decodeHello(bytes) } catch { channel.close(); return }
     if (!member.shipChosen) member.ship = ship
-    if (!member.hello) member.joinedAt = ++room.nextJoinOrder
+    const firstHello = !member.hello
+    if (firstHello) member.joinedAt = ++room.nextJoinOrder
     member.hello = bytes
     clearTimeout(helloTimeout)
     room.lastActivity = Date.now()
     broadcast(room)
+    if (firstHello && room.potBuyInSats !== null && potLedger) {
+      void potLedger.prepareSeat(room.code, seat).then(({ entry, claim }) => {
+        if (member.channel.open) channel.control({ type: 'pot', seat, buyInSats: room.potBuyInSats,
+          paymentId: entry.paymentId, claim })
+      }).catch(error => guardRoom(room, 'pot seat', () => { throw error }))
+    }
   })
   socket.on('message', (data, binary) => guardRoom(room, 'message', () => {
     const bytes = data instanceof ArrayBuffer ? new Uint8Array(data)
