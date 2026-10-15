@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { PotLedger } from '../src/server/pot-ledger'
+import { PotLedger, entitlementExpired } from '../src/server/pot-ledger'
 import { VoltageSend } from '../src/server/voltage-send'
 import { encodeLnurl, fixedMainnetInvoiceAmount } from '../src/server/lnurl'
 import { potLaunchAction } from '../src/ui/pot-launch'
@@ -158,12 +158,61 @@ try {
   const recoveredLedger = await PotLedger.open(path)
   const recoveredSend = recoveredLedger.getRoom('NFD123')!.entries[0].entitlement!.sends[0]
   assert.equal(typeof recoveredSend.notFoundSince, 'number', 'first 404 is durable across restart')
-  recoveredSend.notFoundSince = Date.now() - 30 * 60_000 - 1
+  const expiredEntitlement = recoveredLedger.getRoom('NFD123')!.entries[0].entitlement!
+  expiredEntitlement.expiresAt = Date.now() - 1
+  assert.equal(entitlementExpired(expiredEntitlement), false,
+    'the 24-hour claim cannot expire while a send is uncertain')
+  await assert.rejects(() => recoveredLedger.failAbsentSend(uncertain.id), /not uniquely pending/,
+    'operator cannot clear an ambiguous send before reconciliation state')
+  assert.equal((await recoveredLedger.noteSendNotFound('NFD123', 0, uncertain.id,
+    recoveredSend.notFoundSince! + 30 * 60_000 + 1)).state, 'needs-reconcile')
+  assert.equal(entitlementExpired(expiredEntitlement), false,
+    'an ambiguous send cannot expire its entitlement')
+  assert.equal((await PotLedger.open(path)).nextPayout('NFD123', 0), null,
+    'persistent 404 never reopens a second payment automatically')
   const recoveredSender = new VoltageSend(recoveredLedger, config, absentMock)
-  assert.equal((await recoveredSender.poll('NFD123', 0, uncertain.id)).state, 'failed')
-  assert((await PotLedger.open(path)).nextPayout('NFD123', 0),
-    'persistent 404 durably reopens the claim after 30 minutes')
+  assert.equal((await recoveredSender.poll('NFD123', 0, uncertain.id)).state, 'needs-reconcile',
+    'GET polling continues after the operator flag')
+  assert.equal(uncertainPosts, 1, 'no later GET 404 retries the original POST')
+  assert.deepEqual(await recoveredLedger.failAbsentSend(uncertain.id),
+    { code: 'NFD123', seat: 0 }, 'operator may clear the confirmed-absent UUID')
+  await assert.rejects(() => recoveredLedger.failAbsentSend(uncertain.id), /not uniquely pending/,
+    'operator exit is single-use')
+  assert(recoveredLedger.nextPayout('NFD123', 0),
+    'manual clearance renews the entitlement and reopens its claim')
+  assert.equal((await PotLedger.open(path)).getRoom('NFD123')!.entries[0].entitlement!
+    .sends[0].state, 'failed', 'manual clearance is durable')
   assert.equal(uncertainPosts, 1, 'uncertain UUID was never reposted')
+
+  await recoveredLedger.createRoom('LATE12', 2, 100)
+  await recoveredLedger.prepareSeat('LATE12', 0)
+  await recoveredLedger.update('LATE12', 0, 'completed')
+  await recoveredLedger.interrupt('LATE12')
+  await recoveredLedger.ensureRefunds('LATE12')
+  const late = await recoveredLedger.prepareSend('LATE12', 0, 'lnbc980n1' + 'q'.repeat(60))
+  let lateVisible = false
+  let latePosts = 0
+  const lateMock = (async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    if (String(url).endsWith('/wallets/wallet')) return Response.json({ id: 'wallet', network: 'mainnet',
+      balances: [{ currency: 'btc', available: { amount: 200_000, unit: 'msats', negative: false } }] })
+    if (init?.method === 'POST') { latePosts++; throw new Error('lost response') }
+    return lateVisible ? Response.json({ id: late.id, wallet_id: 'wallet', organization_id: 'org',
+      environment_id: 'env', direction: 'send', type: 'bolt11', status: 'completed',
+      data: { amount: { currency: 'btc', amount: late.amountMsat },
+        fees: { currency: 'btc', unit: 'msats', amount: 1000 } } })
+      : new Response(null, { status: 404 })
+  }) as typeof fetch
+  const lateSender = new VoltageSend(recoveredLedger, config, lateMock)
+  assert.equal((await lateSender.submit('LATE12', 0, late.id)).state, 'uncertain')
+  await lateSender.poll('LATE12', 0, late.id)
+  await recoveredLedger.noteSendNotFound('LATE12', 0, late.id,
+    late.notFoundSince! + 30 * 60_000 + 1)
+  lateVisible = true
+  assert.equal((await lateSender.poll('LATE12', 0, late.id)).state, 'completed',
+    'a late Voltage completion resolves a flagged UUID without retrying its POST')
+  assert.equal(latePosts, 1)
+  assert.equal(recoveredLedger.getRoom('LATE12')!.entries[0].entitlement!.sends.length, 1,
+    'a late completion cannot create a second send')
 
   await reopened.createRoom('REF123', 2, 100)
   await reopened.prepareSeat('REF123', 0)

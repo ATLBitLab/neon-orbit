@@ -3,7 +3,7 @@ import { open, readFile, rename, mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 export type ReceiveState = 'prepared' | 'submitted' | 'uncertain' | 'receiving' | 'completed' | 'failed' | 'expired'
-export type SendState = 'prepared' | 'uncertain' | 'submitted' | 'sending' | 'completed' | 'failed'
+export type SendState = 'prepared' | 'uncertain' | 'needs-reconcile' | 'submitted' | 'sending' | 'completed' | 'failed'
 
 export interface PotSend {
   id: string
@@ -17,7 +17,7 @@ export interface PotSend {
   networkFeeMsat?: number
   processingFeeMsat?: number
   totalFeeMsat?: number
-  /** First confirmed GET 404 after a possibly accepted POST. */
+  /** First confirmed GET 404 after a possibly accepted POST; never proof of failure. */
   notFoundSince?: number
 }
 
@@ -261,7 +261,7 @@ export class PotLedger {
     const entry = this.rooms.get(code)?.entries.find(item => item.seat === seat)
     const entitlement = entry?.entitlement
     const next = entitlement ? nextPayout(entitlement) : null
-    if (!next || Date.now() >= entitlement!.expiresAt) throw new Error('claim unavailable')
+    if (!next || entitlementExpired(entitlement!)) throw new Error('claim unavailable')
     const now = Date.now()
     const send: PotSend = { id: randomUUID(), invoice, amountMsat: next.amountMsat,
       maxFeeMsat: next.maxFeeMsat, state: 'prepared', createdAt: now, updatedAt: now }
@@ -273,27 +273,38 @@ export class PotLedger {
 
   nextPayout(code: string, seat: number): { amountMsat: number; maxFeeMsat: number } | null {
     const entitlement = this.rooms.get(code)?.entries.find(item => item.seat === seat)?.entitlement
-    if (!entitlement || Date.now() >= entitlement.expiresAt) return null
+    if (!entitlement || entitlementExpired(entitlement)) return null
     return nextPayout(entitlement)
   }
 
   async updateSend(code: string, seat: number, id: string, state: SendState,
     fees?: { networkFeeMsat?: number; processingFeeMsat?: number; totalFeeMsat: number }): Promise<PotSend> {
     return this.serial(async () => {
-    const send = this.rooms.get(code)?.entries.find(item => item.seat === seat)
-      ?.entitlement?.sends.find(item => item.id === id)
+    const entitlement = this.rooms.get(code)?.entries.find(item => item.seat === seat)?.entitlement
+    const send = entitlement?.sends.find(item => item.id === id)
     if (!send) throw new Error('send unavailable')
     const previous = { state: send.state, updatedAt: send.updatedAt,
       networkFeeMsat: send.networkFeeMsat, processingFeeMsat: send.processingFeeMsat,
-      totalFeeMsat: send.totalFeeMsat }
+      totalFeeMsat: send.totalFeeMsat, expiresAt: entitlement!.expiresAt }
     send.state = state; send.updatedAt = Date.now()
     if (fees) Object.assign(send, fees)
-    try { await this.persist() } catch (error) { Object.assign(send, previous); throw error }
+    if (['uncertain', 'needs-reconcile', 'submitted', 'sending'].includes(previous.state) &&
+        (state === 'completed' || state === 'failed')) {
+      entitlement!.expiresAt = Math.max(entitlement!.expiresAt, Date.now() + DAY)
+    }
+    try { await this.persist() } catch (error) {
+      send.state = previous.state; send.updatedAt = previous.updatedAt
+      send.networkFeeMsat = previous.networkFeeMsat
+      send.processingFeeMsat = previous.processingFeeMsat
+      send.totalFeeMsat = previous.totalFeeMsat
+      entitlement!.expiresAt = previous.expiresAt
+      throw error
+    }
     return send
     })
   }
 
-  /** A 404 is only conclusive after it persists across the reconciliation window. */
+  /** Persistent 404 needs an operator; it never proves that a send did not execute. */
   async noteSendNotFound(code: string, seat: number, id: string, now = Date.now()): Promise<PotSend> {
     return this.serial(async () => {
       const send = this.rooms.get(code)?.entries.find(item => item.seat === seat)
@@ -301,15 +312,38 @@ export class PotLedger {
       if (!send) throw new Error('send unavailable')
       // A 202 or a previously visible payment is known to exist. Never infer
       // its failure from a later 404; only an ambiguous POST can time out.
-      if (send.state !== 'uncertain') return send
+      if (send.state !== 'uncertain' && send.state !== 'needs-reconcile') return send
       const previous = { state: send.state, notFoundSince: send.notFoundSince, updatedAt: send.updatedAt }
       if (send.notFoundSince === undefined) send.notFoundSince = now
-      else if (now - send.notFoundSince >= 30 * 60_000) {
-        send.state = 'failed'
+      else if (send.state === 'uncertain' && now - send.notFoundSince >= 30 * 60_000) {
+        send.state = 'needs-reconcile'
         send.updatedAt = now
       } else return send
       try { await this.persist() } catch (error) { Object.assign(send, previous); throw error }
       return send
+    })
+  }
+
+  /** Offline operator action, after the payment UUID is confirmed absent in Voltage. */
+  async failAbsentSend(id: string): Promise<{ code: string; seat: number }> {
+    return this.serial(async () => {
+      const matches = [...this.rooms.values()].flatMap(room => room.entries.flatMap(entry =>
+        entry.entitlement?.sends.filter(send => send.id === id).map(send => ({ room, entry, send })) ?? []))
+      if (matches.length !== 1 || matches[0].send.state !== 'needs-reconcile') {
+        throw new Error('send is not uniquely pending operator reconciliation')
+      }
+      const { room, entry, send } = matches[0]
+      const entitlement = entry.entitlement!
+      const previous = { state: send.state, updatedAt: send.updatedAt, expiresAt: entitlement.expiresAt }
+      send.state = 'failed'
+      send.updatedAt = Date.now()
+      entitlement.expiresAt = Math.max(entitlement.expiresAt, Date.now() + DAY)
+      try { await this.persist() } catch (error) {
+        send.state = previous.state; send.updatedAt = previous.updatedAt
+        entitlement.expiresAt = previous.expiresAt
+        throw error
+      }
+      return { code: room.code, seat: entry.seat }
     })
   }
 
@@ -405,6 +439,15 @@ function entitlement(kind: PotEntitlement['kind'], grossMsat: number): PotEntitl
   return { kind, grossMsat, amountMsat: grossMsat - reserveMsat,
     maxFeeMsat: reserveMsat - processingBudget,
     expiresAt: Date.now() + DAY, sends: [] }
+}
+
+export function hasPendingSend(value: PotEntitlement): boolean {
+  return value.sends.some(send => ['uncertain', 'needs-reconcile', 'submitted', 'sending']
+    .includes(send.state))
+}
+
+export function entitlementExpired(value: PotEntitlement, now = Date.now()): boolean {
+  return now >= value.expiresAt && !hasPendingSend(value)
 }
 
 function nextPayout(value: PotEntitlement): { amountMsat: number; maxFeeMsat: number } | null {

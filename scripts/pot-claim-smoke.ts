@@ -14,6 +14,17 @@ const other = await ledger.prepareSeat('REF123', 1)
 await ledger.update('REF123', 0, 'completed')
 await ledger.update('REF123', 1, 'completed')
 await ledger.launch('REF123', [0, 1])
+await ledger.createRoom('REVIEW', 2, 100)
+const reviewSeat = await ledger.prepareSeat('REVIEW', 0)
+await ledger.update('REVIEW', 0, 'completed')
+await ledger.interrupt('REVIEW')
+await ledger.ensureRefunds('REVIEW')
+const reviewSend = await ledger.prepareSend('REVIEW', 0, 'lnbc980n1' + 'q'.repeat(60))
+await ledger.updateSend('REVIEW', 0, reviewSend.id, 'uncertain')
+await ledger.noteSendNotFound('REVIEW', 0, reviewSend.id)
+ledger.getRoom('REVIEW')!.entries[0].entitlement!.expiresAt = Date.now() - 1
+await ledger.noteSendNotFound('REVIEW', 0, reviewSend.id,
+  reviewSend.notFoundSince! + 30 * 60_000 + 1)
 // The listener process starts with no in-memory room and must convert this
 // persisted running match to two refunds before answering any claim request.
 const grossMsat = 100_000
@@ -47,6 +58,7 @@ const mock = createServer(async (req, res) => {
     res.writeHead(202).end()
     return
   }
+  if (req.url?.endsWith(reviewSend.id)) { res.writeHead(404).end(); return }
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
     id: req.url?.split('/').at(-1) ?? paymentId,
     wallet_id: '5272faf9-4644-4478-bc21-9f4b57b420a0',
@@ -98,6 +110,12 @@ try {
   }
   assert.equal((await fetch(`${base}/health`)).status, 200, 'bad HTTP bodies do not crash the server')
   const headers = { Authorization: `Bearer ${claim}` }
+  const reviewStatus = await fetch(`${base}/pot/claim?room=REVIEW&seat=0`, {
+    headers: { Authorization: `Bearer ${reviewSeat.claim}` },
+  }).then(response => response.json()) as { state: string; expiresAt: number | null; lnurl?: string }
+  assert.equal(reviewStatus.state, 'needs-reconcile', 'persistent 404 is player-visible as under review')
+  assert.equal(reviewStatus.expiresAt, null, 'ambiguous payout cannot expire after 24 hours')
+  assert.equal(reviewStatus.lnurl, undefined, 'an unresolved payout never offers a second invoice')
   const status = await fetch(`${base}/pot/claim?room=REF123&seat=0`, { headers })
   assert.equal(status.status, 200)
   const body = await status.json() as { kind: string; state: string; lnurl: string }

@@ -8,7 +8,7 @@ import { decodeStatsSession, STATS_SESSION_FRAME } from '../net/stats-session'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { createDedicatedMatch } from './match'
 import { DEDICATED_SNAPSHOT_EVERY } from './snapshot-rate'
-import { PotLedger } from './pot-ledger'
+import { PotLedger, entitlementExpired, hasPendingSend } from './pot-ledger'
 import { VoltageReceive } from './voltage-receive'
 import { createMatchStats, departureOf, StatsLog, type MatchStats, type Outcome } from './stats'
 import { VoltageSend } from './voltage-send'
@@ -385,7 +385,7 @@ async function claimStatus(code: string, seat: number) {
   return { phase: potLedger?.getRoom(code)?.phase ?? 'lobby',
     kind: entitlement?.kind ?? null, amountMsat: next?.amountMsat ?? latest?.amountMsat ??
       entitlement?.amountMsat ?? null,
-    expiresAt: entitlement?.expiresAt ?? null,
+    expiresAt: entitlement && !hasPendingSend(entitlement) ? entitlement.expiresAt : null,
     state: next ? 'claimable' : latest?.state ?? (entitlement ? 'claimable' : entry.state),
     paymentId: latest?.id ?? null,
     feeNotice: 'Payout or refund is the funded amount less a bounded Lightning fee allowance; unused reserve can be claimed again.' }
@@ -394,7 +394,7 @@ async function claimStatus(code: string, seat: number) {
 async function sendClaim(code: string, seat: number, invoice: string) {
   const entry = potLedger?.getRoom(code)?.entries.find(item => item.seat === seat)
   const entitlement = entry?.entitlement
-  if (!entitlement || !voltageSend || !potLedger || Date.now() >= entitlement.expiresAt) {
+  if (!entitlement || !voltageSend || !potLedger || entitlementExpired(entitlement)) {
     throw new Error('claim unavailable or expired')
   }
   const active = entitlement.sends.find(send => send.state !== 'failed' && send.state !== 'completed')
@@ -445,7 +445,7 @@ const server = createServer((req, res) => {
       const entry = potLedger.getRoom(owner.code)?.entries.find(item => item.seat === owner.seat)
       const entitlement = entry?.entitlement
       if (!entitlement || !potLedger.nextPayout(owner.code, owner.seat) ||
-          Date.now() >= entitlement.expiresAt) { reply(res, 200, status); return }
+          entitlementExpired(entitlement)) { reply(res, 200, status); return }
       for (const [key, link] of withdrawLinks) {
         if (link.code === owner.code && link.seat === owner.seat) withdrawLinks.delete(key)
       }
@@ -517,7 +517,7 @@ const server = createServer((req, res) => {
     if (url.pathname === '/lnurlw') {
       const entitlement = potLedger?.getRoom(link.code)?.entries.find(item => item.seat === link.seat)?.entitlement
       const next = potLedger?.nextPayout(link.code, link.seat)
-      if (!entitlement || !next || Date.now() >= entitlement.expiresAt) {
+      if (!entitlement || !next || entitlementExpired(entitlement)) {
         reply(res, 404, { status: 'ERROR', reason: 'claim expired' }); return
       }
       const callback = new URL('/lnurlw/cb', POT_PUBLIC_URL)

@@ -44,7 +44,9 @@ export function createPotClaimPanel(parent: HTMLElement) {
     heading.textContent = status.kind === 'winner' ? 'POT WINNER' : 'BUY-IN REFUND'
     note.textContent = status.state === 'completed'
       ? `${amount} sats paid. Payment ID: ${status.paymentId ?? 'unknown'}`
-      : status.state === 'failed' ? 'The payment failed. You may try a fresh invoice.'
+      : status.state === 'needs-reconcile'
+        ? `Payout under review. Payment ID: ${status.paymentId ?? 'pending'}. Your claim remains open; please check back later.`
+        : status.state === 'failed' ? 'The payment failed. You may try a fresh invoice.'
         : status.state === 'claimable' ? status.paymentId
           ? `A prior payment completed. Withdraw the remaining ${amount} sats within 24 hours.`
           : `Withdraw ${amount} sats within 24 hours.`

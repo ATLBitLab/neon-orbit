@@ -187,9 +187,12 @@ after this trial; the owner does not play for money before it passes.
    retry. Never send a second payment to compensate for an uncertain first.
    If a send remains uncertain, look up its persisted UUID with Voltage
    `GET /v1/organizations/<org>/environments/<env>/payments/<uuid>` and in
-   the dashboard; verify wallet, direction, amount, and status. A GET 404 must persist for 30 minutes
-   before the server reopens the claim; manually confirm the old UUID is still
-   absent before submitting a fresh invoice. Record both UUIDs for audit.
+   the dashboard; verify wallet, direction, amount, and status. After 30
+   minutes of 404s the server marks it `needs-reconcile` and shows the player
+   **Payout under review**. It keeps polling the original UUID and never
+   reopens the claim from a 404 alone. An ambiguous send's entitlement does
+   not expire while it is unresolved. Record the UUID for audit; do not try a
+   new invoice until a terminal Voltage result or the offline procedure below.
 4. Set `POT_ENABLED=0` in the root-owned environment file and restart only
    after all active rooms have ended. Confirm `/pot` returns 404, free room
    creation/launch still works, and `journalctl -u neon-orbit` has no payout
@@ -204,6 +207,31 @@ after this trial; the owner does not play for money before it passes.
    or reserve and rerun the trial before leaving pot mode enabled. Record each
    buy-in and send UUID and any sub-2-sat dust retained in the ledger. Keep the
    ledger backup until reconciled.
+
+### Offline reconciliation of an ambiguous send
+
+This is a PM/operator action, never a player action. A GET 404, even after 30
+minutes, is **not** proof that Voltage did not execute the payment. Check the
+UUID in Voltage's payments list or dashboard for the correct organization,
+environment and wallet. If it is present, leave the ledger alone: the server
+will poll it to `completed` or `failed`. If and only if the operator confirms
+the UUID was never created, wait for all live rooms to end and stop the service.
+As root on the droplet, make a private backup and run the offline CLI:
+
+```sh
+systemctl stop neon-orbit
+cp -p /var/lib/neon-orbit/pot-ledger.json /root/pot-ledger.before-reconcile.json
+node /opt/neon-orbit/dist-server/pot-reconcile.mjs <confirmed-absent-uuid> --confirmed-absent
+systemctl start neon-orbit
+```
+
+The CLI refuses to run without root, while the service is active, or unless
+that exact UUID is in `needs-reconcile`. It drops to the ledger's service-user
+identity before writing, so the restarted listener retains file access. The
+single-use action marks only that send `failed` and gives its owner a fresh
+24-hour claim window. Keep the backup and both old/new UUIDs until the new
+send completes. During the PM trial, leave `POT_ENABLED=0` again after all
+payments reconcile.
 
 ## Client preview
 

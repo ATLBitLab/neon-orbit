@@ -20,6 +20,7 @@ interface Payment {
 /** A send ID is durable before its first POST. An uncertain POST is GET-only. */
 export class VoltageSend {
   private readonly submissions = new Map<string, Promise<PotSend>>()
+  private readonly warnedReconciles = new Set<string>()
   constructor(private readonly ledger: PotLedger, private readonly config: VoltageConfig,
     private readonly fetcher: typeof fetch = fetch) {
     const url = new URL(config.baseUrl)
@@ -110,7 +111,14 @@ export class VoltageSend {
     let response: Response
     try { response = await this.request(this.paymentUrl(id), { method: 'GET' }) }
     catch { return send }
-    if (response.status === 404) return this.ledger.noteSendNotFound(code, seat, id)
+    if (response.status === 404) {
+      const current = await this.ledger.noteSendNotFound(code, seat, id)
+      if (current.state === 'needs-reconcile' && !this.warnedReconciles.has(id)) {
+        console.error('[neon-orbit] pot payout needs reconciliation', { room: code, seat, paymentId: id })
+        this.warnedReconciles.add(id)
+      }
+      return current
+    }
     if (!response.ok) return send
     let payment: Payment
     try { payment = await response.json() as Payment } catch { return send }
