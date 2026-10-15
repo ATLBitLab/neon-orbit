@@ -57,7 +57,7 @@ import { createSeats, isParticipant, seatOf } from '../src/game/roster'
 import { createDevHook, installDevHook, type DevHook } from '../src/core/dev-hook'
 import { createScreens, type PauseHost, type Screen } from '../src/ui/screens'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
-import { SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
+import { NPC_DRONE_GUN, SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
 import {
   ARENA_HARD_LIMIT,
   ARENA_RADIUS,
@@ -1643,6 +1643,7 @@ function testPickups(): void {
    * let a boosted Drone delete a Wasp between frames.
    */
   const boostedBolt = new Ship(SHIPS.drone, FACTION_PLAYER)
+  const isolatedBolts = createBolts()
   boostedBolt.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
   boostedBolt.warpTimer = 0
   boostedBolt.engageOverdrive(OVERDRIVE_DURATION)
@@ -1659,14 +1660,15 @@ function testPickups(): void {
     mark.hull = mark.spec.maxHull
     mark.position.set(0, 0, -400)
     mark.velocity.set(0, 0, 0)
-    boostedBolt.step(controls({ fire: true }), STEP, ctx)
-    bolts.update(STEP, [boostedBolt, mark], [])
+    boostedBolt.step(controls({ fire: true }), STEP, { ...ctx, bolts: isolatedBolts })
+    isolatedBolts.update(STEP, [boostedBolt, mark], [])
   }
   check(
     'a boosted bolt still does exactly its spec damage',
     biggestHit === SHIPS.drone.damage,
     `${biggestHit} vs spec ${SHIPS.drone.damage}`,
   )
+  isolatedBolts.dispose()
 
   /* Stack, not refresh. */
   gunner.overdriveTimer = 0
@@ -4945,6 +4947,7 @@ function testShootingAParticipantPays(): void {
     droneRadius: SHIPS.drone.radius,
     waspDamage: SHIPS.wasp.damage,
     droneDamage: SHIPS.drone.damage,
+    npcDroneDamage: NPC_DRONE_GUN.damage,
   }
   SHIPS.hornet.maxHull = 40
   SHIPS.hornet.radius = 350
@@ -4954,6 +4957,7 @@ function testShootingAParticipantPays(): void {
   SHIPS.drone.radius = 0.001
   SHIPS.wasp.damage = 0
   SHIPS.drone.damage = 0
+  NPC_DRONE_GUN.damage = 0
 
   function fly(localSeat: number) {
     const hud = feedRecordingHud()
@@ -4983,6 +4987,7 @@ function testShootingAParticipantPays(): void {
   SHIPS.drone.radius = original.droneRadius
   SHIPS.wasp.damage = original.waspDamage
   SHIPS.drone.damage = original.droneDamage
+  NPC_DRONE_GUN.damage = original.npcDroneDamage
 
   const [zero, one] = from0.views
   const deaths = (zero?.deaths ?? 0) + (one?.deaths ?? 0)
@@ -5042,6 +5047,7 @@ function testAMinePaysTheLastHitter(): void {
     droneRadius: SHIPS.drone.radius,
     waspDamage: SHIPS.wasp.damage,
     droneDamage: SHIPS.drone.damage,
+    npcDroneDamage: NPC_DRONE_GUN.damage,
     hornetHull: SHIPS.hornet.maxHull,
     hornetDamage: SHIPS.hornet.damage,
   }
@@ -5053,6 +5059,7 @@ function testAMinePaysTheLastHitter(): void {
   SHIPS.drone.radius = 350
   SHIPS.wasp.damage = 0
   SHIPS.drone.damage = 0
+  NPC_DRONE_GUN.damage = 0
   SHIPS.hornet.maxHull = 1e6
   SHIPS.hornet.damage = 0.1
   const SENTINEL = 350
@@ -5165,6 +5172,7 @@ function testAMinePaysTheLastHitter(): void {
   SHIPS.drone.radius = original.droneRadius
   SHIPS.wasp.damage = original.waspDamage
   SHIPS.drone.damage = original.droneDamage
+  NPC_DRONE_GUN.damage = original.npcDroneDamage
   SHIPS.hornet.maxHull = original.hornetHull
   SHIPS.hornet.damage = original.hornetDamage
 }
@@ -5236,6 +5244,7 @@ function testTheMatchEndsOnEveryMachine(): void {
     droneHull: SHIPS.drone.maxHull,
     waspDamage: SHIPS.wasp.damage,
     droneDamage: SHIPS.drone.damage,
+    npcDroneDamage: NPC_DRONE_GUN.damage,
     waspRadius: SHIPS.wasp.radius,
     droneRadius: SHIPS.drone.radius,
   }
@@ -5243,6 +5252,7 @@ function testTheMatchEndsOnEveryMachine(): void {
   SHIPS.drone.maxHull = 30
   SHIPS.wasp.damage = 0
   SHIPS.drone.damage = 0
+  NPC_DRONE_GUN.damage = 0
   SHIPS.wasp.radius = 350
   SHIPS.drone.radius = 350
   const SENTINEL = 350
@@ -5317,6 +5327,7 @@ function testTheMatchEndsOnEveryMachine(): void {
   SHIPS.drone.maxHull = original.droneHull
   SHIPS.wasp.damage = original.waspDamage
   SHIPS.drone.damage = original.droneDamage
+  NPC_DRONE_GUN.damage = original.npcDroneDamage
   SHIPS.wasp.radius = original.waspRadius
   SHIPS.drone.radius = original.droneRadius
 
@@ -5674,6 +5685,7 @@ function testAWinWaitsForEveryExplosion(): void {
     droneHull: SHIPS.drone.maxHull,
     waspDamage: SHIPS.wasp.damage,
     droneDamage: SHIPS.drone.damage,
+    npcDroneDamage: NPC_DRONE_GUN.damage,
     waspRadius: SHIPS.wasp.radius,
     droneRadius: SHIPS.drone.radius,
   }
@@ -5684,6 +5696,7 @@ function testAWinWaitsForEveryExplosion(): void {
   SHIPS.drone.maxHull = 30
   SHIPS.wasp.damage = 0
   SHIPS.drone.damage = 0
+  NPC_DRONE_GUN.damage = 0
   SHIPS.wasp.radius = 350
   SHIPS.drone.radius = 350
 
@@ -5791,6 +5804,7 @@ function testAWinWaitsForEveryExplosion(): void {
   SHIPS.drone.maxHull = original.droneHull
   SHIPS.wasp.damage = original.waspDamage
   SHIPS.drone.damage = original.droneDamage
+  NPC_DRONE_GUN.damage = original.npcDroneDamage
   SHIPS.wasp.radius = original.waspRadius
   SHIPS.drone.radius = original.droneRadius
   check(
@@ -5825,6 +5839,7 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
     droneHull: SHIPS.drone.maxHull,
     waspDamage: SHIPS.wasp.damage,
     droneDamage: SHIPS.drone.damage,
+    npcDroneDamage: NPC_DRONE_GUN.damage,
     waspRadius: SHIPS.wasp.radius,
     droneRadius: SHIPS.drone.radius,
   }
@@ -5833,6 +5848,7 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
   SHIPS.drone.maxHull = 30
   SHIPS.wasp.damage = 0
   SHIPS.drone.damage = 0
+  NPC_DRONE_GUN.damage = 0
   SHIPS.wasp.radius = 350
   SHIPS.drone.radius = 350
   const SENTINEL = 350
@@ -5917,6 +5933,7 @@ function testAnEliminatedSeatDoesNotInheritTheWin(): void {
   SHIPS.drone.maxHull = original.droneHull
   SHIPS.wasp.damage = original.waspDamage
   SHIPS.drone.damage = original.droneDamage
+  NPC_DRONE_GUN.damage = original.npcDroneDamage
   SHIPS.wasp.radius = original.waspRadius
   SHIPS.drone.radius = original.droneRadius
 
@@ -7193,7 +7210,7 @@ function testARunMatchesItsRecordedBaseline(): void {
     wasp:
       '0/0/0/70/235.30300057403224/0 | 55/0/19/70/445.3298881633059/2 | 100/0/59/70/292.3947361912082/3 | 115/0/84/70/442.1328492907095/3',
     drone:
-      '0/0/0/200/125.05555269793625/0 | 0/0/1/180/207.80567967883238/2 | 20/0/5/175/233.0433285191874/3 | 20/0/7/165/197.12698816305436/3',
+      '0/0/0/200/125.05555269793625/0 | 0/0/2/180/208.07734173024517/2 | 18/0/12/175/232.03821959823935/3 | 18/0/18/175/194.53175177624726/3',
   }
 
   function fly(ship: ShipId): string {
@@ -7918,7 +7935,24 @@ function testPredictedWeaponsAreOnlyPresentation(): void {
   check('a new match can present its first volley again', visible() === 1 && audio.laserCount === 2)
   weapons.advance(3, [], [])
   check('missed cosmetic tracers expire', visible() === 0)
+  weapons.clear(); weapons.begin(0)
+  weapons.fire({ ...shot, cosmeticTracers: 1, tracerAxis: new THREE.Vector3(0, 1, 0) })
+  check('a Drone shot adds a client-only tracer', visible() === 2)
   weapons.dispose()
+
+  const flashBolts = createBolts()
+  const flashShip = new Ship(SHIPS.drone, FACTION_PLAYER)
+  flashShip.spawn(new THREE.Vector3(), new THREE.Vector3(0, 0, -1000))
+  flashShip.warpTimer = 0
+  const flashCtx: ShipContext = { hazards: [], audio: silentAudio(), bolts: flashBolts, localFaction: FACTION_PLAYER }
+  flashShip.step(controls({ fire: true }), STEP, flashCtx)
+  flashShip.syncVisual()
+  const lit = flashShip.visual.muzzleFlashes.length === 2 && flashShip.visual.muzzleFlashes.every(m => m.visible)
+  for (let i = 0; i < 5; i++) flashShip.step(controls(), STEP, flashCtx)
+  flashShip.syncVisual()
+  check('Drone muzzle flashes light for one volley then fade', lit && flashShip.visual.muzzleFlashes.every(m => !m.visible))
+  flashShip.dispose()
+  flashBolts.dispose()
 
   const bolts = createBolts()
   bolts.fire(shot); bolts.fire({ ...shot, faction: FACTION_AI })

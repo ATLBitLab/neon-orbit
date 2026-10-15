@@ -6,14 +6,18 @@ import { encodeHello, FRAME } from '../src/net/session'
 import { encodeIntent } from '../src/net/wire'
 import { createDedicatedMatch } from '../src/server/match'
 import { DEDICATED_SNAPSHOT_EVERY } from '../src/server/snapshot-rate'
+import type { ShipId } from '../src/ships/specs'
 
 const seconds = Number(process.argv[2] ?? 60)
 const clients = Number(process.argv[3] ?? 4)
 const snapshotEvery = Number(process.argv[4] && process.argv[4] !== '--enforce-budget'
   ? process.argv[4] : DEDICATED_SNAPSHOT_EVERY)
 const enforceBudget = process.argv.includes('--enforce-budget')
-/** Representative four-seat synthetic load; live traffic still needs monitoring. */
-const PER_CLIENT_BUDGET_BYTES_PER_SECOND = 130_000
+const allDrone = process.argv.includes('--all-drone')
+const allHornet = process.argv.includes('--all-hornet')
+if (allDrone && allHornet) throw new RangeError('choose one roster override')
+/** Main's four-Hornet roster already sends about 138 KB/s at 30 Hz. */
+const PER_CLIENT_BUDGET_BYTES_PER_SECOND = 160_000
 if (!Number.isInteger(seconds) || seconds < 1 || seconds > 600) {
   throw new RangeError('duration must be an integer from 1 to 600 simulated seconds')
 }
@@ -22,7 +26,10 @@ if (!Number.isInteger(snapshotEvery) || snapshotEvery < 1) {
   throw new RangeError('snapshotEvery must be a positive integer')
 }
 const started = performance.now()
-const match = createDedicatedMatch({ setup: { ships: (['hornet', 'wasp', 'drone', 'hornet'] as const).slice(0, clients),
+const ships = (allDrone ? ['drone', 'drone', 'drone', 'drone']
+  : allHornet ? ['hornet', 'hornet', 'hornet', 'hornet']
+  : ['hornet', 'wasp', 'drone', 'hornet']).slice(0, clients) as ShipId[]
+const match = createDedicatedMatch({ setup: { ships,
   seed: 0x5120fa11, respawn: true }, snapshotEvery })
 const startupMs = performance.now() - started
 let bytes = 0
@@ -69,7 +76,7 @@ try {
   timings.sort((a, b) => a - b)
   console.log(JSON.stringify({
     node: process.version, cpu: cpus()[0]?.model, platform: process.platform,
-    clients, snapshotEvery, seed: match.seed, simulatedSeconds, result: !!match.result,
+    clients, ships, snapshotEvery, seed: match.seed, simulatedSeconds, result: !!match.result,
     startupMs, stepMeanMs: timings.reduce((a, b) => a + b, 0) / timings.length,
     stepP95Ms: timings[Math.ceil(timings.length * 0.95) - 1], stepMaxMs: timings.at(-1),
     cpuMs: (cpu.user + cpu.system) / 1000, rssMiB: process.memoryUsage().rss / 1024 ** 2,

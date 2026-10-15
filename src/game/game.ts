@@ -27,7 +27,7 @@ import { createWeaponPresentation } from './weapon-presentation'
 import type { Input } from '../core/input'
 import { STREAM, subRng, type Rng } from '../core/rng'
 import type { MatchResult, RunResult, SeatLine } from '../core/scores'
-import { otherShips, SHIPS, type ShipId } from '../ships/specs'
+import { enemyShipSpec, otherShips, SHIPS, type ShipId } from '../ships/specs'
 import {
   ARENA_HARD_LIMIT,
   ARENA_RADIUS,
@@ -836,7 +836,7 @@ export function createGame(deps: GameDeps): Game {
     if (!id || seats.length === 0) return
 
     const index = pilotsSpawned++
-    const ship = new Ship(SHIPS[id], FACTION_AI, subRng(runSeed, STREAM.enemyGuns + index))
+    const ship = new Ship(enemyShipSpec(id), FACTION_AI, subRng(runSeed, STREAM.enemyGuns + index))
     pickSpawnPoint(_spawnPos)
     fightCentre(_anchor)
     ship.spawn(_spawnPos, _anchor)
@@ -1872,7 +1872,7 @@ export function createGame(deps: GameDeps): Game {
       seen.add(hull.id)
       let pilot = pilots.find((p) => pilotIds.get(p) === hull.id)
       if (!pilot) {
-        const ship = new Ship(SHIPS[hull.spec], FACTION_AI)
+        const ship = new Ship(enemyShipSpec(hull.spec), FACTION_AI)
         ship.position.set(hull.ship.position.x, hull.ship.position.y, hull.ship.position.z)
         ship.quaternion.set(
           hull.ship.quaternion.x,

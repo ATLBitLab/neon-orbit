@@ -20,6 +20,10 @@ export interface ShipVisual {
   thrusters: THREE.Object3D[]
   /** Gun muzzle offsets in ship-local space. */
   muzzles: THREE.Vector3[]
+  /** Local-only flashes, driven by the weapon clock. */
+  muzzleFlashes: THREE.Mesh[]
+  muzzleFlashMat: THREE.MeshBasicMaterial | null
+  muzzleFlashGeometry: THREE.BufferGeometry | null
   hullMat: THREE.MeshPhongMaterial
   trimMat: THREE.LineBasicMaterial
   /** Canopy and running-light glow. */
@@ -333,6 +337,22 @@ export function buildShip(spec: ShipSpec): ShipVisual {
   group.add(new THREE.LineSegments(baked.edges, trimMat))
   group.add(new THREE.Mesh(baked.accent, accentMat))
 
+  const muzzleFlashGeometry = spec.id === 'drone' ? new THREE.IcosahedronGeometry(2.6, 0) : null
+  const muzzleFlashMat = spec.id === 'drone' ? new THREE.MeshBasicMaterial({
+    color: 0xffd37a, transparent: true, opacity: 0.9,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }) : null
+  const muzzleFlashes: THREE.Mesh[] = []
+  if (muzzleFlashGeometry && muzzleFlashMat) {
+    for (const m of baked.muzzles) {
+      const flash = new THREE.Mesh(muzzleFlashGeometry, muzzleFlashMat)
+      flash.position.copy(m).z -= 3
+      flash.visible = false
+      group.add(flash)
+      muzzleFlashes.push(flash)
+    }
+  }
+
   const thrusters: THREE.Object3D[] = baked.thrusters.map((t) => {
     const flare = thrusterMesh(t.radius * 0.78, t.length * 0.8, thrusterMat)
     flare.position.set(t.x, t.y, t.z)
@@ -358,6 +378,9 @@ export function buildShip(spec: ShipSpec): ShipVisual {
     hullMesh,
     thrusters,
     muzzles: baked.muzzles.map((m) => m.clone()),
+    muzzleFlashes,
+    muzzleFlashMat,
+    muzzleFlashGeometry,
     hullMat,
     trimMat,
     accentMat,
@@ -375,6 +398,8 @@ export function disposeShipVisual(v: ShipVisual): void {
   v.accentMat.dispose()
   v.thrusterMat.dispose()
   v.shieldMat.dispose()
+  v.muzzleFlashMat?.dispose()
+  v.muzzleFlashGeometry?.dispose()
   v.shieldMesh.geometry.dispose()
   for (const t of v.thrusters) {
     if (t instanceof THREE.Mesh) t.geometry.dispose()
