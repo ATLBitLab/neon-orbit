@@ -113,6 +113,21 @@ export function placeLines(lines: SeatLine[]): void {
   }
 }
 
+/** Authoritative single winner for paid human seats; AI backfill is ineligible. */
+export function awardPotWinner(lines: SeatLine[], humanSeats: readonly number[]): number {
+  const humans = lines.filter(line => humanSeats.includes(line.seat))
+  if (humans.length < 2) throw new Error('pot result needs two human entrants')
+  const survivors = humans.filter(line => line.alive)
+  const eligible = survivors.length ? survivors : humans
+  const winner = eligible.slice().sort((a, b) => b.score - a.score || a.seat - b.seat)[0]
+  for (const line of lines) line.won = line === winner
+  const rest = lines.filter(line => line !== winner)
+    .sort((a, b) => a.place - b.place || a.seat - b.seat)
+  winner.place = 1
+  rest.forEach((line, index) => { line.place = index + 2 })
+  return winner.seat
+}
+
 /** Hulls of each non-chosen type that make up the squadron. */
 const PER_ENEMY_TYPE = 3
 /** How many enemies are airborne at once. */
@@ -218,6 +233,8 @@ export type RunEnd = (result: RunResult) => void
  */
 export interface MatchSetup {
   ships: ShipId[]
+  /** Dedicated pot policy. These seats paid to enter; empty seats are AI and cannot win. */
+  potHumans?: number[]
   /**
    * The seat this machine presents: camera, HUD, alarms, gun pitch. Defaults to
    * seat 0. Presentation only — see the note at the top of this file.
@@ -524,6 +541,7 @@ export function createGame(deps: GameDeps): Game {
   /** Index into `seats` of the seat this machine draws. Presentation only. */
   let localIndex = 0
   let respawns = false
+  let potHumans: number[] | null = null
 
   let pilots: EnemyPilot[] = []
   let queue: ShipId[] = []
@@ -1272,6 +1290,7 @@ export function createGame(deps: GameDeps): Game {
       }
     })
     placeLines(lines)
+    if (potHumans) awardPotWinner(lines, potHumans)
     return { time: elapsed, cleared, lines }
   }
 
@@ -2199,6 +2218,15 @@ export function createGame(deps: GameDeps): Game {
       if (!active) return
     }
 
+    if (potHumans && potHumans.every(index => seats[index]?.phase.kind !== 'wrecked')) {
+      const survivingHumans = potHumans.filter(index =>
+        seats[index]?.phase.kind === 'flying' && seats[index].ship.alive)
+      if (survivingHumans.length <= 1) {
+        resolveMatch(false)
+        return
+      }
+    }
+
     /* A cleared squadron is still the win, and still the only one. With more than
        one seat in the arena it is a *placing*: `sealMatch` pays every seat still
        flying for finishing, ranks them, and the seats placed first have won.
@@ -2444,6 +2472,7 @@ export function createGame(deps: GameDeps): Game {
       respawnRng = subRng(runSeed, STREAM.respawn)
 
       respawns = setup.respawn ?? false
+      potHumans = setup.potHumans ?? null
       seats = built
       acks = seats.map(() => -1)
       localIndex = drawnSeatIndex(setup.local, seats.length)

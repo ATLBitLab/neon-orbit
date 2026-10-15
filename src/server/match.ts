@@ -51,7 +51,7 @@ export function createHeadlessGame() {
 }
 
 export interface DedicatedOptions {
-  setup: Pick<MatchSetup, 'seed' | 'respawn'> & { ships: ShipId[] }
+  setup: Pick<MatchSetup, 'seed' | 'respawn' | 'potHumans'> & { ships: ShipId[] }
   snapshotEvery?: number
 }
 
