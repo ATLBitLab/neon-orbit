@@ -462,7 +462,7 @@ export interface GameDeps {
   environment: Environment
   input: Input
   audio: Audio
-  hud: Hud
+  hud: Omit<Hud, 'root'>
   bestScoreFor(ship: ShipId): number
   onEnd: RunEnd
 }

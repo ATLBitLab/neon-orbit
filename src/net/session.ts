@@ -213,6 +213,8 @@ export interface HostStats {
 export interface HostOptions {
   game: Game
   setup: MatchSetup & { ships: ShipId[] }
+  /** No browser owns seat 0: every seat accepts a peer or AI backfill. */
+  dedicated?: boolean
   /** Send a snapshot every this many ticks. 1 is every tick. */
   snapshotEvery?: number
   /**
@@ -227,7 +229,7 @@ export interface HostOptions {
 }
 
 export interface Host {
-  /** Begin the match. Seat 0 is the host's own; the rest wait for peers. */
+  /** Begin the match. Browser hosts reserve seat 0; dedicated hosts reserve none. */
   start(): void
   /**
    * Hand a connected channel a seat. Returns the seat, or -1 if there was none —
@@ -235,10 +237,10 @@ export interface Host {
    */
   accept(channel: Channel, reservedSeat?: number): number
   /**
-   * Fly one tick: the host's own intent for seat 0, the latest admitted intent
-   * (or a hold) for every remote seat, then a snapshot to every peer.
+   * Fly one tick: local controls for a browser host, admitted remote intents or
+   * AI for the other seats. Dedicated hosts take no local controls.
    */
-  tick(local: Controls): void
+  tick(local?: Controls): void
   close(): void
   readonly stats: HostStats
   readonly peers: number
@@ -269,15 +271,16 @@ export function createHost(options: HostOptions): Host {
   const seed = (options.setup.seed ?? ((Math.random() * 0xffffffff) >>> 0)) >>> 0
   const setup = { ...options.setup, seed, local: 0 }
   const seatCount = setup.ships.length
+  const firstRemote = options.dedicated ? 0 : 1
 
   const peers: (Peer | null)[] = Array.from({ length: seatCount }, () => null)
   const intents: Controls[] = Array.from({ length: seatCount }, () => neutral())
   const holds: Controls[] = Array.from({ length: seatCount }, () => neutral())
   const scratch: Controls = neutral()
   // One per seat that can be empty, seeded per seat so two wingmen do not fly
-  // the same line and a seed replays the same match. Seat 0 is the host's own.
+  // the same line and a seed replays the same match.
   const autopilots: (SeatAutopilot | null)[] = setup.ships.map((ship, seat) =>
-    seat > 0 && (options.backfill ?? true) ? createSeatAutopilot(ship, subRng(seed, STREAM.wingman + seat)) : null,
+    seat >= firstRemote && (options.backfill ?? true) ? createSeatAutopilot(ship, subRng(seed, STREAM.wingman + seat)) : null,
   )
   const stats: HostStats = { wrongSeat: 0, stale: 0, malformed: 0, held: 0, admitted: 0, refused: 0, results: 0, backfilled: 0 }
   let tick = 0
@@ -337,8 +340,8 @@ export function createHost(options: HostOptions): Host {
     },
 
     accept(channel, reservedSeat) {
-      const seat = reservedSeat ?? peers.findIndex((p, i) => i > 0 && p === null)
-      if (seat < 1 || seat >= seatCount || peers[seat]) {
+      const seat = reservedSeat ?? peers.findIndex((p, i) => i >= firstRemote && p === null)
+      if (!Number.isInteger(seat) || seat < firstRemote || seat >= seatCount || peers[seat]) {
         stats.refused++
         refuse(channel, 'full')
         return -1
@@ -359,6 +362,7 @@ export function createHost(options: HostOptions): Host {
     },
 
     tick(local) {
+      if (firstRemote === 1 && !local) throw new Error('browser host requires local controls')
       // A resolved match is told to every peer, and nothing else is sent: the
       // roster is gone, and a snapshot of nobody is not a world. Said again
       // every half second for as long as the host keeps ticking, because the
@@ -383,8 +387,8 @@ export function createHost(options: HostOptions): Host {
         }
         return
       }
-      intents[0] = local
-      for (let seat = 1; seat < seatCount; seat++) {
+      if (firstRemote === 1) intents[0] = local!
+      for (let seat = firstRemote; seat < seatCount; seat++) {
         const peer = peers[seat]
         const held = holds[seat]
         const auto = autopilots[seat]
