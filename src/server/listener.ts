@@ -76,7 +76,8 @@ function reply(res: import('node:http').ServerResponse, status: number, body: ob
 }
 
 function launcher(room: Room): Member | undefined {
-  return room.members.filter(member => member.hello).sort((a, b) => a.seat - b.seat)[0]
+  // Members remain in connection order even when a vacated low seat is reused.
+  return room.members.find(member => member.hello)
 }
 
 function broadcast(room: Room): void {
