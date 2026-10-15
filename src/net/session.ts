@@ -643,6 +643,11 @@ export function createClient(options: ClientOptions): Client {
       }
       seat = welcome.seat
       game.start(welcome.setup)
+      // Lobby HELLO retries use the local frame counter, but intents belong to
+      // the new match clock. A long lobby wait must not send a future tick.
+      tick = 0
+      buffer.length = 0
+      coastedAt = -2
       options.onWelcome?.(seat)
       return
     }

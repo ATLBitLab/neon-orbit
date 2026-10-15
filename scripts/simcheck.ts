@@ -3611,6 +3611,35 @@ function testAnIntentFrameEndsInAdmission(): void {
  * the client's stick must actually be flying seat 1 on the host, which is
  * proved by a second host whose seat 1 hears nothing and fights differently.
  */
+function testLobbyWaitDoesNotAdvanceIntentTick(): void {
+  section('Lobby wait does not advance the match intent tick')
+  for (const resumed of [false, true]) {
+    const wire = createLoopback()
+    const game = newMatch()
+    const intents: number[] = []
+    wire.a.onMessage((bytes) => {
+      if (bytes[0] === FRAME.INTENT) intents.push(new DataView(bytes.buffer, bytes.byteOffset).getUint32(3, true))
+    })
+    // A resumed session also creates a fresh client and waits for WELCOME.
+    // In either case, waiting longer than the server's 600-tick lead limit
+    // must not turn the first match intent into a policy-close offence.
+    const client = createClient({ game, channel: wire.b, predict: true })
+    for (let i = 0; i < 720; i++) {
+      client.tick(controls())
+      wire.pump()
+    }
+    check(`${resumed ? 'resumed' : 'new'} client remains in lobby after 720 ticks`, client.seat === -1)
+    wire.a.send(encodeWelcome(1, { ships: ['hornet', 'wasp'], seed: 42, respawn: true }))
+    wire.pump()
+    client.tick(controls())
+    wire.pump()
+    check(`${resumed ? 'resumed' : 'new'} client starts intents at match tick zero`,
+      client.seat === 1 && intents.length === 1 && intents[0] === 0,
+      `seat ${client.seat}, intents ${intents.join(',')}`)
+    game.dispose()
+  }
+}
+
 function testAMatchCrossesTheWire(): void {
   section('A match crosses the wire')
 
@@ -8014,6 +8043,7 @@ testTheWorldSurvivesTheWire()
 testAMirrorIsTheHostsMatch()
 testHullsComeAndGoByIdAndBadFramesDoNothing()
 testAnIntentFrameEndsInAdmission()
+testLobbyWaitDoesNotAdvanceIntentTick()
 testAMatchCrossesTheWire()
 testABadWireIsSurvived()
 testAnEmptySeatIsFlown()
