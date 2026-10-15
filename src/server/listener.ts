@@ -8,7 +8,8 @@ import { createDedicatedMatch } from './match'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const MAX_ROOMS = 8
-const MAX_PLAYERS = 6
+const MAX_ROOMS_PER_IP = 3
+const MAX_PLAYERS = 12
 const MAX_CONNECTIONS_PER_IP = 6
 const MAX_PENDING_PER_IP = 1
 const MAX_PACKET = 256
@@ -16,6 +17,7 @@ const MAX_BUFFERED = 2 * 1024 * 1024
 const MAX_MESSAGES_PER_SECOND = 120
 const MAX_TICK_LEAD = 600
 const IDLE_MS = 30 * 60_000
+const EMPTY_ROOM_MS = 60_000
 const END_GRACE_MS = 10_000
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
@@ -31,6 +33,7 @@ interface Member {
 
 interface Room {
   code: string
+  creatorIp: string
   seats: number
   members: Member[]
   state: 'lobby' | 'running' | 'finished'
@@ -108,7 +111,7 @@ function startRoom(room: Room): void {
   // The lobby consumed the first HELLO. Deliver it to the match after its
   // channel handler is installed, in seat order, preserving the lobby seats.
   for (const member of [...room.members].sort((a, b) => a.seat - b.seat)) {
-    match.connect(member.channel)
+    match.connect(member.channel, member.seat)
     if (member.hello) member.channel.receive(member.hello)
   }
   let next = performance.now()
@@ -132,6 +135,10 @@ const server = createServer((req, res) => {
     reply(res, 200, { ok: true, rooms: rooms.size, players: totalPlayers() }); return
   }
   if (req.method === 'POST' && req.url === '/rooms') {
+    const ip = clientIp(req)
+    if ([...rooms.values()].filter(room => room.creatorIp === ip).length >= MAX_ROOMS_PER_IP) {
+      reply(res, 429, { error: 'too many rooms from this IP' }); return
+    }
     if (rooms.size >= MAX_ROOMS || totalPlayers() >= MAX_PLAYERS) {
       reply(res, 503, { error: 'server full' }); return
     }
@@ -146,7 +153,14 @@ const server = createServer((req, res) => {
       if (!Number.isInteger(seats) || seats < 2 || seats > 4) {
         reply(res, 400, { error: 'seats must be 2 to 4' }); return
       }
-      const room: Room = { code: code(), seats, members: [], state: 'lobby', revision: 0,
+      // Recheck after reading the body because another request may have created a room.
+      if ([...rooms.values()].filter(room => room.creatorIp === ip).length >= MAX_ROOMS_PER_IP) {
+        reply(res, 429, { error: 'too many rooms from this IP' }); return
+      }
+      if (rooms.size >= MAX_ROOMS || totalPlayers() >= MAX_PLAYERS) {
+        reply(res, 503, { error: 'server full' }); return
+      }
+      const room: Room = { code: code(), creatorIp: ip, seats, members: [], state: 'lobby', revision: 0,
         match: null, timer: null, expiry: null, lastActivity: Date.now() }
       rooms.set(room.code, room)
       reply(res, 201, { code: room.code, seats })
@@ -157,13 +171,16 @@ const server = createServer((req, res) => {
 })
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PACKET, perMessageDeflate: false })
+function clientIp(request: IncomingMessage): string {
+  const direct = request.socket.remoteAddress ?? 'unknown'
+  // Only the loopback Caddy hop may supply the actual public client IP.
+  return (direct === '127.0.0.1' || direct === '::1' || direct === '::ffff:127.0.0.1')
+    ? String(request.headers['x-real-ip'] ?? direct) : direct
+}
 server.on('upgrade', (request: IncomingMessage, socket, head) => {
   const url = new URL(request.url ?? '/', 'http://localhost')
   const room = rooms.get(url.searchParams.get('room')?.toUpperCase() ?? '')
-  const direct = request.socket.remoteAddress ?? 'unknown'
-  // Only the loopback Caddy hop may supply the actual public client IP.
-  const ip = (direct === '127.0.0.1' || direct === '::1' || direct === '::ffff:127.0.0.1')
-    ? String(request.headers['x-real-ip'] ?? direct) : direct
+  const ip = clientIp(request)
   const sameIp = members().filter(member => member.ip === ip)
   if (url.pathname !== '/ws' || !room || room.state !== 'lobby' ||
       room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
@@ -277,9 +294,10 @@ wss.on('connection', (socket: WebSocket, room: Room) => {
 
 setInterval(() => {
   for (const room of rooms.values()) {
-    if (room.state === 'lobby' && Date.now() - room.lastActivity > IDLE_MS) closeRoom(room)
+    if (room.state === 'lobby' && Date.now() - room.lastActivity >
+        (room.members.length === 0 ? EMPTY_ROOM_MS : IDLE_MS)) closeRoom(room)
   }
-}, 60_000).unref()
+}, 5_000).unref()
 
 server.listen(PORT, '127.0.0.1', () => console.log(`neon-orbit server listening on ${PORT}`))
 process.on('SIGTERM', () => { for (const room of rooms.values()) closeRoom(room); server.close() })

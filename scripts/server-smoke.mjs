@@ -101,3 +101,72 @@ for (let i = 0; i < 121; i++) busy.send(JSON.stringify({ type: 'noop' }))
 const rateClose = await new Promise(resolve => busy.once('close', resolve))
 assert.equal(rateClose, 1008, 'message rate limit closed the connection')
 console.log('pending connection, packet size, and message rate limits held')
+
+async function waitFor(predicate) {
+  const deadline = Date.now() + 5000
+  while (!await predicate()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for room state')
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+}
+
+async function createRoom(seats, ip) {
+  const response = await fetch(`${endpoint}/rooms`, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Real-IP': ip },
+    body: JSON.stringify({ seats }) })
+  return { status: response.status, ...await response.json() }
+}
+
+async function joinRoom(code, ip, ship = 1) {
+  const url = new URL('/ws', endpoint)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  url.searchParams.set('room', code)
+  const socket = new WebSocket(url, { headers: { 'X-Real-IP': ip } })
+  const frames = []
+  socket.on('message', (data, binary) => { if (binary) frames.push(Buffer.from(data)) })
+  await new Promise((resolve, reject) => {
+    socket.once('open', resolve)
+    socket.once('error', reject)
+  })
+  socket.send(Buffer.from([1, 3, ship]))
+  await waitFor(() => frames.some(frame => frame[0] === 7))
+  return { socket, frames }
+}
+
+const gapIp = '198.51.100.10'
+const gap = await createRoom(3, gapIp)
+assert.equal(gap.status, 201)
+const p1 = await joinRoom(gap.code, gapIp, 1) // Hornet
+const p2 = await joinRoom(gap.code, gapIp, 2) // Drone
+const p3 = await joinRoom(gap.code, gapIp, 0) // Wasp
+p2.socket.close()
+await waitFor(async () => (await fetch(`${endpoint}/health`).then(res => res.json())).players === 2)
+p1.socket.send(JSON.stringify({ type: 'start' }))
+await waitFor(() => p1.frames.some(frame => frame[0] === 2) && p3.frames.some(frame => frame[0] === 2))
+const gapWelcome = p3.frames.find(frame => frame[0] === 2)
+assert.equal(gapWelcome[2], 2, 'Wasp player kept reserved lobby seat 2')
+assert.equal(gapWelcome[10], 1, 'vacant seat 1 uses default Hornet')
+assert.equal(gapWelcome[11], 0, 'seat 2 keeps Wasp instead of giving it to AI')
+p1.socket.close()
+p3.socket.close()
+await waitFor(async () => (await fetch(`${endpoint}/health`).then(res => res.json())).players === 0)
+console.log('lobby gap kept seat and hull assignments')
+
+const sharedIp = '198.51.100.20'
+const sharedSockets = []
+for (let i = 0; i < 3; i++) {
+  const room = await createRoom(2, sharedIp)
+  assert.equal(room.status, 201)
+  sharedSockets.push((await joinRoom(room.code, sharedIp)).socket)
+  sharedSockets.push((await joinRoom(room.code, sharedIp)).socket)
+}
+assert.equal((await createRoom(2, sharedIp)).status, 429, 'one IP cannot reserve every room')
+const otherIp = '198.51.100.21'
+const otherRoom = await createRoom(2, otherIp)
+assert.equal(otherRoom.status, 201, 'another IP can create despite six same-IP players')
+const other = await joinRoom(otherRoom.code, otherIp)
+assert.equal((await fetch(`${endpoint}/health`).then(res => res.json())).players, 7,
+  'six clients on one NAT coexist with another client')
+for (const socket of [...sharedSockets, other.socket]) socket.close()
+await waitFor(async () => (await fetch(`${endpoint}/health`).then(res => res.json())).players === 0)
+console.log('six same-IP players allowed, per-IP room cap and global headroom held')

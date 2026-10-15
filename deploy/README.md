@@ -55,5 +55,8 @@ when `VITE_SERVER_URL` is configured.
 and returns a code. WebSocket clients connect to `/ws?room=CODE`; game frames
 use the existing binary session protocol, while JSON control frames handle
 room launch and hull changes. A finished room closes ten seconds after its
-result, and an empty room closes immediately. Lobby rooms expire after 30
-minutes of inactivity. There is no reconnect in this slice.
+result, and an empty room closes immediately. An unjoined room expires after
+about one minute; occupied lobbies expire after 30 minutes of inactivity.
+One IP may create at most three rooms and hold six connections, while the
+server allows twelve players globally so a shared Wi-Fi can fill a room
+without excluding other IPs. There is no reconnect in this slice.
