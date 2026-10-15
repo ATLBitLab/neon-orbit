@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createConnection } from 'node:net'
 import WebSocket from 'ws'
 
 const endpoint = process.argv[2] ?? 'http://127.0.0.1:8080'
@@ -15,8 +16,12 @@ function connect() {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(url)
     const frames = []
-    socket.on('message', (data, binary) => { if (binary) frames.push(Buffer.from(data)) })
-    socket.once('open', () => { sockets.push(socket); socket.send(Buffer.from([1, 3, 0])); resolve({ socket, frames }) })
+    const controls = []
+    socket.on('message', (data, binary) => {
+      if (binary) frames.push(Buffer.from(data))
+      else controls.push(JSON.parse(String(data)))
+    })
+    socket.once('open', () => { sockets.push(socket); socket.send(Buffer.from([1, 3, 0])); resolve({ socket, frames, controls }) })
     socket.once('error', reject)
   })
 }
@@ -31,6 +36,10 @@ try {
     }
   }
   await until(() => first.frames.some(frame => frame[0] === 7))
+  first.socket.send(JSON.stringify({ type: 'start' }))
+  await until(() => first.controls.some(control => control.type === 'error'))
+  assert.equal((await fetch(`${endpoint}/health`).then(res => res.json())).rooms, 1,
+    'early launch refusal kept the lobby open')
   const second = await connect()
   await until(() => second.frames.some(frame => frame[0] === 7))
   first.socket.send(JSON.stringify({ type: 'ship', ship: 'drone' }))
@@ -97,7 +106,7 @@ const rateRoom = await fetch(`${endpoint}/rooms`, { method: 'POST',
 guardUrl.searchParams.set('room', rateRoom.code)
 const busy = new WebSocket(guardUrl)
 await new Promise((resolve, reject) => { busy.once('open', resolve); busy.once('error', reject) })
-for (let i = 0; i < 121; i++) busy.send(JSON.stringify({ type: 'noop' }))
+for (let i = 0; i < 121; i++) busy.send(JSON.stringify({ type: 'ship', ship: 'hornet' }))
 const rateClose = await new Promise(resolve => busy.once('close', resolve))
 assert.equal(rateClose, 1008, 'message rate limit closed the connection')
 console.log('pending connection, packet size, and message rate limits held')
@@ -170,3 +179,43 @@ assert.equal((await fetch(`${endpoint}/health`).then(res => res.json())).players
 for (const socket of [...sharedSockets, other.socket]) socket.close()
 await waitFor(async () => (await fetch(`${endpoint}/health`).then(res => res.json())).players === 0)
 console.log('six same-IP players allowed, per-IP room cap and global headroom held')
+
+const controlIp = '198.51.100.50'
+const controlRoom = await createRoom(2, controlIp)
+assert.equal(controlRoom.status, 201)
+const creator = await joinRoom(controlRoom.code, controlIp)
+for (const payload of ['null', '1', '"text"', '[]', '{}', '{"type":"unknown"}', '{']) {
+  const offender = await joinRoom(controlRoom.code, controlIp)
+  const closed = new Promise(resolve => offender.socket.once('close', resolve))
+  offender.socket.send(payload)
+  assert.equal(await closed, 1008, `invalid control ${payload} closed only its sender`)
+  assert.equal(creator.socket.readyState, WebSocket.OPEN, 'creator stayed in lobby')
+  await waitFor(async () => (await fetch(`${endpoint}/health`).then(res => res.json())).players === 1)
+}
+const survivor = await joinRoom(controlRoom.code, controlIp)
+const creatorClosed = new Promise(resolve => creator.socket.once('close', resolve))
+creator.socket.send('null')
+assert.equal(await creatorClosed, 1008, 'invalid creator control was a policy close')
+assert.equal(survivor.socket.readyState, WebSocket.OPEN, 'creator bad frame did not close the room')
+const replacement = await joinRoom(controlRoom.code, controlIp)
+assert.equal(replacement.frames.find(frame => frame[0] === 7)?.[6], 0,
+  'vacated creator seat can be joined again')
+
+const rawResponse = await new Promise((resolve, reject) => {
+  const url = new URL(endpoint)
+  const socket = createConnection(Number(url.port), url.hostname)
+  let response = ''
+  socket.setTimeout(3000, () => socket.destroy(new Error('malformed upgrade timed out')))
+  socket.on('connect', () => socket.write('GET //[ HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n'))
+  socket.on('data', data => { response += String(data) })
+  socket.on('close', () => resolve(response))
+  socket.on('error', reject)
+})
+assert.match(rawResponse, /^HTTP\/1\.1 400 Bad Request/, 'malformed upgrade got HTTP 400')
+assert.equal((await fetch(`${endpoint}/health`).then(res => res.json())).ok, true,
+  'process remained healthy after malformed upgrade')
+assert.equal(survivor.socket.readyState, WebSocket.OPEN,
+  'malformed upgrade did not disrupt an existing room')
+survivor.socket.close()
+replacement.socket.close()
+console.log('invalid controls closed only their senders; malformed upgrade returned 400')

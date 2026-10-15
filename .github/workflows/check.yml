@@ -32,6 +32,8 @@ jobs:
 
       - run: npm run build
 
+      - run: npm run check:server-isolation
+
   # Separate job: it runs the whole simulation suite once per mutation, so it is
   # minutes rather than seconds and should not hold up the signal above.
   mutants:
