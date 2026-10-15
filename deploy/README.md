@@ -68,7 +68,7 @@ When the complete flow is ready, systemd's optional root-owned
 `/etc/neon-orbit/pot.env` provides `POT_ENABLED=1` and `VOLTAGE_API_KEY`.
 The server uses the dedicated mainnet `neon-orbit-pot` wallet and stores its
 ledger at `/var/lib/neon-orbit/pot-ledger.json` (the service's `StateDirectory`).
-The ledger contains payment IDs, invoice state, and salted hashes of private
+The state directory is mode 0700 and the ledger file is mode 0600. The ledger contains payment IDs, invoice state, and salted hashes of private
 seat claim credentials; it does not store those credentials or the API key.
 Back up the state directory before replacing the droplet. A restart ends live
 matches but keeps payment records for reconciliation and later refunds.

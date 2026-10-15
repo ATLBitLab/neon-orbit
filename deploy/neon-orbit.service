@@ -13,6 +13,7 @@ Environment=PORT=8080
 Environment=POT_ENABLED=0
 EnvironmentFile=-/etc/neon-orbit/pot.env
 StateDirectory=neon-orbit
+StateDirectoryMode=0700
 ReadWritePaths=/var/lib/neon-orbit
 ExecStart=/usr/bin/node /opt/neon-orbit/dist-server/listener.mjs
 Restart=always
