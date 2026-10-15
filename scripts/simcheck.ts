@@ -48,6 +48,7 @@ import { createMatchLobby } from '../src/net/lobby'
 import { createWeaponPresentation } from '../src/game/weapon-presentation'
 import { decodeHello, decodeLobby, encodeHello, encodeLobby, PROTOCOL_VERSION, type LobbyState } from '../src/net/session'
 import { modeFromLocation } from '../src/net/browser'
+import { stepSession } from '../src/net/frame'
 import { createLinkMonitor, type LinkReport } from '../src/net/link'
 import { createClient, createHost, decodeResult, decodeWelcome, encodeResult, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
 import { createGame, DEATH_SEQUENCE, PARTICIPANT_BOUNTY_MULT, placeLines, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
@@ -6613,6 +6614,43 @@ function testTheLoopSurvivesTheEndOfARun(): void {
   SHIPS.wasp.maxHull = originalHull
 }
 
+/** A server creator keeps host mode after a disconnect, while the session is null. */
+function testServerCreatorCanRetryOrPlaySoloAfterDisconnect(): void {
+  section('A disconnected server creator can retry or play solo')
+
+  const game = newMatch()
+  const mode = modeFromLocation('?server=https://example.test&host=2')
+  const intents = [controls()]
+  game.start({ ships: ['hornet', 'wasp'], seed: 0x5ea75 })
+  const before = game.capture().tick
+
+  let thrown = ''
+  try {
+    // offerRetry clears joining but leaves the original host mode and match on screen.
+    for (let i = 0; i < 180; i++) {
+      stepSession(mode, null, null, game, intents)
+      game.render(0.5, STEP)
+    }
+  } catch (error) {
+    thrown = String(error)
+  }
+  check('a disconnected creator keeps rendering without a one-seat step',
+    thrown === '' && game.capture().tick === before, thrown)
+
+  // RETRY calls startJoining, which installs a new joining session and abandons
+  // the old local match. The restarted session must receive ticks, not the game.
+  game.abandon()
+  let retryTicks = 0
+  stepSession(mode, null, { tick: () => { retryTicks++ } }, game, intents)
+  check('RETRY routes the next tick to the new server session', retryTicks === 1)
+
+  // PLAY SOLO switches mode, opens the hangar, and starts a one-seat game.
+  game.start({ ships: ['hornet'], seed: 0x5010 })
+  stepSession({ kind: 'solo' }, null, null, game, intents)
+  check('PLAY SOLO advances a fresh one-seat match', game.capture().tick === 1)
+  game.dispose()
+}
+
 /**
  * A drawn-seat index that is not a number falls back rather than throwing.
  *
@@ -7983,6 +8021,7 @@ testARefusedCallChangesNothing()
 testTheScreenMachineCanBeLeftAgain()
 testTheDevHookReadsTheRunningGame()
 testTheLoopSurvivesTheEndOfARun()
+testServerCreatorCanRetryOrPlaySoloAfterDisconnect()
 testScoringIsPerSeat()
 testTwoScorersKeepSeparateStreaks()
 testShootingAParticipantPays()

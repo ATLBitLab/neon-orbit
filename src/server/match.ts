@@ -77,7 +77,7 @@ export function createDedicatedMatch(options: DedicatedOptions) {
   host.start()
   return {
     /** A valid HELLO precedes seat assignment; hulls are fixed by server setup. */
-    connect(channel: Channel) {
+    connect(channel: Channel, reservedSeat?: number) {
       if (closed || !channel.open || headless.game.result || channels.size >= MAX_CONNECTIONS) {
         channel.close()
         return
@@ -91,7 +91,7 @@ export function createDedicatedMatch(options: DedicatedOptions) {
         if (bytes[0] !== FRAME.HELLO) { channel.close(); return }
         try { decodeHello(bytes) } catch { refuse(channel, 'version'); return }
         waiting.delete(channel)
-        host.accept(channel)
+        host.accept(channel, reservedSeat)
       })
     },
     /** Exactly one 1/60s tick; no browser input or client delta can advance time. */

@@ -30,10 +30,10 @@ export function createWing(parent: HTMLElement, onLeave: () => void) {
   leave.addEventListener('click', onLeave)
   parent.append(root)
   return {
-    show(joinCode: string, host: boolean) {
+    show(joinCode: string, host: boolean, joinUrl?: string) {
       root.hidden = false
       code.textContent = `JOIN CODE ${joinCode}`
-      url = `${location.origin}${location.pathname}?join=${joinCode}`
+      url = joinUrl ?? `${location.origin}${location.pathname}?join=${joinCode}`
       copy.textContent = 'COPY LINK'
       copy.hidden = !host
       leave.hidden = host
