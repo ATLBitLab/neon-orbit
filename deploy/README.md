@@ -2,8 +2,15 @@
 
 The deployed hostname is `104-131-185-100.sslip.io` on the Neon Orbit droplet
 (`104.131.185.100`). Caddy terminates TLS and forwards WebSocket traffic to
-Node on loopback port 8080. The process admits six connected players across
+Node on loopback port 8080. The process admits twelve connected players across
 rooms, with two to four seats per match. Rooms live only in process memory.
+
+The match and client input run at 60 Hz. This listener sends a full world
+snapshot every second tick (30 Hz), with no change to the browser-hosted WebRTC
+protocol. `npm run check:bandwidth` enforces a representative 130 KB/s per-client
+budget for a synthetic four-player active match. Actual egress also includes
+WebSocket/TLS overhead and varies with how many bolts are in flight; watch the
+droplet's 500 GB monthly transfer allowance during playtests.
 
 ## Build locally and install on the droplet
 

@@ -456,7 +456,7 @@ shot instead. All of it is in `beginDeathSequence` / `stepDeathSequence` in `src
 
 ## Checks
 
-### Authoritative server foundation (Phase A, first slice)
+### Authoritative server
 
 `src/server/match.ts` runs the real arena and existing host protocol in Node,
 without a browser, renderer, DOM or audio device. Every seat, including P1, is
@@ -466,12 +466,11 @@ the existing seat binding, replay rejection and input admission. Only the
 server's `step()` advances the match, by 1/60 second. Closing the match closes
 its channels and disposes its simulation and environment.
 
-This is a transport-independent runtime, **not yet a joinable server**. There
-is no network listener, browser server-join flow, authentication, deployment,
-or public matchmaking in this slice. A future transport must enforce packet
-size/rate limits and backpressure before handing bytes to the runtime. The
-runtime caps connections at eight and expires unseated handshakes after 300
-server ticks. The caller owns scheduling, idle policy and match lifetime.
+`src/server/listener.ts` runs that match behind a WebSocket listener with rooms,
+packet and rate limits, backpressure, and lifecycle cleanup. The browser can
+join its rooms while the existing WebRTC host path remains available. The
+runtime caps connections at eight per match and expires unseated handshakes
+after 300 server ticks. The listener owns scheduling and room lifetime.
 
 The arena uses the same construction as the browser, including stations, mines
 and pods. It currently allocates three.js geometry even though it never renders;
@@ -481,14 +480,17 @@ boundary. Removing those allocations is a later measured optimization.
 Run a reproducible local load measurement:
 
 ```bash
-npm run bench:server -- 60  # four synthetic clients, 60 simulated seconds
+npm run bench:server -- 60 4 1  # former 60 Hz snapshots
+npm run bench:server -- 60 4 2  # dedicated server's 30 Hz snapshots
+npm run check:bandwidth        # 130 KB/s per client budget in the fixed four-seat run
 ```
 
 It prints startup and tick timings, CPU time, process RSS and encoded outbound
 bytes. The benchmark runs faster than real time and excludes sockets, TLS and
-concurrent rooms, so it does not establish hosting capacity. Snapshots still
-contain the full bolt pool at 60 Hz; use the measured traffic before choosing a
-hosting budget. `simcheck` exercises all-remote seating, P1 snapshot mirroring,
+concurrent rooms, so it does not establish hosting capacity. The dedicated
+listener still simulates and accepts input at 60 Hz but sends complete snapshots
+at 30 Hz; browser-hosted WebRTC keeps its existing cadence and protocol.
+`simcheck` exercises all-remote seating, P1 snapshot mirroring,
 forgery/replay, takeover, bounded handshakes and shutdown.
 
 ### Existing checks
