@@ -105,7 +105,10 @@ function boot() {
     camera: stage.camera,
     audio,
     onLaunch: (id) => startRun(id),
-    onSelect: (id) => lobby?.wing.setShip(id),
+    onSelect: (id) => {
+      lobby?.wing.setShip(id)
+      joining?.selectShip?.(id)
+    },
   })
 
   const wing = createWing(hangar.root.querySelector('.stage')!, () => {
@@ -273,6 +276,7 @@ function boot() {
     joining = null
     const current = () => attempt === joinAttempt
     const ship = hangar.selected
+    let serverReady = false
     rememberShip(ship)
     game.abandon()
     screens.moveTo('hangar')
@@ -295,7 +299,12 @@ function boot() {
       onLobby: (state: LobbyState) => {
         if (!current()) return
         wing.update(state)
-        hangar.action(asServerHost ? 'LAUNCH' : 'WAITING FOR HOST', !asServerHost)
+        serverReady = state.seats.filter(seat => seat.pilot === 'human').length >= 2
+        hangar.action(asServerHost ? serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER' : 'WAITING FOR HOST',
+          !asServerHost || !serverReady)
+      },
+      onServerError: () => {
+        if (current() && asServerHost) hangar.action(serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER', !serverReady)
       },
       onWelcome: (seat: number) => {
         if (!current()) return

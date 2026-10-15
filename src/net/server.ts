@@ -28,6 +28,7 @@ export async function createServerRoom(endpoint: string, seats: number): Promise
     body: JSON.stringify({ seats }) })
   const body = await response.json() as { code?: string; error?: string }
   if (!response.ok || !body.code) throw new Error(body.error ?? 'could not create room')
+  if (!/^[A-HJ-NP-Z2-9]{6}$/.test(body.code)) throw new Error('server returned an invalid room code')
   return body.code
 }
 
@@ -60,13 +61,18 @@ export function joinServer(
       handlers.status('connected — waiting for launch')
       handlers.onLink({ state: 'up', reason: '', route: 'server' })
       resolve({ client, tick: local => client.tick(local), stop: () => { stopped = true; socket.close() },
-        start: () => socket.send(JSON.stringify({ type: 'start' })) })
+        start: () => socket.send(JSON.stringify({ type: 'start' })),
+        selectShip: next => socket.send(JSON.stringify({ type: 'ship', ship: next })) })
     }
     socket.onmessage = event => {
       if (typeof event.data === 'string') {
         try {
           const message = JSON.parse(event.data) as { type: string; message?: string; players?: number }
-          if (message.type === 'error') handlers.status(message.message ?? 'server error')
+          if (message.type === 'error') {
+            const reason = message.message ?? 'server error'
+            handlers.status(reason)
+            handlers.onServerError?.(reason)
+          }
           if (message.type === 'room' && (!client || client.seat < 0)) handlers.status(`${message.players} player(s) in room`)
         } catch { handlers.status('invalid server message') }
         return

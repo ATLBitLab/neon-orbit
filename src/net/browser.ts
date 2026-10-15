@@ -33,7 +33,7 @@ export type NetMode = { kind: 'solo' } | { kind: 'host'; guest: ShipId; seats: n
 export function modeFromLocation(search: string): NetMode {
   const params = new URLSearchParams(search)
   const join = params.get('join')
-  if (join) return { kind: 'join', code: join.toUpperCase() }
+  if (join && /^[A-Z0-9]{6}$/i.test(join)) return { kind: 'join', code: join.toUpperCase() }
   if (params.has('host')) {
     const value = params.get('host') ?? ''
     const guest = SHIP_ORDER.includes(value as ShipId) ? value as ShipId : 'wasp'
@@ -99,6 +99,7 @@ export interface Joining {
   tick(local: Controls): void
   stop(): void
   start?(): void
+  selectShip?(ship: ShipId): void
 }
 
 /** What a link looks like from the join screen: the monitor's verdict plus the route it was on. */
@@ -120,6 +121,7 @@ export interface JoinHandlers {
    * it notices — when it does not, or when ICE fails outright.
    */
   onLink(link: LinkStatus): void
+  onServerError?(message: string): void
 }
 
 /** Connect to a host by code. Resolves once the data channel is open; the welcome follows on it. */

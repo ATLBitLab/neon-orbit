@@ -3,15 +3,18 @@ import { randomBytes } from 'node:crypto'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { Channel } from '../net/channel'
 import { decodeHello, encodeLobby, FRAME } from '../net/session'
-import type { ShipId } from '../ships/specs'
+import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { createDedicatedMatch } from './match'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const MAX_ROOMS = 8
 const MAX_PLAYERS = 6
+const MAX_CONNECTIONS_PER_IP = 6
+const MAX_PENDING_PER_IP = 1
 const MAX_PACKET = 256
 const MAX_BUFFERED = 2 * 1024 * 1024
 const MAX_MESSAGES_PER_SECOND = 120
+const MAX_TICK_LEAD = 600
 const IDLE_MS = 30 * 60_000
 const END_GRACE_MS = 10_000
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -22,6 +25,8 @@ interface Member {
   ship: ShipId
   seat: number
   hello: Uint8Array | null
+  ip: string
+  shipChosen: boolean
 }
 
 interface Room {
@@ -37,6 +42,11 @@ interface Room {
 }
 
 const rooms = new Map<string, Room>()
+const clientIps = new WeakMap<WebSocket, string>()
+
+function members(): Member[] {
+  return [...rooms.values()].flatMap(room => room.members)
+}
 
 function code(): string {
   for (;;) {
@@ -47,7 +57,7 @@ function code(): string {
 }
 
 function totalPlayers(): number {
-  return [...rooms.values()].reduce((sum, room) => sum + room.members.length, 0)
+  return members().length
 }
 
 function reply(res: import('node:http').ServerResponse, status: number, body: object): void {
@@ -86,7 +96,9 @@ function closeRoom(room: Room): void {
 
 function startRoom(room: Room): void {
   if (room.state !== 'lobby') return
-  if (room.members.length < 2) throw new Error('at least two players must join before launch')
+  if (room.members.filter(member => member.hello).length < 2) {
+    throw new Error('at least two players must join before launch')
+  }
   const ships = Array.from({ length: room.seats }, (_, i) =>
     room.members.find(m => m.seat === i)?.ship ?? 'hornet')
   const match = createDedicatedMatch({ setup: { ships, seed: randomBytes(4).readUInt32LE(), respawn: true } })
@@ -148,13 +160,23 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PACKET, perMes
 server.on('upgrade', (request: IncomingMessage, socket, head) => {
   const url = new URL(request.url ?? '/', 'http://localhost')
   const room = rooms.get(url.searchParams.get('room')?.toUpperCase() ?? '')
+  const direct = request.socket.remoteAddress ?? 'unknown'
+  // Only the loopback Caddy hop may supply the actual public client IP.
+  const ip = (direct === '127.0.0.1' || direct === '::1' || direct === '::ffff:127.0.0.1')
+    ? String(request.headers['x-real-ip'] ?? direct) : direct
+  const sameIp = members().filter(member => member.ip === ip)
   if (url.pathname !== '/ws' || !room || room.state !== 'lobby' ||
-      room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS) {
-    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')
+      room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
+      sameIp.length >= MAX_CONNECTIONS_PER_IP ||
+      sameIp.filter(member => !member.hello).length >= MAX_PENDING_PER_IP) {
+    socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n')
     socket.destroy()
     return
   }
-  wss.handleUpgrade(request, socket, head, ws => wss.emit('connection', ws, room))
+  wss.handleUpgrade(request, socket, head, ws => {
+    clientIps.set(ws, ip)
+    wss.emit('connection', ws, room)
+  })
 })
 
 wss.on('connection', (socket: WebSocket, room: Room) => {
@@ -178,18 +200,28 @@ wss.on('connection', (socket: WebSocket, room: Room) => {
     },
     onMessage(handler) { messages.push(handler) },
     onClose(handler) { closers.push(handler) },
-    receive(bytes) { for (const handler of messages) handler(bytes) },
+    receive(bytes) { for (const handler of [...messages]) handler(bytes) },
     close() { socket.close(1000) },
   }
-  const member: Member = { channel, socket, seat, ship: 'hornet', hello: null }
+  const member: Member = { channel, socket, seat, ship: 'hornet', hello: null,
+    ip: clientIps.get(socket) ?? 'unknown', shipChosen: false }
+  const helloTimeout = setTimeout(() => { if (!member.hello) socket.close(1008, 'hello timeout') }, 5000)
+  let awaitingPong = false
+  const heartbeat = setInterval(() => {
+    if (awaitingPong) socket.terminate()
+    else { awaitingPong = true; socket.ping() }
+  }, 15_000)
+  socket.on('pong', () => { awaitingPong = false })
   room.members.push(member)
   room.lastActivity = Date.now()
   broadcast(room)
   channel.onMessage(bytes => {
     if (room.state !== 'lobby' || bytes[0] !== FRAME.HELLO) return
     try {
-      member.ship = decodeHello(bytes)
+      const ship = decodeHello(bytes)
+      if (!member.shipChosen) member.ship = ship
       member.hello = bytes
+      clearTimeout(helloTimeout)
       room.lastActivity = Date.now()
       broadcast(room)
     } catch { channel.close() }
@@ -203,9 +235,25 @@ wss.on('connection', (socket: WebSocket, room: Room) => {
       socket.close(1008, 'rate limit'); return
     }
     room.lastActivity = Date.now()
-    if (binary) { channel.receive(new Uint8Array(bytes)); return }
-    let message: { type?: string }
+    if (binary) {
+      if (room.state === 'running' && bytes[0] === FRAME.INTENT && bytes.byteLength >= 7) {
+        const tick = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(3, true)
+        if (tick > (room.match?.ticks ?? 0) + MAX_TICK_LEAD) {
+          socket.close(1008, 'future tick'); return
+        }
+      }
+      channel.receive(new Uint8Array(bytes))
+      return
+    }
+    let message: { type?: string; ship?: unknown }
     try { message = JSON.parse(String(data)) } catch { socket.close(1008, 'invalid control'); return }
+    if (message.type === 'ship' && room.state === 'lobby' && member.hello &&
+        SHIP_ORDER.includes(message.ship as ShipId)) {
+      member.ship = message.ship as ShipId
+      member.shipChosen = true
+      broadcast(room)
+      return
+    }
     if (message.type === 'start' && seat === 0) {
       try { startRoom(room) } catch (error) {
         channel.control({ type: 'error', message: error instanceof Error ? error.message : String(error) })
@@ -216,6 +264,8 @@ wss.on('connection', (socket: WebSocket, room: Room) => {
     if (notified) return
     notified = true
     closed = true
+    clearTimeout(helloTimeout)
+    clearInterval(heartbeat)
     for (const handler of closers) handler()
     const index = room.members.indexOf(member)
     if (index >= 0) room.members.splice(index, 1)
@@ -231,5 +281,5 @@ setInterval(() => {
   }
 }, 60_000).unref()
 
-server.listen(PORT, '0.0.0.0', () => console.log(`neon-orbit server listening on ${PORT}`))
+server.listen(PORT, '127.0.0.1', () => console.log(`neon-orbit server listening on ${PORT}`))
 process.on('SIGTERM', () => { for (const room of rooms.values()) closeRoom(room); server.close() })
