@@ -57,6 +57,7 @@ export class VoltageSend {
   private async submitPrepared(code: string, seat: number, send: PotSend): Promise<PotSend> {
     // The wallet has no credit line. Check spendable BTC on every attempt, not
     // its nominal limit or total balance; processing fees are additional.
+    try {
     const walletUrl = new URL(`/organizations/${this.config.organizationId}/wallets/${this.config.walletId}`,
       this.config.baseUrl).toString()
     const walletResponse = await this.request(walletUrl, { method: 'GET' })
@@ -72,6 +73,11 @@ export class VoltageSend {
         !Number.isSafeInteger(available) ||
         available! < send.amountMsat + send.maxFeeMsat + processingBound) {
       throw new Error('pot wallet lacks confirmed spendable funds and fee reserve')
+    }
+    } catch (error) {
+      // No POST was attempted: release the entitlement for a fresh LNURL invoice.
+      await this.ledger.updateSend(code, seat, send.id, 'failed')
+      throw error
     }
     // Persist an attempted write before making it. Even an empty 202 is only
     // accepted; no client sees "paid" until a matching GET says completed.
@@ -104,6 +110,7 @@ export class VoltageSend {
     let response: Response
     try { response = await this.request(this.paymentUrl(id), { method: 'GET' }) }
     catch { return send }
+    if (response.status === 404) return this.ledger.noteSendNotFound(code, seat, id)
     if (!response.ok) return send
     let payment: Payment
     try { payment = await response.json() as Payment } catch { return send }
@@ -112,7 +119,8 @@ export class VoltageSend {
         payment.environment_id !== this.config.environmentId ||
         payment.direction !== 'send' || payment.type !== 'bolt11' ||
         (payment.data?.amount &&
-          (payment.data.amount.currency !== 'btc' || payment.data.amount.amount !== send.amountMsat))) return send
+        (payment.data.amount.currency !== 'btc' || payment.data.amount.amount !== send.amountMsat))) return send
+    await this.ledger.clearSendNotFound(code, seat, id)
     if (payment.status === 'completed') {
       const fee = (value: { currency: string; unit: string; amount: number } | undefined) =>
         value?.currency === 'btc' && value.unit === 'msats' && Number.isSafeInteger(value.amount) &&
@@ -120,9 +128,13 @@ export class VoltageSend {
       const network = fee(payment.payment_breakdown?.network_fee)
       const processing = fee(payment.payment_breakdown?.processing_fee)
       const total = fee(payment.data?.fees ?? undefined)
+      // data.fees is the aggregate network/provider *plus* processing fee.
+      // If the breakdown is absent, store its known total in one bucket; no
+      // residual can be overstated by pretending the total excludes processing.
       const fees = network !== null && processing !== null
-        ? { networkFeeMsat: network, processingFeeMsat: processing }
-        : total !== null ? { networkFeeMsat: total, processingFeeMsat: 0 } : undefined
+        ? { networkFeeMsat: network, processingFeeMsat: processing,
+          totalFeeMsat: network + processing }
+        : total !== null ? { totalFeeMsat: total } : undefined
       return this.ledger.updateSend(code, seat, id, 'completed', fees)
     }
     if (payment.status === 'failed') return this.ledger.updateSend(code, seat, id, 'failed')

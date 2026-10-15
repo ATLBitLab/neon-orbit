@@ -116,7 +116,7 @@ export function placeLines(lines: SeatLine[]): void {
 /** Authoritative single winner for paid human seats; AI backfill is ineligible. */
 export function awardPotWinner(lines: SeatLine[], humanSeats: readonly number[]): number {
   const humans = lines.filter(line => humanSeats.includes(line.seat))
-  if (humans.length < 2) throw new Error('pot result needs two human entrants')
+  if (!humans.length) throw new Error('pot result needs an eligible human')
   const survivors = humans.filter(line => line.alive)
   const eligible = survivors.length ? survivors : humans
   const winner = eligible.slice().sort((a, b) => b.score - a.score || a.seat - b.seat)[0]
@@ -278,6 +278,8 @@ export interface Game {
   readonly seatCount: number
   /** Begin a match. */
   start(setup: MatchSetup): void
+  /** An expired paid-seat resume window is a permanent elimination. */
+  forfeitPotSeat(seat: number): void
   /**
    * Advance the simulation by exactly one fixed tick, flying **seat `i` on
    * `intents[i]`**.
@@ -542,6 +544,7 @@ export function createGame(deps: GameDeps): Game {
   let localIndex = 0
   let respawns = false
   let potHumans: number[] | null = null
+  const potForfeited = new Set<number>()
 
   let pilots: EnemyPilot[] = []
   let queue: ShipId[] = []
@@ -1290,7 +1293,8 @@ export function createGame(deps: GameDeps): Game {
       }
     })
     placeLines(lines)
-    if (potHumans) awardPotWinner(lines, potHumans)
+    const eligible = potHumans?.filter(seat => !potForfeited.has(seat))
+    if (eligible?.length) awardPotWinner(lines, eligible)
     return { time: elapsed, cleared, lines }
   }
 
@@ -2444,6 +2448,16 @@ export function createGame(deps: GameDeps): Game {
       return seats.length
     },
 
+    forfeitPotSeat(index) {
+      if (!active || !potHumans?.includes(index) || potForfeited.has(index)) return
+      const seat = seats[index]
+      if (!seat) return
+      potForfeited.add(index)
+      seat.phase = ELIMINATED
+      seat.ship.alive = false
+      seat.ship.visual.group.visible = false
+    },
+
     start(setup) {
       /*
        * Everything that can refuse the setup happens before anything is torn down.
@@ -2473,6 +2487,7 @@ export function createGame(deps: GameDeps): Game {
 
       respawns = setup.respawn ?? false
       potHumans = setup.potHumans ?? null
+      potForfeited.clear()
       seats = built
       acks = seats.map(() => -1)
       localIndex = drawnSeatIndex(setup.local, seats.length)

@@ -13,6 +13,7 @@ import { VoltageReceive } from './voltage-receive'
 import { createMatchStats, departureOf, StatsLog, type MatchStats, type Outcome } from './stats'
 import { VoltageSend } from './voltage-send'
 import { encodeLnurl, fixedMainnetInvoiceAmount } from './lnurl'
+import { choosePotWinner } from './pot-winner'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const MAX_ROOMS = 8
@@ -104,6 +105,9 @@ interface Room {
   expiry: ReturnType<typeof setTimeout> | null
   lastActivity: number
   potBuyInSats: number | null
+  /** Score frozen at each paid pilot's last connected tick; AI cannot improve it. */
+  potLastScores: Map<number, number>
+  potForfeited: Set<number>
   stats: MatchStats | null
 }
 
@@ -246,7 +250,11 @@ function reserveSeat(room: Room, member: Member): void {
     timer: setTimeout(() => guardRoom(room, 'resume expiry', () => {
       if (room.resumes.get(seat) !== reservation) return
       room.resumes.delete(seat)
-      if (room.members.length === 0) closeRoom(room)
+      if (room.potBuyInSats !== null) {
+        room.potForfeited.add(seat)
+        room.match?.forfeitPotSeat(seat)
+      }
+      else if (room.members.length === 0) closeRoom(room)
     }), RESUME_GRACE_MS),
   }
   room.resumes.set(seat, reservation)
@@ -326,20 +334,25 @@ function launchMatch(room: Room, potHumans?: number[]): void {
       match.step()
       next += 1000 / 60
       if (match.ticks % STATS_SAMPLE_TICKS === 0) recordStats(room, stats => stats.sample(match.view))
+      // A paid result must be sealed in the ledger before any RESULT is sent.
+      if (potHumans && match.result) break
     }
     if (steps > 3) next = now + 1000 / 60
     if (match.result && room.state === 'running') {
       if (potHumans && potLedger) {
         room.state = 'settling'
-        const winner = match.result.lines.find(line => line.won && potHumans.includes(line.seat))
-        if (!winner) { closeRoom(room); return }
-        void potLedger.resolve(room.code, winner.seat).then(() => {
+        const connected = room.members.filter(member => member.hello).map(member => member.seat)
+        const winnerSeat = choosePotWinner(match.result.lines, potHumans, connected,
+          room.potLastScores, room.potForfeited)
+        if (winnerSeat === null) { closeRoom(room); return }
+        const claimable = potLedger.previewWinner(room.code)
+        void potLedger.resolve(room.code, winnerSeat).then(() => {
           if (!rooms.has(room.code)) return
           finishStats(room, match.result!.cleared ? 'cleared' : 'wiped')
           room.state = 'finished'
           match.step() // deliver the sealed RESULT after the ledger commit
           for (const member of room.members) member.channel.control({ type: 'pot-result',
-            winnerSeat: winner.seat, amountSats: potHumans.length * room.potBuyInSats! })
+            winnerSeat, claimableSats: claimable / 1000 })
           room.expiry = setTimeout(() => closeRoom(room), END_GRACE_MS)
         }).catch(error => {
           console.error(`[neon-orbit] room ${room.code} result commit failed`, error)
@@ -354,7 +367,7 @@ function launchMatch(room: Room, potHumans?: number[]): void {
   }), 1000 / 60)
 }
 
-async function claimStatus(code: string, seat: number): Promise<object> {
+async function claimStatus(code: string, seat: number) {
   const entry = potLedger?.getRoom(code)?.entries.find(item => item.seat === seat)
   if (!entry) throw new Error('claim unavailable')
   if (entry.canceled || potLedger?.getRoom(code)?.phase === 'refunding' ||
@@ -378,7 +391,7 @@ async function claimStatus(code: string, seat: number): Promise<object> {
     feeNotice: 'Payout or refund is the funded amount less a bounded Lightning fee allowance; unused reserve can be claimed again.' }
 }
 
-async function sendClaim(code: string, seat: number, invoice: string): Promise<object> {
+async function sendClaim(code: string, seat: number, invoice: string) {
   const entry = potLedger?.getRoom(code)?.entries.find(item => item.seat === seat)
   const entitlement = entry?.entitlement
   if (!entitlement || !voltageSend || !potLedger || Date.now() >= entitlement.expiresAt) {
@@ -387,9 +400,13 @@ async function sendClaim(code: string, seat: number, invoice: string): Promise<o
   const active = entitlement.sends.find(send => send.state !== 'failed' && send.state !== 'completed')
   if (active) {
     if (active.invoice !== invoice) throw new Error('claim already submitted')
-    if (active.state === 'prepared') await voltageSend.submit(code, seat, active.id)
-    else await voltageSend.poll(code, seat, active.id)
-    return claimStatus(code, seat)
+    const result = active.state === 'prepared'
+      ? await voltageSend.submit(code, seat, active.id)
+      : await voltageSend.poll(code, seat, active.id)
+    if (result.state === 'failed') throw new Error('payment failed; claim reopened')
+    const status = await claimStatus(code, seat)
+    if (active.state === 'failed') throw new Error('payment failed; claim reopened')
+    return status
   }
   const next = potLedger.nextPayout(code, seat)
   if (!next || fixedMainnetInvoiceAmount(invoice) !== next.amountMsat) {
@@ -397,8 +414,11 @@ async function sendClaim(code: string, seat: number, invoice: string): Promise<o
   }
   const send = await potLedger.prepareSend(code, seat, invoice)
   await voltageSend.submit(code, seat, send.id)
-  await voltageSend.pollBounded(code, seat, send.id)
-  return claimStatus(code, seat)
+  const result = await voltageSend.pollBounded(code, seat, send.id)
+  if (result.state === 'failed') throw new Error('payment failed; claim reopened')
+  const status = await claimStatus(code, seat)
+  if (send.state === 'failed') throw new Error('payment failed; claim reopened')
+  return status
 }
 
 function claimFromRequest(req: IncomingMessage, url: URL): { code: string; seat: number } | null {
@@ -510,7 +530,12 @@ const server = createServer((req, res) => {
       const invoice = url.searchParams.get('pr') ?? ''
       if (invoice.length > 5000) { reply(res, 400, { status: 'ERROR', reason: 'invoice too long' }); return }
       link.used = true
-      void sendClaim(link.code, link.seat, invoice).then(() => {
+      void sendClaim(link.code, link.seat, invoice).then(status => {
+        if (status.state === 'failed') {
+          link.used = false
+          reply(res, 200, { status: 'ERROR', reason: 'payment failed; request a new withdraw link' })
+          return
+        }
         withdrawLinks.delete(k1)
         reply(res, 200, { status: 'OK' })
       }).catch(error => {
@@ -600,7 +625,7 @@ const server = createServer((req, res) => {
         reply(res, 503, { error: 'server full' }); return
       }
       const room: Room = { code: code(), creatorIp: ip, seats, members: [], resumes: new Map(),
-        abandoned: new Map(), state: 'lobby',
+        abandoned: new Map(), potLastScores: new Map(), potForfeited: new Set(), state: 'lobby',
         revision: 0, nextJoinOrder: 0,
         match: null, timer: null, expiry: null, lastActivity: Date.now(), potBuyInSats, stats: null }
       creatingRooms.set(room.code, ip)
@@ -811,8 +836,15 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
       const index = room.members.indexOf(member)
       if (index >= 0) room.members.splice(index, 1)
       if (room.state === 'running' && member.hello) recordStats(room, stats => stats.leave(seat, departureOf(code)))
+      if (room.state === 'running' && room.potBuyInSats !== null && member.hello) {
+        room.potLastScores.set(seat, room.match?.view(seat)?.score ?? 0)
+      }
       if (reservation && !member.hello) reservation.claiming = false
       else if (code !== 1008 && code !== 1009) reserveSeat(room, member)
+      else if (room.state === 'running' && room.potBuyInSats !== null) {
+        room.potForfeited.add(seat)
+        room.match?.forfeitPotSeat(seat)
+      }
       if (room.state === 'lobby' && room.potBuyInSats !== null && potLedger &&
           potLedger.getRoom(room.code)?.entries.some(entry => entry.seat === seat && !entry.canceled)) {
         room.abandoned.set(seat, setTimeout(() => guardRoom(room, 'abandoned seat', () => {

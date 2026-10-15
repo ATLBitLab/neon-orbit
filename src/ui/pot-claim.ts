@@ -13,7 +13,7 @@ export function createPotClaimPanel(parent: HTMLElement) {
   const note = document.createElement('p')
   note.setAttribute('role', 'status')
   const fee = document.createElement('p')
-  fee.textContent = 'The winner or refunded player receives the funded amount minus a bounded Lightning fee allowance. No house fee.'
+  fee.textContent = 'The winner or refunded player receives the funded amount minus a bounded Lightning fee allowance. No house fee. Disconnecting during a pot match forfeits the pot.'
   const qr = document.createElement('canvas')
   qr.setAttribute('aria-label', 'LNURL withdraw QR code')
   const copy = document.createElement('button')

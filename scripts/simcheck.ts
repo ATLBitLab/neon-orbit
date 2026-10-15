@@ -8067,6 +8067,11 @@ function testPotWinnerIsOnePaidHuman(): void {
   check('if every human dies, their highest score wins', awardPotWinner(dead, [0, 1]) === 0)
   const tied = lines([true, true], [80, 80])
   check('a tie resolves deterministically to the lower seat', awardPotWinner(tied, [0, 1]) === 0)
+  const vacant = lines([true, false], [900, 10])
+  check('a vacant AI survivor cannot win over the remaining human',
+    awardPotWinner(vacant, [1]) === 1)
+  const reclaimed = lines([true, false], [900, 10])
+  check('a reclaimed pilot is eligible to win again', awardPotWinner(reclaimed, [0, 1]) === 0)
 }
 
 testPotWinnerIsOnePaidHuman()

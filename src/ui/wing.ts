@@ -12,7 +12,7 @@ export function createWing(parent: HTMLElement, onLeave: () => void) {
     <ol class="wing-seats" aria-label="Seats"></ol>
     <div class="wing-pot" hidden>
       <h3>POT MATCH</h3>
-      <p class="wing-pot-fee">Winner receives the pot minus a bounded allowance for Lightning routing and processing fees. No house fee.</p>
+      <p class="wing-pot-fee">Winner receives the pot minus a bounded allowance for Lightning routing and processing fees. No house fee. Disconnecting forfeits the pot.</p>
       <p class="wing-pot-state" role="status"></p>
       <canvas class="wing-pot-qr" aria-label="Lightning invoice QR code" hidden></canvas>
       <textarea class="wing-pot-invoice" readonly aria-label="Lightning invoice" hidden></textarea>

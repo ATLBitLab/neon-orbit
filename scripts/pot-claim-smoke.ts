@@ -10,7 +10,7 @@ const temp = await mkdtemp(join(tmpdir(), 'neon-pot-claim-'))
 const ledger = await PotLedger.open(join(temp, 'ledger.json'))
 await ledger.createRoom('REF123', 2, 100)
 const { claim } = await ledger.prepareSeat('REF123', 0)
-await ledger.prepareSeat('REF123', 1)
+const other = await ledger.prepareSeat('REF123', 1)
 await ledger.update('REF123', 0, 'completed')
 await ledger.update('REF123', 1, 'completed')
 await ledger.launch('REF123', [0, 1])
@@ -22,6 +22,8 @@ const amountMsat = grossMsat - reserveMsat
 const invoice = `lnbc${amountMsat / 100}n1${'q'.repeat(60)}`
 let postCount = 0
 let paymentId = ''
+let failNext = false
+let failedId = ''
 const mock = createServer(async (req, res) => {
   assert.equal(req.headers['x-api-key'], 'fake-only')
   if (req.url?.endsWith('/wallets/5272faf9-4644-4478-bc21-9f4b57b420a0')) {
@@ -40,15 +42,18 @@ const mock = createServer(async (req, res) => {
     })
     const parsed = JSON.parse(body) as { id: string; data: { amount: { amount: number } } }
     paymentId = parsed.id
+    if (failNext) failedId = parsed.id
     assert.equal(parsed.data.amount.amount, amountMsat)
     res.writeHead(202).end()
     return
   }
   res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
-    id: paymentId, wallet_id: '5272faf9-4644-4478-bc21-9f4b57b420a0',
+    id: req.url?.split('/').at(-1) ?? paymentId,
+    wallet_id: '5272faf9-4644-4478-bc21-9f4b57b420a0',
     organization_id: '5ad1ad8d-5f47-4c9f-82f1-ee63ea1f2c29',
     environment_id: '638fcc72-5f4b-4734-a2d6-8d0ef939b750',
-    direction: 'send', type: 'bolt11', status: 'completed',
+    direction: 'send', type: 'bolt11',
+    status: req.url?.endsWith(failedId) && failedId ? 'failed' : 'completed',
     data: { amount: { currency: 'btc', amount: amountMsat } },
     payment_breakdown: { network_fee: { currency: 'btc', unit: 'msats', amount: 500 },
       processing_fee: { currency: 'btc', unit: 'msats', amount: 1000 } },
@@ -134,6 +139,24 @@ try {
   body: JSON.stringify({ code: 'REF123', seat: 0, invoice: invoice + 'q' }) })
   assert.equal(changed.status, 409)
   assert.equal(postCount, 1, 'a completed claim never pays twice')
+
+  failNext = true
+  const otherHeaders = { Authorization: `Bearer ${other.claim}` }
+  const otherStatus = await fetch(`${base}/pot/claim?room=REF123&seat=1`, {
+    headers: otherHeaders }).then(response => response.json()) as { lnurl: string }
+  const otherUrl = new URL(lnurlUrl(otherStatus.lnurl))
+  const otherOffer = await fetch(`${base}${otherUrl.pathname}${otherUrl.search}`)
+    .then(response => response.json()) as { callback: string }
+  const failedCallback = new URL(otherOffer.callback)
+  failedCallback.searchParams.set('k1', otherUrl.searchParams.get('k1')!)
+  failedCallback.searchParams.set('pr', invoice)
+  const failed = await fetch(`${base}${failedCallback.pathname}${failedCallback.search}`)
+    .then(response => response.json()) as { status: string }
+  assert.equal(failed.status, 'ERROR', 'LNURL reports a terminal send failure to the wallet')
+  const reopened = await fetch(`${base}/pot/claim?room=REF123&seat=1`, {
+    headers: otherHeaders }).then(response => response.json()) as { state: string; lnurl: string }
+  assert.equal(reopened.state, 'claimable')
+  assert(reopened.lnurl, 'failed LNURL send leaves the refund claim open')
   console.log('pot LNURL withdraw + mocked Voltage send smoke passed')
 } finally {
   if (child) { child.kill('SIGTERM'); await new Promise(resolve => child!.once('exit', resolve)) }

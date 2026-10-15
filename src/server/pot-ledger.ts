@@ -16,6 +16,9 @@ export interface PotSend {
   updatedAt: number
   networkFeeMsat?: number
   processingFeeMsat?: number
+  totalFeeMsat?: number
+  /** First confirmed GET 404 after a possibly accepted POST. */
+  notFoundSince?: number
 }
 
 export interface PotEntitlement {
@@ -52,7 +55,9 @@ export interface PotRoom {
   closedAt?: number
 }
 
-interface LedgerFile { version: 1; rooms: PotRoom[] }
+interface DustRecord { code: string; seat: number; amountMsat: number; claimSalt: string;
+  claimHash: string; recordedAt: number }
+interface LedgerFile { version: 1; rooms: PotRoom[]; dust?: DustRecord[] }
 
 function hashClaim(secret: string, salt: string): Buffer {
   // The claim itself has 256 random bits, so a fast one-way hash is safe and
@@ -62,6 +67,7 @@ function hashClaim(secret: string, salt: string): Buffer {
 
 export class PotLedger {
   private readonly rooms = new Map<string, PotRoom>()
+  private readonly dust: DustRecord[] = []
   private writeQueue: Promise<void> = Promise.resolve()
   private operationQueue: Promise<void> = Promise.resolve()
 
@@ -77,11 +83,13 @@ export class PotLedger {
     }
     if (file.version !== 1 || !Array.isArray(file.rooms)) throw new Error('invalid pot ledger')
     for (const room of file.rooms) ledger.rooms.set(room.code, room)
+    if (Array.isArray(file.dust)) ledger.dust.push(...file.dust)
     return ledger
   }
 
   getRoom(code: string): PotRoom | undefined { return this.rooms.get(code) }
   listRooms(): PotRoom[] { return [...this.rooms.values()] }
+  listDust(): readonly DustRecord[] { return this.dust }
 
   private serial<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.operationQueue.then(operation)
@@ -202,6 +210,13 @@ export class PotLedger {
     })
   }
 
+  /** Amount the winner can request before actual route fees are known. */
+  previewWinner(code: string): number {
+    const room = this.rooms.get(code)
+    if (!room?.participants?.length) throw new Error('pot participants unavailable')
+    return entitlement('winner', room.participants.length * room.buyInSats * 1000).amountMsat
+  }
+
   /** Only a completed receive creates a refundable liability. Never infer it from 202. */
   async ensureRefunds(code: string): Promise<void> {
     return this.serial(async () => {
@@ -263,13 +278,14 @@ export class PotLedger {
   }
 
   async updateSend(code: string, seat: number, id: string, state: SendState,
-    fees?: { networkFeeMsat: number; processingFeeMsat: number }): Promise<PotSend> {
+    fees?: { networkFeeMsat?: number; processingFeeMsat?: number; totalFeeMsat: number }): Promise<PotSend> {
     return this.serial(async () => {
     const send = this.rooms.get(code)?.entries.find(item => item.seat === seat)
       ?.entitlement?.sends.find(item => item.id === id)
     if (!send) throw new Error('send unavailable')
     const previous = { state: send.state, updatedAt: send.updatedAt,
-      networkFeeMsat: send.networkFeeMsat, processingFeeMsat: send.processingFeeMsat }
+      networkFeeMsat: send.networkFeeMsat, processingFeeMsat: send.processingFeeMsat,
+      totalFeeMsat: send.totalFeeMsat }
     send.state = state; send.updatedAt = Date.now()
     if (fees) Object.assign(send, fees)
     try { await this.persist() } catch (error) { Object.assign(send, previous); throw error }
@@ -277,31 +293,71 @@ export class PotLedger {
     })
   }
 
+  /** A 404 is only conclusive after it persists across the reconciliation window. */
+  async noteSendNotFound(code: string, seat: number, id: string, now = Date.now()): Promise<PotSend> {
+    return this.serial(async () => {
+      const send = this.rooms.get(code)?.entries.find(item => item.seat === seat)
+        ?.entitlement?.sends.find(item => item.id === id)
+      if (!send) throw new Error('send unavailable')
+      // A 202 or a previously visible payment is known to exist. Never infer
+      // its failure from a later 404; only an ambiguous POST can time out.
+      if (send.state !== 'uncertain') return send
+      const previous = { state: send.state, notFoundSince: send.notFoundSince, updatedAt: send.updatedAt }
+      if (send.notFoundSince === undefined) send.notFoundSince = now
+      else if (now - send.notFoundSince >= 30 * 60_000) {
+        send.state = 'failed'
+        send.updatedAt = now
+      } else return send
+      try { await this.persist() } catch (error) { Object.assign(send, previous); throw error }
+      return send
+    })
+  }
+
+  async clearSendNotFound(code: string, seat: number, id: string): Promise<void> {
+    return this.serial(async () => {
+      const send = this.rooms.get(code)?.entries.find(item => item.seat === seat)
+        ?.entitlement?.sends.find(item => item.id === id)
+      if (!send?.notFoundSince) return
+      const previous = send.notFoundSince
+      delete send.notFoundSince
+      try { await this.persist() } catch (error) { send.notFoundSince = previous; throw error }
+    })
+  }
+
   /** Remove only records with no possible future credit or unpaid entitlement. */
   async collect(now = Date.now()): Promise<number> {
     return this.serial(async () => {
     const removed: PotRoom[] = []
+    const dustBefore = this.dust.length
     for (const room of this.rooms.values()) {
       if (!room.closedAt || now - room.closedAt < 7 * 24 * 60 * 60_000) continue
-      const receivedMsat = room.entries.filter(entry => entry.state === 'completed').length * room.buyInSats * 1000
-      const spentMsat = room.entries.flatMap(entry => entry.entitlement?.sends ?? [])
-        .filter(send => send.state === 'completed')
-        .reduce((sum, send) => sum + send.amountMsat + (send.networkFeeMsat ?? 0) +
-          (send.processingFeeMsat ?? 0), 0)
-      // Any unused fee allowance is still the players' money, not house rake.
-      // Retain the record for a later residual claim or manual reconciliation.
-      if (spentMsat < receivedMsat) continue
       if (room.entries.some(entry =>
         !['prepared', 'failed', 'expired', 'completed'].includes(entry.state) ||
         (entry.state === 'completed' &&
           (!entry.entitlement && !(room.phase === 'resolved' && room.participants?.includes(entry.seat))) ||
-          (entry.entitlement && !entry.entitlement.sends.some(send => send.state === 'completed'))))) continue
+          (entry.entitlement && !entry.entitlement.sends.some(send => send.state === 'completed'))) ||
+        entry.entitlement?.sends.some(send => !['completed', 'failed'].includes(send.state)))) continue
+      const residuals = room.entries.flatMap(entry => {
+        const value = entry.entitlement
+        if (!value) return []
+        if (value.sends.some(send => send.state === 'completed' && !knownFee(send))) return [null]
+        const spent = value.sends.filter(send => send.state === 'completed')
+          .reduce((sum, send) => sum + send.amountMsat + actualFee(send), 0)
+        return [{ entry, amountMsat: value.grossMsat - spent }]
+      })
+      if (residuals.some(value => !value || value.amountMsat < 0 || value.amountMsat >= 2000)) continue
+      // Keep even sub-2-sat money as a compact, claim-bound liability record.
+      for (const value of residuals) if (value && value.amountMsat) this.dust.push({
+        code: room.code, seat: value.entry.seat, amountMsat: value.amountMsat,
+        claimSalt: value.entry.claimSalt, claimHash: value.entry.claimHash, recordedAt: now,
+      })
       removed.push(room)
       this.rooms.delete(room.code)
     }
     if (!removed.length) return 0
     try { await this.persist() } catch (error) {
       for (const room of removed) this.rooms.set(room.code, room)
+      this.dust.length = dustBefore
       throw error
     }
     return removed.length
@@ -315,7 +371,8 @@ export class PotLedger {
       const temp = `${this.path}.${randomUUID()}.tmp`
       const handle = await open(temp, 'wx', 0o600)
       try {
-        await handle.writeFile(JSON.stringify({ version: 1, rooms: [...this.rooms.values()] }))
+        await handle.writeFile(JSON.stringify({ version: 1, rooms: [...this.rooms.values()],
+          dust: this.dust }))
         await handle.sync()
       } finally { await handle.close() }
       await rename(temp, this.path)
@@ -329,6 +386,13 @@ export class PotLedger {
 }
 
 const DAY = 24 * 60 * 60_000
+function knownFee(send: PotSend): boolean {
+  return send.totalFeeMsat !== undefined ||
+    (send.networkFeeMsat !== undefined && send.processingFeeMsat !== undefined)
+}
+function actualFee(send: PotSend): number {
+  return send.totalFeeMsat ?? ((send.networkFeeMsat ?? 0) + (send.processingFeeMsat ?? 0))
+}
 function entitlement(kind: PotEntitlement['kind'], grossMsat: number): PotEntitlement {
   // A fixed BOLT11 invoice is chosen before the route fee is known. Reserve a
   // bounded fee allowance from the gross; never promise wallet credit as cash.
@@ -350,9 +414,9 @@ function nextPayout(value: PotEntitlement): { amountMsat: number; maxFeeMsat: nu
   // Unknown actual fees cannot be treated as unspent funds. Keep the liability
   // in the ledger until Voltage reports its final breakdown or an operator
   // reconciles it.
-  if (completed.some(send => send.networkFeeMsat === undefined || send.processingFeeMsat === undefined)) return null
+  if (completed.some(send => !knownFee(send))) return null
   const spent = completed.reduce((sum, send) => sum + send.amountMsat +
-    send.networkFeeMsat! + send.processingFeeMsat!, 0)
+    actualFee(send), 0)
   const residual = value.grossMsat - spent
   if (residual < 2000) return null
   const processingBps = Number(process.env.POT_PROCESSING_FEE_BPS ?? 0)

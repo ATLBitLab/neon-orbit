@@ -24,7 +24,7 @@ import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, typ
 import { LINK_GRACE_MS } from './net/link'
 import { stepSession } from './net/frame'
 import type { LobbyState } from './net/session'
-import { cancelPotSeat, createServerRoom, joinServer, potPayment, serverJoinLink, serverPotEnabled, serverUrl,
+import { cancelPotSeat, createServerRoom, joinServer, potClaimStatus, potPayment, serverJoinLink, serverPotEnabled, serverUrl,
   type PotPaymentStatus } from './net/server'
 import { createHangar } from './ui/hangar'
 import { createWing } from './ui/wing'
@@ -86,6 +86,7 @@ function boot() {
   const potBuyInSats = mode.kind === 'host' && endpoint && Number.isInteger(requestedPot) &&
     requestedPot >= 10 && requestedPot <= 1000 ? requestedPot : undefined
   let potAvailable = false
+  let activePotRoom = false
   let potPoll: number | null = null
   let hosting: Hosting | null = null
   let joining: Joining | null = null
@@ -350,6 +351,7 @@ function boot() {
     let lobbyState: LobbyState | null = null
     let launcherSeat: number | undefined
     let potRoom: { buyInSats: number; paidSeats: number[] } | null = null
+    activePotRoom = false
     let potStatus: PotPaymentStatus | undefined
     let potClaim = storedPotClaim(code)
     const renderPot = () => {
@@ -417,6 +419,7 @@ function boot() {
       onPotRoom: (pot: { buyInSats: number; paidSeats: number[] }) => {
         if (!current()) return
         potRoom = pot
+        activePotRoom = true
         renderPot()
         updateAction()
         if (potClaim && potPoll === null && !['completed', 'failed', 'expired'].includes(potStatus?.state ?? '')) {
@@ -513,7 +516,20 @@ function boot() {
     audio.setMusic(result.won ? 'victory' : 'defeat')
     debrief.show(result, isRecord, Math.max(previous, result.score))
     const code = new URLSearchParams(window.location.search).get('join')
-    if (code) checkPotClaim(code)
+    if (code) {
+      checkPotClaim(code)
+      if (activePotRoom) {
+        debrief.potNotice('Pot match · disconnecting forfeits the pot.')
+        const claim = storedPotClaim(code)
+        if (endpoint && claim) void potClaimStatus(endpoint, code, claim.seat, claim.token)
+          .then(status => {
+            if (status.kind === 'winner' && status.amountMsat !== null && debrief.visible) {
+              debrief.potNotice(`Claimable: ${(status.amountMsat / 1000).toLocaleString()} sats ` +
+                '(gross pot less the fee reserve). Disconnecting forfeits the pot.')
+            }
+          }).catch(() => {})
+      }
+    }
   }
 
   /* ---- Global keys and pointer lock ------------------------------------- */

@@ -150,7 +150,7 @@ They use a fake key and make no mainnet requests.
 `npm run check:pot-payout` covers winner/refund ledger transitions and an
 ambiguous mocked send across a process restart.
 
-### Owner-authorized mainnet trial (maximum 5,000 sats)
+### PM-run, owner-authorized mainnet trial (maximum 5,000 sats)
 
 Run only after independent review of this payout PR, while the server has zero
 active rooms. The owner authorized the Project Manager to use up to 5,000 sats
@@ -160,6 +160,9 @@ credit limit at zero. Confirm its mainnet network, available BTC balance,
 send policies, and the `VOLTAGE_API_KEY` environment key using the Voltage
 dashboard without printing the key. Back up `/var/lib/neon-orbit/pot-ledger.json`
 securely before switching the flag.
+Run only **one pot room at a time** until the single-wallet balance and
+in-flight-send contention is hardened. The flag returns to off immediately
+after this trial; the owner does not play for money before it passes.
 
 1. In root-owned `/etc/neon-orbit/pot.env`, set `POT_ENABLED=1`, set the
    verified `POT_PROCESSING_FEE_BPS`, and keep the existing key.
@@ -171,20 +174,36 @@ securely before switching the flag.
    launch, verify both show **PAID**, never merely "invoice created" or 202.
    Fly to an elimination result. The winner scans the LNURL-withdraw QR or
    pastes a fixed-amount mainnet BOLT11 invoice for the displayed amount.
-   Verify `GET /pot/claim` in that authenticated browser reaches `completed`
-   with a payment UUID; check the same UUID in the Voltage dashboard.
+   Record the first send UUID and verify it is **completed** in Voltage (a
+   submitted 202 is not paid). The unused fee reserve should then produce a
+   `claimable` remainder of at least 2 sats. Withdraw that second claim and
+   record its separate UUID and amount. Only call the entitlement complete
+   after both sends are reconciled.
 3. Create a second 100-sat pot and pay only one seat. Close its tabs and wait
    for the ten-minute empty-room expiry. Reopen its room link on the same
    browser; the claim panel should offer a refund. Withdraw it and verify its
    distinct Voltage send UUID is completed. This trial uses about 300 sats of
    buy-ins, leaving room under the 5,000-sat authorization for fees and one
-   retry. Never send a second payment to compensate for an uncertain first;
-   reconcile the persisted UUID first.
+   retry. Never send a second payment to compensate for an uncertain first.
+   If a send remains uncertain, look up its persisted UUID with Voltage
+   `GET /v1/organizations/<org>/environments/<env>/payments/<uuid>` and in
+   the dashboard; verify wallet, direction, amount, and status. A GET 404 must persist for 30 minutes
+   before the server reopens the claim; manually confirm the old UUID is still
+   absent before submitting a fresh invoice. Record both UUIDs for audit.
 4. Set `POT_ENABLED=0` in the root-owned environment file and restart only
    after all active rooms have ended. Confirm `/pot` returns 404, free room
    creation/launch still works, and `journalctl -u neon-orbit` has no payout
-   errors. Record each buy-in and send UUID, actual fees, and any unpaid fee
-   residual from the ledger. Keep the ledger backup until reconciled.
+   errors. For **each** completed send record the actual network/provider and
+   processing fee from Voltage's `payment_breakdown`. If only `data.fees` is
+   available, record its aggregate total and treat the fee-policy check as
+   inconclusive until Voltage supplies the breakdown. Compare network fee to
+   that send's `maxFeeMsat`, processing fee to `POT_PROCESSING_FEE_BPS`, and
+   total fee to its reserve.
+   Pass only if every send stays inside the reserve and all residual claims
+   reconcile. If a fee exceeds the bound, turn the flag off, correct the bps
+   or reserve and rerun the trial before leaving pot mode enabled. Record each
+   buy-in and send UUID and any sub-2-sat dust retained in the ledger. Keep the
+   ledger backup until reconciled.
 
 ## Client preview
 
