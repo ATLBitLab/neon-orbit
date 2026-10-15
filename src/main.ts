@@ -22,6 +22,7 @@ import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
 import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, type Joining, type Lobby } from './net/browser'
 import { LINK_GRACE_MS } from './net/link'
+import { stepSession } from './net/frame'
 import type { LobbyState } from './net/session'
 import { createServerRoom, joinServer, serverJoinLink, serverUrl } from './net/server'
 import { createHangar } from './ui/hangar'
@@ -445,11 +446,8 @@ function boot() {
         // arrived rather than ones it produced. The simulation is handed one
         // intent per seat and never asks which of those a device produced.
         intents[0] = pilot.advance(input.state, STEP)
-        if (hosting) hosting.tick(intents[0])
-        else if (joining) joining.tick(intents[0])
-        else if (mode.kind !== 'join') game.step(intents)
-        // In join mode with no session yet, nothing steps: the host's snapshots
-        // will drive the game once the welcome arrives.
+        stepSession(mode, hosting, joining, game, intents)
+        // With no network session, a networked game waits for RETRY or PLAY SOLO.
       }
       game.render(alpha, frameSeconds)
     }
