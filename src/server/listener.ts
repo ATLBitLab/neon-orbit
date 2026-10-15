@@ -4,11 +4,13 @@ import { WebSocket, WebSocketServer } from 'ws'
 import type { Channel } from '../net/channel'
 import { decodeHello, encodeLobby, FRAME } from '../net/session'
 import { decodeResumeToken } from '../net/resume'
+import { decodeStatsSession, STATS_SESSION_FRAME } from '../net/stats-session'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { createDedicatedMatch } from './match'
 import { DEDICATED_SNAPSHOT_EVERY } from './snapshot-rate'
 import { PotLedger } from './pot-ledger'
 import { VoltageReceive } from './voltage-receive'
+import { createMatchStats, departureOf, StatsLog, type MatchStats, type Outcome } from './stats'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const MAX_ROOMS = 8
@@ -26,6 +28,11 @@ const EMPTY_POT_ROOM_MS = 10 * 60_000
 const END_GRACE_MS = 10_000
 const RESUME_GRACE_MS = 12_000
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const STATS_SAMPLE_TICKS = 6
+// Anonymous match stats (#64). STATS_PATH='' turns recording off.
+const statsPath = process.env.STATS_PATH ?? '/var/lib/neon-orbit/match-stats.jsonl'
+const statsLog = statsPath ? new StatsLog(statsPath,
+  Number(process.env.STATS_MAX_BYTES ?? 50 * 1024 * 1024)) : null
 const POT_ENABLED = process.env.POT_ENABLED === '1'
 const potLedger = POT_ENABLED
   ? await PotLedger.open(process.env.POT_LEDGER_PATH ?? '/var/lib/neon-orbit/pot-ledger.json') : null
@@ -47,6 +54,8 @@ interface Member {
   shipChosen: boolean
   resumeToken: string
   joinedAt: number | null
+  /** Random per-browser-session id for stats; never tied to IP or token. */
+  session: string | null
 }
 
 interface ResumeReservation {
@@ -72,12 +81,31 @@ interface Room {
   expiry: ReturnType<typeof setTimeout> | null
   lastActivity: number
   potBuyInSats: number | null
+  stats: MatchStats | null
 }
 
 const rooms = new Map<string, Room>()
 const creatingRooms = new Map<string, string>()
 const clientIps = new WeakMap<WebSocket, string>()
 const pendingResumes = new Map<WebSocket, string>()
+
+/** Stats are best effort: nothing in here may throw into a room. */
+function recordStats(room: Room, operation: (stats: MatchStats) => void): void {
+  if (!room.stats) return
+  try { operation(room.stats) } catch (error) {
+    console.error('[neon-orbit] match stats failed', error)
+    room.stats = null
+  }
+}
+
+function finishStats(room: Room, outcome: Outcome): void {
+  const match = room.match
+  if (!match) return
+  recordStats(room, stats => {
+    void statsLog?.append(stats.finish(outcome, match.result, seat => match.view(seat)))
+  })
+  room.stats = null
+}
 
 function sameToken(left: string, right: string): boolean {
   const a = Buffer.from(left)
@@ -159,6 +187,7 @@ function closeRoom(room: Room): void {
   rooms.delete(room.code)
   if (room.timer) clearInterval(room.timer)
   if (room.expiry) clearTimeout(room.expiry)
+  if (room.state === 'running') finishStats(room, 'abandoned')
   for (const reservation of room.resumes.values()) clearTimeout(reservation.timer)
   room.resumes.clear()
   for (const [socket] of pendingResumes) {
@@ -221,6 +250,11 @@ function startRoom(room: Room): string | null {
     snapshotEvery: DEDICATED_SNAPSHOT_EVERY })
   room.match = match
   room.state = 'running'
+  if (statsLog) {
+    const humans = new Map(room.members.filter(member => member.hello)
+      .map(member => [member.seat, member.session] as const))
+    try { room.stats = createMatchStats(ships, humans) } catch { room.stats = null }
+  }
   broadcast(room)
   // The lobby consumed the first HELLO. Deliver it to the match after its
   // channel handler is installed, in seat order, preserving the lobby seats.
@@ -237,9 +271,14 @@ function startRoom(room: Room): string | null {
     const now = performance.now()
     // Never let a stalled process run an unbounded burst of old ticks.
     let steps = 0
-    while (next <= now && steps++ < 3) { match.step(); next += 1000 / 60 }
+    while (next <= now && steps++ < 3) {
+      match.step()
+      next += 1000 / 60
+      if (match.ticks % STATS_SAMPLE_TICKS === 0) recordStats(room, stats => stats.sample(match.view))
+    }
     if (steps > 3) next = now + 1000 / 60
     if (match.result && room.state === 'running') {
+      finishStats(room, match.result.cleared ? 'cleared' : 'wiped')
       room.state = 'finished'
       room.expiry = setTimeout(() => closeRoom(room), END_GRACE_MS)
     }
@@ -326,7 +365,7 @@ const server = createServer((req, res) => {
       }
       const room: Room = { code: code(), creatorIp: ip, seats, members: [], resumes: new Map(), state: 'lobby',
         revision: 0, nextJoinOrder: 0,
-        match: null, timer: null, expiry: null, lastActivity: Date.now(), potBuyInSats }
+        match: null, timer: null, expiry: null, lastActivity: Date.now(), potBuyInSats, stats: null }
       creatingRooms.set(room.code, ip)
       void (async () => {
         if (potBuyInSats !== null) await potLedger!.createRoom(room.code, seats, potBuyInSats)
@@ -426,7 +465,8 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
   }
   const member: Member = { channel, socket, seat, ship: reservation?.ship ?? 'hornet', hello: null,
     ip: clientIps.get(socket) ?? 'unknown', shipChosen: false,
-    resumeToken: randomBytes(32).toString('base64url'), joinedAt: null }
+    resumeToken: randomBytes(32).toString('base64url'), joinedAt: null,
+    session: null }
   const helloTimeout = setTimeout(() => guardRoom(room, 'hello timeout', () => {
     if (!member.hello) socket.close(1008, 'hello timeout')
   }), 5000)
@@ -450,6 +490,7 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
       clearTimeout(reservation.timer)
       room.resumes.delete(seat)
       room.match!.connect(channel, seat)
+      recordStats(room, stats => stats.rejoin(seat))
       channel.receive(bytes)
       channel.control({ type: 'resume', token: member.resumeToken, graceMs: RESUME_GRACE_MS })
       return
@@ -481,6 +522,11 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
     }
     room.lastActivity = Date.now()
     if (binary) {
+      // Stats session: at most once, before HELLO, and never forwarded to the match.
+      if (bytes[0] === STATS_SESSION_FRAME) {
+        if (!member.hello && member.session === null) member.session = decodeStatsSession(bytes)
+        return
+      }
       if (room.state === 'running' && bytes[0] === FRAME.INTENT && bytes.byteLength >= 7) {
         const tick = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(3, true)
         if (tick > (room.match?.ticks ?? 0) + MAX_TICK_LEAD) {
@@ -523,6 +569,7 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
       for (const handler of closers) handler()
       const index = room.members.indexOf(member)
       if (index >= 0) room.members.splice(index, 1)
+      if (room.state === 'running' && member.hello) recordStats(room, stats => stats.leave(seat, departureOf(code)))
       if (reservation && !member.hello) reservation.claiming = false
       else if (code !== 1008 && code !== 1009) reserveSeat(room, member)
       if (room.members.length === 0 && room.resumes.size === 0 && room.potBuyInSats === null) closeRoom(room)

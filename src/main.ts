@@ -375,7 +375,7 @@ function boot() {
     pilot.reset()
     audio.setMusic('hangar')
     netPanel.style.display = 'none'
-    wing.show(code, asServerHost, endpoint ? serverJoinLink(code, endpoint) : undefined)
+    wing.show(code, asServerHost, endpoint ? serverJoinLink(code, endpoint) : undefined, !!endpoint)
     wing.status(endpoint ? 'Connecting to server…' : 'Looking for the host…')
     const handlers = {
       active: current,

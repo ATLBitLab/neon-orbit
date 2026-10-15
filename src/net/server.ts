@@ -3,6 +3,7 @@ import type { ShipId } from '../ships/specs'
 import type { Channel } from './channel'
 import { createClient, type Client } from './session'
 import { encodeResumeToken } from './resume'
+import { encodeStatsSession } from './stats-session'
 import type { JoinHandlers, Joining } from './browser'
 
 /** The server URL is explicit so a preview client can point at a test droplet. */
@@ -57,6 +58,23 @@ export async function potPayment(endpoint: string, code: string, seat: number, t
   return body
 }
 
+/**
+ * A random id for the anonymous match stats, so the server can see "picked
+ * Drone, then Hornet" across one browser session. Never derived from anything
+ * and gone when the tab closes (sessionStorage).
+ */
+function statsSession(): string | null {
+  try {
+    let value = sessionStorage.getItem('neon-orbit.stats-session')
+    if (!value || !/^[A-Za-z0-9_-]{22}$/.test(value)) {
+      const bytes = crypto.getRandomValues(new Uint8Array(16))
+      value = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').slice(0, 22)
+      sessionStorage.setItem('neon-orbit.stats-session', value)
+    }
+    return value
+  } catch { return null }
+}
+
 export function joinServer(
   game: Game, endpoint: string, code: string, ship: ShipId, handlers: JoinHandlers,
   resumeToken?: string,
@@ -91,6 +109,12 @@ export function joinServer(
         proof[1] = potClaim.seat
         for (let i = 0; i < 43; i++) proof[i + 2] = potClaim.token.charCodeAt(i)
         socket.send(proof)
+      }
+      // A resumed seat keeps the session it joined with; the id never goes in the URL.
+      // The pot claim proof must stay the first frame, so the session follows it.
+      if (!resumeToken) {
+        const session = statsSession()
+        if (session) socket.send(Uint8Array.from(encodeStatsSession(session)))
       }
       client = createClient({ game, channel, ship,
         onLobby: handlers.onLobby, onWelcome: handlers.onWelcome, onRefused: handlers.onRefused })

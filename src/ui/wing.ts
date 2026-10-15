@@ -19,6 +19,7 @@ export function createWing(parent: HTMLElement, onLeave: () => void) {
       <button type="button" class="btn wing-pot-copy" hidden>COPY INVOICE</button>
     </div>
     <p class="wing-status" role="status"></p>
+    <p class="wing-note" hidden>We record anonymous match stats to tune balance.</p>
     <div class="wing-actions"><button type="button" class="btn wing-copy">COPY LINK</button>
     <button type="button" class="btn wing-leave">LEAVE WING</button></div>`
   const code = root.querySelector<HTMLElement>('.wing-code')!
@@ -29,6 +30,7 @@ export function createWing(parent: HTMLElement, onLeave: () => void) {
   const potQr = root.querySelector<HTMLCanvasElement>('.wing-pot-qr')!
   const potInvoice = root.querySelector<HTMLTextAreaElement>('.wing-pot-invoice')!
   const potCopy = root.querySelector<HTMLButtonElement>('.wing-pot-copy')!
+  const note = root.querySelector<HTMLElement>('.wing-note')!
   const copy = root.querySelector<HTMLButtonElement>('.wing-copy')!
   const leave = root.querySelector<HTMLButtonElement>('.wing-leave')!
   let url = ''
@@ -55,8 +57,10 @@ export function createWing(parent: HTMLElement, onLeave: () => void) {
   })
   parent.append(root)
   return {
-    show(joinCode: string, host: boolean, joinUrl?: string) {
+    /** `recorded`: a dedicated-server room, whose matches feed the anonymous stats. */
+    show(joinCode: string, host: boolean, joinUrl?: string, recorded = false) {
       root.hidden = false
+      note.hidden = !recorded
       code.textContent = `JOIN CODE ${joinCode}`
       url = joinUrl ?? `${location.origin}${location.pathname}?join=${joinCode}`
       copy.textContent = 'COPY LINK'
