@@ -453,6 +453,53 @@ body {
   gap: 6px;
 }
 
+#select .hangar-actions,
+#select .host-game {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#select .hangar-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+#select .host-game[hidden] {
+  display: none;
+}
+
+#select .host-game label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #dff6ff;
+  font: 11px var(--font-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+#select .host-game select {
+  min-width: 54px;
+  padding: 10px 8px;
+  border: 1px solid var(--hair);
+  background: #0b0f1a;
+  color: #dff6ff;
+  font: 700 13px var(--font-display);
+  cursor: pointer;
+}
+
+#select .host-game select:focus-visible,
+#select .host-button:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
+#select .host-button {
+  border-color: var(--cyan);
+  color: #dff6ff;
+}
+
 .btn-launch {
   font-family: var(--font-display);
   font-weight: 900;
@@ -1234,6 +1281,11 @@ body {
 
   #select .controls-legend {
     display: none;
+  }
+
+  #select .hangar-actions {
+    width: 100%;
+    justify-content: center;
   }
 
   .hud-tl,

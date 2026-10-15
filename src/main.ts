@@ -108,6 +108,13 @@ function boot() {
     camera: stage.camera,
     audio,
     onLaunch: (id) => startRun(id),
+    onHost: endpoint ? (seats) => {
+      const url = new URL(window.location.href)
+      url.searchParams.delete('join')
+      url.searchParams.delete('p2p')
+      url.searchParams.set('host', String(seats))
+      window.location.assign(url.toString())
+    } : undefined,
     onSelect: (id) => {
       lobby?.wing.setShip(id)
       joining?.selectShip?.(id)
@@ -200,6 +207,7 @@ function boot() {
     game.abandon()
     netPanel.style.display = 'none'
     hangar.action(mode.kind === 'join' ? 'JOIN WING' : null)
+    hangar.hostOptions(mode.kind === 'solo')
     wing.hide()
     screens.moveTo('hangar')
     pause.hide()
