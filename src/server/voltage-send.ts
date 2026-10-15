@@ -1,5 +1,6 @@
 import type { PotLedger, PotSend } from './pot-ledger'
 import type { VoltageConfig } from './voltage-receive'
+import { voltageUrl } from './voltage-url'
 
 interface Payment {
   id: string
@@ -32,8 +33,8 @@ export class VoltageSend {
 
   private paymentUrl(id?: string): string {
     const { baseUrl, organizationId, environmentId } = this.config
-    return new URL(`/organizations/${organizationId}/environments/${environmentId}/payments` +
-      (id ? `/${id}` : ''), baseUrl).toString()
+    return voltageUrl(baseUrl, `organizations/${organizationId}/environments/${environmentId}/payments` +
+      (id ? `/${id}` : ''))
   }
 
   private request(url: string, init: RequestInit): Promise<Response> {
@@ -59,8 +60,8 @@ export class VoltageSend {
     // The wallet has no credit line. Check spendable BTC on every attempt, not
     // its nominal limit or total balance; processing fees are additional.
     try {
-    const walletUrl = new URL(`/organizations/${this.config.organizationId}/wallets/${this.config.walletId}`,
-      this.config.baseUrl).toString()
+    const walletUrl = voltageUrl(this.config.baseUrl,
+      `organizations/${this.config.organizationId}/wallets/${this.config.walletId}`)
     const walletResponse = await this.request(walletUrl, { method: 'GET' })
     if (!walletResponse.ok) throw new Error('wallet balance unavailable')
     const wallet = await walletResponse.json() as { id?: string; network?: string; balances?: {
@@ -95,10 +96,15 @@ export class VoltageSend {
     catch { return send }
     if (response.status === 202 || response.status === 409) {
       await this.ledger.updateSend(code, seat, send.id, 'submitted')
-    } else if (response.status === 400 || response.status === 422) {
+    } else {
+      console.error('[neon-orbit] Voltage send POST unexpected status', {
+        room: code, seat, paymentId: send.id, status: response.status,
+      })
+      if (response.status === 400 || response.status === 422) {
       // These validation responses reject the request before execution. An
       // unrelated 5xx/timeout remains uncertain and must be reconciled by ID.
-      await this.ledger.updateSend(code, seat, send.id, 'failed')
+        await this.ledger.updateSend(code, seat, send.id, 'failed')
+      }
     }
     return send
   }

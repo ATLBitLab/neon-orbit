@@ -78,9 +78,19 @@ try {
   let reads = 0
   const config = { baseUrl: 'http://127.0.0.1:9999/v1', organizationId: 'org',
     environmentId: 'env', walletId: 'wallet', apiKey: 'fake-only' }
+  const paymentsPath = '/v1/organizations/org/environments/env/payments'
+  const walletPath = '/v1/organizations/org/wallets/wallet'
+  function assertVoltagePath(url: string | URL, method = 'GET'): 'wallet' | 'post' | 'payment' {
+    const path = new URL(String(url)).pathname
+    if (path === walletPath) { assert.equal(method, 'GET'); return 'wallet' }
+    if (method === 'POST') { assert.equal(path, paymentsPath); return 'post' }
+    assert.match(path, /^\/v1\/organizations\/org\/environments\/env\/payments\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      'send GET retains /v1 and its payment UUID')
+    return 'payment'
+  }
   const mock = (async (url: string | URL, init?: RequestInit): Promise<Response> => {
-    const target = String(url)
-    if (target.endsWith('/wallets/wallet')) {
+    const path = assertVoltagePath(url, init?.method)
+    if (path === 'wallet') {
       return Response.json({ id: 'wallet', network: 'mainnet', balances: [{ currency: 'btc',
         available: { amount: 200_000, unit: 'msats', negative: false } }] })
     }
@@ -118,7 +128,8 @@ try {
   let spendable = 0
   let retriedPosts = 0
   const balanceMock = (async (url: string | URL, init?: RequestInit): Promise<Response> => {
-    if (String(url).endsWith('/wallets/wallet')) return Response.json({ id: 'wallet', network: 'mainnet',
+    const path = assertVoltagePath(url, init?.method)
+    if (path === 'wallet') return Response.json({ id: 'wallet', network: 'mainnet',
       balances: [{ currency: 'btc', available: { amount: spendable, unit: 'msats', negative: false } }] })
     if (init?.method === 'POST') { retriedPosts++; return new Response(null, { status: 202 }) }
     return new Response(null, { status: 404 })
@@ -138,6 +149,30 @@ try {
   assert.equal((await balanceSender.poll('PAY123', 1, retry.id)).state, 'submitted',
     'a 202-accepted UUID cannot be failed by a later transient 404')
 
+  await reopened.createRoom('ERR503', 2, 100)
+  await reopened.prepareSeat('ERR503', 0)
+  await reopened.update('ERR503', 0, 'completed')
+  await reopened.interrupt('ERR503')
+  await reopened.ensureRefunds('ERR503')
+  const badStatusSend = await reopened.prepareSend('ERR503', 0, 'lnbc980n1' + 'q'.repeat(60))
+  const badStatusMock = (async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    const path = assertVoltagePath(url, init?.method)
+    if (path === 'wallet') return Response.json({ id: 'wallet', network: 'mainnet',
+      balances: [{ currency: 'btc', available: { amount: 200_000, unit: 'msats', negative: false } }] })
+    assert.equal(path, 'post')
+    return new Response(null, { status: 503 })
+  }) as typeof fetch
+  const sendLogs: unknown[][] = []
+  const originalError = console.error
+  console.error = (...values: unknown[]) => { sendLogs.push(values) }
+  try {
+    assert.equal((await new VoltageSend(reopened, config, badStatusMock)
+      .submit('ERR503', 0, badStatusSend.id)).state, 'uncertain')
+  } finally { console.error = originalError }
+  assert.equal((sendLogs[0]?.[1] as { status?: number })?.status, 503,
+    'send POST logs the unexpected HTTP status')
+  assert(!JSON.stringify(sendLogs).includes('fake-only'), 'send error log excludes the API key')
+
   await reopened.createRoom('NFD123', 2, 100)
   await reopened.prepareSeat('NFD123', 0)
   await reopened.update('NFD123', 0, 'completed')
@@ -146,7 +181,8 @@ try {
   const uncertain = await reopened.prepareSend('NFD123', 0, 'lnbc980n1' + 'q'.repeat(60))
   let uncertainPosts = 0
   const absentMock = (async (url: string | URL, init?: RequestInit): Promise<Response> => {
-    if (String(url).endsWith('/wallets/wallet')) return Response.json({ id: 'wallet', network: 'mainnet',
+    const path = assertVoltagePath(url, init?.method)
+    if (path === 'wallet') return Response.json({ id: 'wallet', network: 'mainnet',
       balances: [{ currency: 'btc', available: { amount: 200_000, unit: 'msats', negative: false } }] })
     if (init?.method === 'POST') { uncertainPosts++; throw new Error('no response') }
     return new Response(null, { status: 404 })
@@ -193,7 +229,8 @@ try {
   let lateVisible = false
   let latePosts = 0
   const lateMock = (async (url: string | URL, init?: RequestInit): Promise<Response> => {
-    if (String(url).endsWith('/wallets/wallet')) return Response.json({ id: 'wallet', network: 'mainnet',
+    const path = assertVoltagePath(url, init?.method)
+    if (path === 'wallet') return Response.json({ id: 'wallet', network: 'mainnet',
       balances: [{ currency: 'btc', available: { amount: 200_000, unit: 'msats', negative: false } }] })
     if (init?.method === 'POST') { latePosts++; throw new Error('lost response') }
     return lateVisible ? Response.json({ id: late.id, wallet_id: 'wallet', organization_id: 'org',

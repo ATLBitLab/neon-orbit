@@ -1,4 +1,5 @@
 import type { PotLedger, PotSeat } from './pot-ledger'
+import { voltageUrl } from './voltage-url'
 
 export interface VoltageConfig {
   baseUrl: string
@@ -33,8 +34,8 @@ export class VoltageReceive {
 
   private paymentUrl(id?: string): string {
     const { baseUrl, organizationId, environmentId } = this.config
-    const path = `/organizations/${organizationId}/environments/${environmentId}/payments`
-    return new URL(path + (id ? `/${id}` : ''), baseUrl).toString()
+    const path = `organizations/${organizationId}/environments/${environmentId}/payments`
+    return voltageUrl(baseUrl, path + (id ? `/${id}` : ''))
   }
 
   // A timeout applies to every external read/write. No POST is retried after
@@ -77,6 +78,10 @@ export class VoltageReceive {
     if (response.status === 202 || response.status === 409) {
       // 202 only acknowledges the request; it never means invoice or payment.
       await this.ledger.update(code, seat, 'submitted')
+    } else {
+      console.error('[neon-orbit] Voltage receive POST unexpected status', {
+        room: code, seat, paymentId: entry.paymentId, status: response.status,
+      })
     }
     // Other outcomes remain uncertain until GET by the same persisted ID.
     return entry
