@@ -83,16 +83,24 @@ node /opt/neon-orbit/scripts/stats-summary.mjs            # table per hull
 node /opt/neon-orbit/scripts/stats-summary.mjs --json     # raw numbers
 ```
 
-## Pot payment lobby (disabled until payout/refunds ship)
+## Optional Bitcoin pot matches
 
-`POT_ENABLED=0` is the service default. Do **not** enable pot rooms from this
-branch: they can receive invoices but deliberately cannot launch yet. The
-client shows a pot choice, invoice QR and copy control, and settled-seat status;
-authoritative results, payout, and refunds come in the next PR.
+`POT_ENABLED=0` is the service default. Keep it off until the payout branch has
+passed independent review and the owner-authorized mainnet trial below. The
+client shows a pot choice (10–1,000 sats), invoice QR and copy control, and
+settled-seat status. A pot launches only after at least two present humans have
+settled. It uses elimination: the last human alive wins; if several remain when
+the squadron clears, their highest score wins; if none remain, the highest
+human score wins. A tie breaks toward the lower seat number. AI cannot win.
 Free rooms keep the existing `/rooms` and WebSocket behavior.
 
 When the complete flow is ready, systemd's optional root-owned
-`/etc/neon-orbit/pot.env` provides `POT_ENABLED=1` and `VOLTAGE_API_KEY`.
+`/etc/neon-orbit/pot.env` provides `POT_ENABLED=1`, `VOLTAGE_API_KEY`, and
+`POT_PROCESSING_FEE_BPS`. Set that last value to the verified **send** fee rate
+configured on the dedicated Voltage wallet, using `0` only if the dashboard
+confirms no rate. Pot mode refuses to start without this explicit value; rates
+above 1,000 basis points are refused. The fee reserve and wallet-available check
+both include it. Recheck the setting if the wallet policy changes.
 The server uses the dedicated mainnet `neon-orbit-pot` wallet and stores its
 ledger at `/var/lib/neon-orbit/pot-ledger.json` (the service's `StateDirectory`).
 The state directory is mode 0700 and the ledger file is mode 0600. The ledger contains payment IDs, invoice state, and salted hashes of private
@@ -101,7 +109,7 @@ Back up the state directory before replacing the droplet. A restart ends live
 matches but keeps payment records for reconciliation and later refunds.
 
 With the flag on, `POST /rooms` accepts an optional
-`{"pot":{"buyInSats":100}}` (1–1000 sats). A seat receives its claim over
+`{"pot":{"buyInSats":100}}` (10–1000 sats). A seat receives its claim over
 its own WebSocket after HELLO. `POST /pot` with `{"code":"…","seat":0}`
 and `Authorization: Bearer <claim>` submits a fixed BOLT11 receive invoice;
 `GET /pot?room=…&seat=0` with the same header polls settlement. The HTTP
@@ -112,11 +120,118 @@ cannot inherit a claimed pot seat. The browser keeps its private seat claim in
 local storage and proves it in the first WebSocket frame when reclaiming a
 vacated paid seat. After creating a pot room, the host address becomes its
 join link so reloading returns to that room. Room links contain the code and
-server address, not the claim. Even after every seat pays, LAUNCH remains
-disabled until payout and refund handling is ready.
+server address, not the claim.
+
+When the result is durably recorded, the winner gets a 24-hour claim bound to
+that seat credential. The browser shows an LNURL-withdraw QR and a BOLT11
+invoice input for wallets without LNURL-withdraw. Each short-lived LNURL `k1`
+works once. A send UUID, invoice and fee cap are fsynced before one Voltage
+POST; `202` is pending, never proof of payment. Status is verified by GET of
+that same UUID. A failed send may be retried with a new invoice; an uncertain
+one may only be reconciled, not reposted. If final fees leave at least 2 sats
+from the allowance, the same authenticated browser offers a second, smaller
+single-use withdrawal. Smaller or unreported residuals remain a ledger
+liability for operator reconciliation. A restart, room error, or unlaunched
+room expiry converts settled seats to refunds, including payments that settle
+late. Leaving the wing explicitly cancels that paid lobby seat; if its owner
+disconnects, the seat is refunded after ten minutes unless it is reclaimed.
+Revisit the original room link in the same browser to retrieve a refund after
+the room closes. The ledger retains every unresolved payment and unused
+fee allowance rather than treating it as house revenue. Back it up and reconcile
+residual fee allowances before considering a wallet balance free to spend.
+
+The server uses `POT_PUBLIC_URL` (default
+`https://104-131-185-100.sslip.io`) in LNURL callbacks. Set it to the exact
+public HTTPS origin if the hostname changes. Caddy must proxy `/pot/claim`,
+`/lnurlw`, and `/lnurlw/cb` as in `deploy/Caddyfile`.
 
 Run `npm run check:pot` for loopback-only mocked Voltage and listener tests.
 They use a fake key and make no mainnet requests.
+`npm run check:pot-payout` covers winner/refund ledger transitions and an
+ambiguous mocked send across a process restart.
+
+### PM-run, owner-authorized mainnet trial (maximum 5,000 sats)
+
+Run only after independent review of this payout PR, while the server has zero
+active rooms. The owner authorized the Project Manager to use up to 5,000 sats
+from the `atlbitlab` wallet for this trial; no automated test or developer
+session should use that wallet. Keep the dedicated `neon-orbit-pot` wallet's
+credit limit at zero. Confirm its mainnet network, available BTC balance,
+send policies, and the `VOLTAGE_API_KEY` environment key using the Voltage
+dashboard without printing the key. Back up `/var/lib/neon-orbit/pot-ledger.json`
+securely before switching the flag.
+Run only **one pot room at a time** until the single-wallet balance and
+in-flight-send contention is hardened. The flag returns to off immediately
+after this trial; the owner does not play for money before it passes.
+
+1. In root-owned `/etc/neon-orbit/pot.env`, set `POT_ENABLED=1`, set the
+   verified `POT_PROCESSING_FEE_BPS`, and keep the existing key.
+   `chmod 0600 /etc/neon-orbit/pot.env`; restart `neon-orbit` and
+   check `/health` reports `potEnabled:true`. Do not put the key in git or a
+   shell command history. Abort if startup or reconciliation logs an error.
+2. Create a 100-sat pot from the production HOST GAME control. Have two test
+   seats pay their exact invoices from the approved `atlbitlab` wallet. Before
+   launch, verify both show **PAID**, never merely "invoice created" or 202.
+   Fly to an elimination result. The winner scans the LNURL-withdraw QR or
+   pastes a fixed-amount mainnet BOLT11 invoice for the displayed amount.
+   Record the first send UUID and verify it is **completed** in Voltage (a
+   submitted 202 is not paid). The unused fee reserve should then produce a
+   `claimable` remainder of at least 2 sats. Withdraw that second claim and
+   record its separate UUID and amount. Only call the entitlement complete
+   after both sends are reconciled.
+3. Create a second 100-sat pot and pay only one seat. Close its tabs and wait
+   for the ten-minute empty-room expiry. Reopen its room link on the same
+   browser; the claim panel should offer a refund. Withdraw it and verify its
+   distinct Voltage send UUID is completed. This trial uses about 300 sats of
+   buy-ins, leaving room under the 5,000-sat authorization for fees and one
+   retry. Never send a second payment to compensate for an uncertain first.
+   If a send remains uncertain, look up its persisted UUID with Voltage
+   `GET /v1/organizations/<org>/environments/<env>/payments/<uuid>` and in
+   the dashboard; verify wallet, direction, amount, and status. After 30
+   minutes of 404s the server marks it `needs-reconcile` and shows the player
+   **Payout under review**. It keeps polling the original UUID and never
+   reopens the claim from a 404 alone. An ambiguous send's entitlement does
+   not expire while it is unresolved. Record the UUID for audit; do not try a
+   new invoice until a terminal Voltage result or the offline procedure below.
+4. Set `POT_ENABLED=0` in the root-owned environment file and restart only
+   after all active rooms have ended. Confirm `/pot` returns 404, free room
+   creation/launch still works, and `journalctl -u neon-orbit` has no payout
+   errors. For **each** completed send record the actual network/provider and
+   processing fee from Voltage's `payment_breakdown`. If only `data.fees` is
+   available, record its aggregate total and treat the fee-policy check as
+   inconclusive until Voltage supplies the breakdown. Compare network fee to
+   that send's `maxFeeMsat`, processing fee to `POT_PROCESSING_FEE_BPS`, and
+   total fee to its reserve.
+   Pass only if every send stays inside the reserve and all residual claims
+   reconcile. If a fee exceeds the bound, turn the flag off, correct the bps
+   or reserve and rerun the trial before leaving pot mode enabled. Record each
+   buy-in and send UUID and any sub-2-sat dust retained in the ledger. Keep the
+   ledger backup until reconciled.
+
+### Offline reconciliation of an ambiguous send
+
+This is a PM/operator action, never a player action. A GET 404, even after 30
+minutes, is **not** proof that Voltage did not execute the payment. Check the
+UUID in Voltage's payments list or dashboard for the correct organization,
+environment and wallet. If it is present, leave the ledger alone: the server
+will poll it to `completed` or `failed`. If and only if the operator confirms
+the UUID was never created, wait for all live rooms to end and stop the service.
+As root on the droplet, make a private backup and run the offline CLI:
+
+```sh
+systemctl stop neon-orbit
+cp -p /var/lib/neon-orbit/pot-ledger.json /root/pot-ledger.before-reconcile.json
+node /opt/neon-orbit/dist-server/pot-reconcile.mjs <confirmed-absent-uuid> --confirmed-absent
+systemctl start neon-orbit
+```
+
+The CLI refuses to run without root, while the service is active, or unless
+that exact UUID is in `needs-reconcile`. It drops to the ledger's service-user
+identity before writing, so the restarted listener retains file access. The
+single-use action marks only that send `failed` and gives its owner a fresh
+24-hour claim window. Keep the backup and both old/new UUIDs until the new
+send completes. During the PM trial, leave `POT_ENABLED=0` again after all
+payments reconcile.
 
 ## Client preview
 

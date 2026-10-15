@@ -51,7 +51,7 @@ import { modeFromLocation } from '../src/net/browser'
 import { stepSession } from '../src/net/frame'
 import { createLinkMonitor, type LinkReport } from '../src/net/link'
 import { createClient, createHost, decodeResult, decodeWelcome, encodeResult, encodeWelcome, FRAME, SNAPSHOT_DEPTH, SNAPSHOT_QUEUE } from '../src/net/session'
-import { createGame, DEATH_SEQUENCE, PARTICIPANT_BOUNTY_MULT, placeLines, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
+import { awardPotWinner, createGame, DEATH_SEQUENCE, PARTICIPANT_BOUNTY_MULT, placeLines, type Game, type GameDeps, type RunSnapshot } from '../src/game/game'
 import { barBrightness, DAMAGE_BAR_FADE, DAMAGE_BAR_HOLD, type Hud } from '../src/game/hud'
 import { createSeats, isParticipant, seatOf } from '../src/game/roster'
 import { createDevHook, installDevHook, type DevHook } from '../src/core/dev-hook'
@@ -8052,6 +8052,29 @@ testFactionsAreOpenNotTwoSided()
 testMintingAFactionIsGuarded()
 testBoundaryTurnsShipsAround()
 testQuirks()
+function testPotWinnerIsOnePaidHuman(): void {
+  section('Pot winner belongs to one paid human, never AI backfill')
+  const lines = (alive: boolean[], score: number[]): SeatLine[] => score.map((value, seat) => ({
+    seat, ship: 'hornet', score: value, kills: 0, deaths: alive[seat] ? 0 : 1,
+    hits: 0, shots: 0, alive: alive[seat], place: seat + 1, won: false,
+  }))
+  const one = lines([true, false, true], [20, 900, 9999])
+  check('last surviving human wins over a higher-scoring AI', awardPotWinner(one, [0, 1]) === 0)
+  check('exactly one line is marked winner', one.filter(line => line.won).length === 1)
+  const several = lines([true, true, true], [30, 80, 9999])
+  check('highest-scoring human survivor wins over AI', awardPotWinner(several, [0, 1]) === 1)
+  const dead = lines([false, false, true], [70, 50, 9999])
+  check('if every human dies, their highest score wins', awardPotWinner(dead, [0, 1]) === 0)
+  const tied = lines([true, true], [80, 80])
+  check('a tie resolves deterministically to the lower seat', awardPotWinner(tied, [0, 1]) === 0)
+  const vacant = lines([true, false], [900, 10])
+  check('a vacant AI survivor cannot win over the remaining human',
+    awardPotWinner(vacant, [1]) === 1)
+  const reclaimed = lines([true, false], [900, 10])
+  check('a reclaimed pilot is eligible to win again', awardPotWinner(reclaimed, [0, 1]) === 0)
+}
+
+testPotWinnerIsOnePaidHuman()
 testSolarSear()
 testBoltPoolDoesNotLeak()
 testMines()

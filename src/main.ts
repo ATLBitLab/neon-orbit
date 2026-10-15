@@ -24,11 +24,13 @@ import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, typ
 import { LINK_GRACE_MS } from './net/link'
 import { stepSession } from './net/frame'
 import type { LobbyState } from './net/session'
-import { createServerRoom, joinServer, potPayment, serverJoinLink, serverPotEnabled, serverUrl,
+import { cancelPotSeat, createServerRoom, joinServer, potClaimStatus, potPayment, serverJoinLink, serverPotEnabled, serverUrl,
   type PotPaymentStatus } from './net/server'
 import { createHangar } from './ui/hangar'
 import { createWing } from './ui/wing'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
+import { createPotClaimPanel } from './ui/pot-claim'
+import { potLaunchAction } from './ui/pot-launch'
 import { createScreens } from './ui/screens'
 import { buildEnvironment } from './world/environment'
 
@@ -82,8 +84,9 @@ function boot() {
   const endpoint = serverUrl(window.location.search)
   const requestedPot = Number(new URLSearchParams(window.location.search).get('pot'))
   const potBuyInSats = mode.kind === 'host' && endpoint && Number.isInteger(requestedPot) &&
-    requestedPot >= 1 && requestedPot <= 1000 ? requestedPot : undefined
+    requestedPot >= 10 && requestedPot <= 1000 ? requestedPot : undefined
   let potAvailable = false
+  let activePotRoom = false
   let potPoll: number | null = null
   let hosting: Hosting | null = null
   let joining: Joining | null = null
@@ -150,6 +153,13 @@ function boot() {
   }
 
   const wing = createWing(hangar.root.querySelector('.stage')!, () => {
+    const code = new URLSearchParams(window.location.search).get('join')
+    const claim = code ? storedPotClaim(code) : undefined
+    if (endpoint && code && claim) {
+      void cancelPotSeat(endpoint, code, claim.seat, claim.token)
+        .then(() => checkPotClaim(code))
+        .catch(() => netStatus('Pot cancellation unavailable. Reopen this room link to retry.'))
+    }
     clearPotPoll()
     joinAttempt++
     joining?.stop()
@@ -185,6 +195,11 @@ function boot() {
       openHangar()
     },
   })
+  const potClaimPanel = createPotClaimPanel(overlay)
+  function checkPotClaim(code: string) {
+    const claim = storedPotClaim(code)
+    if (endpoint && claim) void potClaimPanel.show(endpoint, code, claim.seat, claim.token)
+  }
 
   const game = createGame({
     scene: stage.scene,
@@ -322,6 +337,7 @@ function boot() {
   }
 
   function startJoining(code: string, asServerHost = false) {
+    checkPotClaim(code)
     clearPotPoll()
     const attempt = ++joinAttempt
     const resumeToken = endpoint && serverResume?.endpoint === endpoint && serverResume.code === code
@@ -335,6 +351,7 @@ function boot() {
     let lobbyState: LobbyState | null = null
     let launcherSeat: number | undefined
     let potRoom: { buyInSats: number; paidSeats: number[] } | null = null
+    activePotRoom = false
     let potStatus: PotPaymentStatus | undefined
     let potClaim = storedPotClaim(code)
     const renderPot = () => {
@@ -356,8 +373,8 @@ function boot() {
     const updateAction = () => {
       if (endpoint && potRoom) {
         const humanSeats = lobbyState?.seats.flatMap((seat, i) => seat.pilot === 'human' ? [i] : []) ?? []
-        hangar.action(humanSeats.length >= 2 && humanSeats.every(seat => potRoom!.paidSeats.includes(seat))
-          ? 'AWAITING POT LAUNCH' : 'WAITING FOR PAYMENT', true)
+        const action = potLaunchAction(serverCanLaunch, humanSeats, potRoom.paidSeats)
+        hangar.action(action.label, action.disabled)
       } else if (endpoint) hangar.action(serverCanLaunch ? serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER' : 'WAITING FOR HOST',
         !serverCanLaunch || !serverReady)
       else hangar.action('WAITING FOR HOST', true)
@@ -402,6 +419,7 @@ function boot() {
       onPotRoom: (pot: { buyInSats: number; paidSeats: number[] }) => {
         if (!current()) return
         potRoom = pot
+        activePotRoom = true
         renderPot()
         updateAction()
         if (potClaim && potPoll === null && !['completed', 'failed', 'expired'].includes(potStatus?.state ?? '')) {
@@ -475,6 +493,7 @@ function boot() {
         if (!current()) return
         console.error(error)
         offerRetry(code, 'COULD NOT JOIN', error instanceof Error ? error.message : String(error))
+        checkPotClaim(code)
       })
   }
 
@@ -496,6 +515,21 @@ function boot() {
     // other screen music. Nobody reads a debrief for a minute and a quarter.
     audio.setMusic(result.won ? 'victory' : 'defeat')
     debrief.show(result, isRecord, Math.max(previous, result.score))
+    const code = new URLSearchParams(window.location.search).get('join')
+    if (code) {
+      checkPotClaim(code)
+      if (activePotRoom) {
+        debrief.potNotice('Pot match · disconnecting forfeits the pot.')
+        const claim = storedPotClaim(code)
+        if (endpoint && claim) void potClaimStatus(endpoint, code, claim.seat, claim.token)
+          .then(status => {
+            if (status.kind === 'winner' && status.amountMsat !== null && debrief.visible) {
+              debrief.potNotice(`Claimable: ${(status.amountMsat / 1000).toLocaleString()} sats ` +
+                '(gross pot less the fee reserve). Disconnecting forfeits the pot.')
+            }
+          }).catch(() => {})
+      }
+    }
   }
 
   /* ---- Global keys and pointer lock ------------------------------------- */
@@ -602,6 +636,7 @@ function boot() {
     hangar.dispose()
     pause.dispose()
     debrief.dispose()
+    potClaimPanel.dispose()
     hud.dispose()
     input.dispose()
     audio.dispose()

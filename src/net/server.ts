@@ -45,6 +45,50 @@ export async function createServerRoom(endpoint: string, seats: number, buyInSat
 
 export interface PotPaymentStatus { paymentId: string; state: string; invoice: string | null }
 
+export interface PotClaimStatus {
+  phase: string
+  kind: 'winner' | 'refund' | null
+  amountMsat: number | null
+  expiresAt: number | null
+  state: string
+  paymentId: string | null
+  feeNotice: string
+  lnurl?: string
+}
+
+export async function potClaimStatus(endpoint: string, code: string, seat: number,
+  token: string): Promise<PotClaimStatus> {
+  const url = new URL('/pot/claim', endpoint.replace(/^ws/, 'http'))
+  url.searchParams.set('room', code)
+  url.searchParams.set('seat', String(seat))
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' })
+  const body = await response.json() as PotClaimStatus & { error?: string }
+  if (!response.ok) throw new Error(body.error ?? 'claim status unavailable')
+  return body
+}
+
+export async function potClaimInvoice(endpoint: string, code: string, seat: number,
+  token: string, invoice: string): Promise<PotClaimStatus> {
+  const url = new URL('/pot/claim', endpoint.replace(/^ws/, 'http'))
+  const response = await fetch(url, { method: 'POST', headers: {
+    Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ code, seat, invoice }), cache: 'no-store' })
+  const body = await response.json() as PotClaimStatus & { error?: string }
+  if (!response.ok) throw new Error(body.error ?? 'claim unavailable')
+  return body
+}
+
+export async function cancelPotSeat(endpoint: string, code: string, seat: number,
+  token: string): Promise<PotClaimStatus> {
+  const url = new URL('/pot/cancel', endpoint.replace(/^ws/, 'http'))
+  const response = await fetch(url, { method: 'POST', headers: {
+    Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ code, seat }), cache: 'no-store' })
+  const body = await response.json() as PotClaimStatus & { error?: string }
+  if (!response.ok) throw new Error(body.error ?? 'seat cancellation unavailable')
+  return body
+}
+
 export async function potPayment(endpoint: string, code: string, seat: number, token: string,
   create: boolean): Promise<PotPaymentStatus> {
   const url = new URL('/pot', endpoint.replace(/^ws/, 'http'))

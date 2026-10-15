@@ -204,12 +204,12 @@ export function createHangar(deps: HangarDeps): Hangar {
   potAmount.textContent = 'Buy-in · sats'
   const sats = el('input') as HTMLInputElement
   sats.type = 'number'
-  sats.min = '1'
+  sats.min = '10'
   sats.max = '1000'
   sats.step = '1'
   sats.value = '100'
   potAmount.append(sats)
-  const potFee = el('p', 'pot-fee', 'Winner receives the pot minus Lightning routing fees.')
+  const potFee = el('p', 'pot-fee', 'Winner receives the pot minus a bounded allowance for Lightning routing and processing fees. No house fee.')
   potFee.hidden = true
   potToggle.addEventListener('change', () => {
     potAmount.hidden = !potToggle.checked
@@ -272,8 +272,8 @@ export function createHangar(deps: HangarDeps): Hangar {
     audio.resume()
     audio.uiSelect()
     const buyIn = potToggle.checked ? Number(sats.value) : undefined
-    if (buyIn !== undefined && (!Number.isInteger(buyIn) || buyIn < 1 || buyIn > 1000)) {
-      sats.setCustomValidity('Choose 1 to 1,000 sats')
+    if (buyIn !== undefined && (!Number.isInteger(buyIn) || buyIn < 10 || buyIn > 1000)) {
+      sats.setCustomValidity('Choose 10 to 1,000 sats')
       sats.reportValidity()
       return
     }

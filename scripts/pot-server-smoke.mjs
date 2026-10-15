@@ -39,7 +39,7 @@ try {
   const mockPort = mock.address().port
   const port = 18178
   child = spawn('node', ['dist-server/listener.mjs'], { env: {
-    ...process.env, PORT: String(port), POT_ENABLED: '1',
+    ...process.env, PORT: String(port), POT_ENABLED: '1', POT_PROCESSING_FEE_BPS: '0',
     POT_LEDGER_PATH: join(dir, 'ledger.json'), VOLTAGE_API_KEY: 'mock-key',
     VOLTAGE_API_URL: `http://127.0.0.1:${mockPort}/v1`,
   }, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -70,12 +70,16 @@ try {
   async function connectPlayer() {
     const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?room=${code}`)
     const controls = []
-    socket.on('message', (data, binary) => { if (!binary) controls.push(JSON.parse(String(data))) })
+    const frames = []
+    socket.on('message', (data, binary) => {
+      if (!binary) controls.push(JSON.parse(String(data)))
+      else frames.push(Buffer.from(data))
+    })
     await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) })
     sockets.push(socket)
     socket.send(Buffer.from([1, 3, 0]))
     await wait(() => controls.some(item => item.type === 'pot'))
-    return { socket, controls, pot: controls.find(item => item.type === 'pot') }
+    return { socket, controls, frames, pot: controls.find(item => item.type === 'pot') }
   }
   const first = await connectPlayer()
   const second = await connectPlayer()
@@ -116,11 +120,6 @@ try {
     authorization: `Bearer ${second.pot.claim}`,
   } })
   assert.equal((await secondPaid.json()).state, 'completed')
-  first.socket.send(JSON.stringify({ type: 'start' }))
-  await wait(() => first.controls.some(item => item.type === 'error' &&
-    item.message === 'pot matches are awaiting payout support'))
-  assert.equal((await fetch(`${url}/health`).then(r => r.json())).rooms, 2,
-    'pot launch remains disabled in receive-only slice')
   first.socket.close()
   await new Promise(resolve => first.socket.once('close', resolve))
   // Paid seat 0 stays locked to the claim, not merely the room code.
@@ -145,8 +144,15 @@ try {
   replacement.send(Buffer.concat([Buffer.from([9, 0]), Buffer.from(first.pot.claim, 'ascii')]))
   replacement.send(Buffer.from([1, 3, 0]))
   await wait(() => frames.some(frame => frame[0] === 7 && frame[6] === 0))
+  // The earliest still-connected HELLO is the launcher after seat 0 is reclaimed.
+  second.socket.send(JSON.stringify({ type: 'start' }))
+  await wait(() => second.frames.some(frame => frame[0] === 2) &&
+    frames.some(frame => frame[0] === 2))
+  assert.equal((await fetch(`${url}/health`).then(r => r.json())).rooms, 2,
+    'the fully paid pot and separate free room remain isolated')
   const disk = JSON.parse(await readFile(join(dir, 'ledger.json'), 'utf8'))
   assert.equal(disk.rooms.find(room => room.code === code).entries[0].state, 'completed')
+  assert.equal(disk.rooms.find(room => room.code === code).phase, 'running')
   assert(!JSON.stringify(disk).includes(first.pot.claim))
   console.log('pot listener + mocked Voltage smoke passes')
 } finally {

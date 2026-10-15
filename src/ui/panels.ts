@@ -124,6 +124,7 @@ export function createPausePanel(deps: PauseDeps): PausePanel {
 
 export interface DebriefPanel {
   show(result: RunResult, isRecord: boolean, best: number): void
+  potNotice(text: string): void
   hide(): void
   readonly visible: boolean
   dispose(): void
@@ -156,13 +157,15 @@ export function createDebriefPanel(deps: DebriefDeps): DebriefPanel {
   const lines = el('div', 'lines')
   const record = el('div', 'record', 'New personal best')
   record.hidden = true
+  const potNotice = el('p', 'pot-notice')
+  potNotice.hidden = true
 
   const actions = el('div', 'actions')
   const replay = button('Fly again', true)
   const hangar = button('Change ship', false)
   actions.append(replay, hangar)
 
-  panel.append(heading, placing, scoreBig, record, board, lines, actions)
+  panel.append(heading, placing, scoreBig, record, board, lines, potNotice, actions)
   root.append(panel)
   deps.parent.append(root)
 
@@ -171,6 +174,7 @@ export function createDebriefPanel(deps: DebriefDeps): DebriefPanel {
 
   return {
     show(result, isRecord, best) {
+      potNotice.hidden = true
       const spec = SHIPS[result.ship]
       const match = result.match
       const mine = match?.lines.find((l) => l.ship === result.ship && l.won === result.won && l.score === result.score)
@@ -219,6 +223,10 @@ export function createDebriefPanel(deps: DebriefDeps): DebriefPanel {
       record.hidden = !isRecord || result.score <= 0
       replay.textContent = `Fly ${spec.name} again`
       root.hidden = false
+    },
+    potNotice(text) {
+      potNotice.textContent = text
+      potNotice.hidden = !text
     },
     hide() {
       root.hidden = true

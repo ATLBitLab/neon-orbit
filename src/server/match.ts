@@ -51,7 +51,7 @@ export function createHeadlessGame() {
 }
 
 export interface DedicatedOptions {
-  setup: Pick<MatchSetup, 'seed' | 'respawn'> & { ships: ShipId[] }
+  setup: Pick<MatchSetup, 'seed' | 'respawn' | 'potHumans'> & { ships: ShipId[] }
   snapshotEvery?: number
 }
 
@@ -102,6 +102,7 @@ export function createDedicatedMatch(options: DedicatedOptions) {
       host.tick()
     },
     snapshot: () => headless.game.capture(),
+    forfeitPotSeat: (seat: number) => headless.game.forfeitPotSeat(seat),
     /** One seat's read-only view, for the anonymous stats recorder. */
     view: (seat: number) => headless.game.snapshot(seat),
     get result() { return headless.game.result },

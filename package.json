@@ -15,14 +15,15 @@
     "check": "npm run typecheck && npm run check:sim && npm run check:balance",
     "bench:server": "esbuild scripts/server-bench.ts --bundle --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/server-bench.mjs --log-level=warning && node node_modules/.cache/server-bench.mjs",
     "check:bandwidth": "npm run bench:server -- 60 4 --enforce-budget && npm run bench:server -- 60 4 2 --all-drone --enforce-budget && npm run bench:server -- 60 4 2 --all-hornet --enforce-budget",
-    "build:server": "esbuild src/server/listener.ts --bundle --packages=external --platform=node --format=esm --target=node20 --outfile=dist-server/listener.mjs --log-level=warning",
+    "build:server": "esbuild src/server/listener.ts src/server/pot-reconcile.ts --bundle --packages=external --platform=node --format=esm --target=node20 --outdir=dist-server --out-extension:.js=.mjs --log-level=warning",
     "start:server": "node dist-server/listener.mjs",
     "check:server": "node scripts/server-smoke.mjs",
     "check:server-isolation": "node scripts/server-isolation.mjs",
     "check:server-resume": "esbuild scripts/server-resume.ts --bundle --packages=external --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/server-resume.mjs --log-level=warning && node node_modules/.cache/server-resume.mjs",
     "check:stats": "npm run build:server && esbuild scripts/stats-check.ts --bundle --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/stats-check.mjs --log-level=warning && node node_modules/.cache/stats-check.mjs && node scripts/server-stats.mjs",
     "stats:summary": "node scripts/stats-summary.mjs",
-    "check:pot": "npm run build:server && esbuild scripts/pot-check.ts --bundle --packages=external --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/pot-check.mjs --log-level=warning && node node_modules/.cache/pot-check.mjs && node scripts/pot-server-smoke.mjs"
+    "check:pot": "npm run build:server && esbuild scripts/pot-check.ts --bundle --packages=external --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/pot-check.mjs --log-level=warning && node node_modules/.cache/pot-check.mjs && node scripts/pot-server-smoke.mjs",
+    "check:pot-payout": "esbuild scripts/pot-payout-check.ts --bundle --packages=external --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/pot-payout-check.mjs --log-level=warning && node node_modules/.cache/pot-payout-check.mjs && esbuild scripts/pot-claim-smoke.ts --bundle --packages=external --platform=node --format=esm --target=node20 --outfile=node_modules/.cache/pot-claim-smoke.mjs --log-level=warning && node node_modules/.cache/pot-claim-smoke.mjs"
   },
   "dependencies": {
     "nostr-tools": "^2.25.2",
