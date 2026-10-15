@@ -1,0 +1,22 @@
+[Unit]
+Description=Neon Orbit game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neon-orbit
+Group=neon-orbit
+WorkingDirectory=/opt/neon-orbit
+Environment=NODE_ENV=production
+Environment=PORT=8080
+ExecStart=/usr/bin/node /opt/neon-orbit/dist-server/listener.mjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

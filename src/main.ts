@@ -22,6 +22,8 @@ import type { Controls } from './game/ship'
 import type { ShipId } from './ships/specs'
 import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, type Joining, type Lobby } from './net/browser'
 import { LINK_GRACE_MS } from './net/link'
+import type { LobbyState } from './net/session'
+import { createServerRoom, joinServer, serverJoinLink, serverUrl } from './net/server'
 import { createHangar } from './ui/hangar'
 import { createWing } from './ui/wing'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
@@ -75,6 +77,7 @@ function boot() {
   // when a join fails and the player chooses to fly alone, which is what makes
   // the frame loop step the simulation again.
   let mode = modeFromLocation(window.location.search)
+  const endpoint = serverUrl(window.location.search)
   let hosting: Hosting | null = null
   let joining: Joining | null = null
   let lobby: Lobby | null = null
@@ -156,6 +159,17 @@ function boot() {
 
   function prepareLobby() {
     if (mode.kind !== 'host') return
+    if (endpoint) {
+      const attempt = ++joinAttempt
+      wing.status('Creating server room…')
+      createServerRoom(endpoint, mode.seats).then(code => {
+        if (attempt !== joinAttempt) return
+        startJoining(code, true)
+      }).catch(error => {
+        if (attempt === joinAttempt) netStatus(`SERVER ROOM FAILED: ${error instanceof Error ? error.message : error}`)
+      })
+      return
+    }
     hosting?.stop()
     hosting = null
     lobby?.close()
@@ -194,6 +208,12 @@ function boot() {
 
   function startRun(id: ShipId) {
     if (mode.kind === 'join') { startJoining(mode.code); return }
+    if (mode.kind === 'host' && endpoint) {
+      if (!joining?.start) { netStatus('Waiting for server room…'); return }
+      joining.start()
+      hangar.action('LAUNCHING…', true)
+      return
+    }
     if (mode.kind === 'host' && hosting) prepareLobby()
     lobby?.wing.setShip(id)
     wing.hide()
@@ -247,7 +267,7 @@ function boot() {
     })
   }
 
-  function startJoining(code: string) {
+  function startJoining(code: string, asServerHost = false) {
     const attempt = ++joinAttempt
     joining?.stop()
     joining = null
@@ -258,7 +278,7 @@ function boot() {
     screens.moveTo('hangar')
     hud.hide()
     input.releasePointerLock()
-    hangar.action('JOIN WING')
+    hangar.action(asServerHost ? 'LAUNCH' : 'JOIN WING')
     hangar.open(ship)
     hangar.action('CONNECTING…', true)
     pause.hide()
@@ -267,17 +287,17 @@ function boot() {
     audio.setMusic('hangar')
     const waiting = 'connected — waiting for the host to launch'
     netPanel.style.display = 'none'
-    wing.show(code, false)
+    wing.show(code, asServerHost, endpoint ? serverJoinLink(code, endpoint) : undefined)
     wing.status('Looking for the host…')
-    joinMatch(game, code, ship, {
+    const handlers = {
       active: current,
-      status: (stage) => { if (current()) wing.status(stage) },
-      onLobby: (state) => {
+      status: (stage: string) => { if (current()) wing.status(stage) },
+      onLobby: (state: LobbyState) => {
         if (!current()) return
         wing.update(state)
-        hangar.action('WAITING FOR HOST', true)
+        hangar.action(asServerHost ? 'LAUNCH' : 'WAITING FOR HOST', !asServerHost)
       },
-      onWelcome: (seat) => {
+      onWelcome: (seat: number) => {
         if (!current()) return
         wing.hide()
         hangar.close()
@@ -287,13 +307,13 @@ function boot() {
         hud.callout(`SEAT ${seat + 1}`, '#6be6ff', 1.5)
         input.requestPointerLock()
       },
-      onRefused: (reason) => {
+      onRefused: (reason: 'version' | 'full') => {
         if (!current()) return
         offerRetry(code, 'COULD NOT JOIN',
           reason === 'version' ? 'game versions differ — reload both pages' : 'the host has no seat free',
           reason === 'full' ? 'A disconnected seat frees when the host notices the drop.' : '')
       },
-      onLink: (link) => {
+      onLink: (link: { state: 'up' | 'down' | 'degraded'; reason: string; route: string }) => {
         if (!current()) return
         const route = link.route ? `<div style="opacity:.7">route ${link.route}</div>` : ''
         if (link.state === 'degraded') {
@@ -307,7 +327,10 @@ function boot() {
           offerRetry(code, 'CONNECTION LOST', link.reason, link.route ? `route was ${link.route}` : '')
         }
       },
-    })
+    }
+    const connect = endpoint ? joinServer(game, endpoint, code, ship, handlers)
+      : joinMatch(game, code, ship, handlers)
+    connect
       .then((j) => {
         if (current()) joining = j
         else j.stop()

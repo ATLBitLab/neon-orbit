@@ -98,6 +98,7 @@ export interface Joining {
   readonly client: Client
   tick(local: Controls): void
   stop(): void
+  start?(): void
 }
 
 /** What a link looks like from the join screen: the monitor's verdict plus the route it was on. */
