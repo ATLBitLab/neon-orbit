@@ -123,6 +123,8 @@ export interface JoinHandlers {
   onLink(link: LinkStatus): void
   onServerError?(message: string): void
   onServerRole?(canLaunch: boolean, launcherSeat: number): void
+  /** Dedicated-server secret for reclaiming this seat after a brief disconnect. */
+  onServerResumeToken?(token: string): void
 }
 
 /** Connect to a host by code. Resolves once the data channel is open; the welcome follows on it. */

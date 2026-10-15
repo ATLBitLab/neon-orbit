@@ -20,6 +20,7 @@ const MAX_TICK_LEAD = 600
 const IDLE_MS = 30 * 60_000
 const EMPTY_ROOM_MS = 60_000
 const END_GRACE_MS = 10_000
+const RESUME_GRACE_MS = 12_000
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
 interface Member {
@@ -30,6 +31,17 @@ interface Member {
   hello: Uint8Array | null
   ip: string
   shipChosen: boolean
+  resumeToken: string
+  joinedAt: number | null
+}
+
+interface ResumeReservation {
+  seat: number
+  ship: ShipId
+  token: string
+  expiresAt: number
+  timer: ReturnType<typeof setTimeout>
+  claiming: boolean
 }
 
 interface Room {
@@ -37,8 +49,10 @@ interface Room {
   creatorIp: string
   seats: number
   members: Member[]
+  resumes: Map<number, ResumeReservation>
   state: 'lobby' | 'running' | 'finished'
   revision: number
+  nextJoinOrder: number
   match: ReturnType<typeof createDedicatedMatch> | null
   timer: ReturnType<typeof setInterval> | null
   expiry: ReturnType<typeof setTimeout> | null
@@ -76,8 +90,12 @@ function reply(res: import('node:http').ServerResponse, status: number, body: ob
 }
 
 function launcher(room: Room): Member | undefined {
-  // Members remain in connection order even when a vacated low seat is reused.
-  return room.members.find(member => member.hello)
+  // Joining means a valid HELLO, not merely an open (possibly idle) socket.
+  let lead: Member | undefined
+  for (const member of room.members) {
+    if (member.joinedAt !== null && (!lead || member.joinedAt < lead.joinedAt!)) lead = member
+  }
+  return lead
 }
 
 function broadcast(room: Room): void {
@@ -100,6 +118,8 @@ function closeRoom(room: Room): void {
   rooms.delete(room.code)
   if (room.timer) clearInterval(room.timer)
   if (room.expiry) clearTimeout(room.expiry)
+  for (const reservation of room.resumes.values()) clearTimeout(reservation.timer)
+  room.resumes.clear()
   // Cleanup itself must not turn one failed room into a process-wide failure.
   try { room.match?.close() } catch (error) {
     console.error(`[neon-orbit] room ${room.code} cleanup failed`, error)
@@ -111,6 +131,21 @@ function closeRoom(room: Room): void {
     }
   }
   room.members.length = 0
+}
+
+function reserveSeat(room: Room, member: Member): void {
+  if (room.state !== 'running' || !member.hello || room.match?.result) return
+  const seat = member.seat
+  const reservation: ResumeReservation = {
+    seat, ship: member.ship, token: member.resumeToken,
+    expiresAt: Date.now() + RESUME_GRACE_MS, claiming: false,
+    timer: setTimeout(() => guardRoom(room, 'resume expiry', () => {
+      if (room.resumes.get(seat) !== reservation) return
+      room.resumes.delete(seat)
+      if (room.members.length === 0) closeRoom(room)
+    }), RESUME_GRACE_MS),
+  }
+  room.resumes.set(seat, reservation)
 }
 
 function guardRoom(room: Room, phase: string, operation: () => void): void {
@@ -137,7 +172,10 @@ function startRoom(room: Room): string | null {
   // channel handler is installed, in seat order, preserving the lobby seats.
   for (const member of [...room.members].sort((a, b) => a.seat - b.seat)) {
     match.connect(member.channel, member.seat)
-    if (member.hello) member.channel.receive(member.hello)
+    if (member.hello) {
+      member.channel.receive(member.hello)
+      member.channel.control({ type: 'resume', token: member.resumeToken, graceMs: RESUME_GRACE_MS })
+    }
   }
   let next = performance.now()
   room.timer = setInterval(() => guardRoom(room, 'tick', () => {
@@ -186,7 +224,8 @@ const server = createServer((req, res) => {
       if (rooms.size >= MAX_ROOMS || totalPlayers() >= MAX_PLAYERS) {
         reply(res, 503, { error: 'server full' }); return
       }
-      const room: Room = { code: code(), creatorIp: ip, seats, members: [], state: 'lobby', revision: 0,
+      const room: Room = { code: code(), creatorIp: ip, seats, members: [], resumes: new Map(), state: 'lobby',
+        revision: 0, nextJoinOrder: 0,
         match: null, timer: null, expiry: null, lastActivity: Date.now() }
       rooms.set(room.code, room)
       reply(res, 201, { code: room.code, seats })
@@ -204,12 +243,20 @@ function clientIp(request: IncomingMessage): string {
     ? String(request.headers['x-real-ip'] ?? direct) : direct
 }
 server.on('upgrade', (request: IncomingMessage, socket, head) => {
+  let claimed: ResumeReservation | undefined
   try {
     const url = new URL(request.url ?? '/', 'http://localhost')
     const room = rooms.get(url.searchParams.get('room')?.toUpperCase() ?? '')
     const ip = clientIp(request)
     const sameIp = members().filter(member => member.ip === ip)
-    if (url.pathname !== '/ws' || !room || room.state !== 'lobby' ||
+    const resumeToken = url.searchParams.get('resume')
+    const reservation = room?.state === 'running' && resumeToken
+      ? [...room.resumes.values()].find(entry => entry.token === resumeToken &&
+          entry.expiresAt > Date.now() && !entry.claiming &&
+          !room.members.some(member => member.seat === entry.seat)) : undefined
+    if (url.pathname !== '/ws' || !room ||
+        (room.state !== 'lobby' && !reservation) ||
+        (room.state === 'lobby' && resumeToken !== null) ||
         room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
         sameIp.length >= MAX_CONNECTIONS_PER_IP ||
         sameIp.filter(member => !member.hello).length >= MAX_PENDING_PER_IP) {
@@ -217,11 +264,16 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
       socket.destroy()
       return
     }
+    if (reservation) {
+      reservation.claiming = true
+      claimed = reservation
+    }
     wss.handleUpgrade(request, socket, head, ws => {
       clientIps.set(ws, ip)
-      wss.emit('connection', ws, room)
+      wss.emit('connection', ws, room, reservation)
     })
   } catch {
+    if (claimed) claimed.claiming = false
     // A malformed request target can make URL parsing throw. Reject just this
     // connection; an uncaught upgrade error would end every active match.
     try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n') } catch { /* already closed */ }
@@ -229,8 +281,8 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
   }
 })
 
-function connectSocket(socket: WebSocket, room: Room): void {
-  const seat = Array.from({ length: room.seats }, (_, i) => i).find(i =>
+function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReservation): void {
+  const seat = reservation?.seat ?? Array.from({ length: room.seats }, (_, i) => i).find(i =>
     !room.members.some(m => m.seat === i))!
   const messages: ((bytes: Uint8Array) => void)[] = []
   const closers: (() => void)[] = []
@@ -253,8 +305,9 @@ function connectSocket(socket: WebSocket, room: Room): void {
     receive(bytes) { for (const handler of [...messages]) handler(bytes) },
     close() { socket.close(1000) },
   }
-  const member: Member = { channel, socket, seat, ship: 'hornet', hello: null,
-    ip: clientIps.get(socket) ?? 'unknown', shipChosen: false }
+  const member: Member = { channel, socket, seat, ship: reservation?.ship ?? 'hornet', hello: null,
+    ip: clientIps.get(socket) ?? 'unknown', shipChosen: false,
+    resumeToken: reservation?.token ?? randomBytes(32).toString('base64url'), joinedAt: null }
   const helloTimeout = setTimeout(() => guardRoom(room, 'hello timeout', () => {
     if (!member.hello) socket.close(1008, 'hello timeout')
   }), 5000)
@@ -265,10 +318,28 @@ function connectSocket(socket: WebSocket, room: Room): void {
   }), 15_000)
   socket.on('pong', () => { awaitingPong = false })
   channel.onMessage(bytes => {
+    if (reservation) {
+      if (member.hello) return
+      if (room.state !== 'running' || room.resumes.get(seat) !== reservation ||
+          Date.now() >= reservation.expiresAt || bytes[0] !== FRAME.HELLO) {
+        socket.close(1008, 'resume expired'); return
+      }
+      try { decodeHello(bytes) } catch { socket.close(1008, 'invalid hello'); return }
+      member.hello = bytes
+      member.joinedAt = ++room.nextJoinOrder
+      clearTimeout(helloTimeout)
+      clearTimeout(reservation.timer)
+      room.resumes.delete(seat)
+      room.match!.connect(channel, seat)
+      channel.receive(bytes)
+      channel.control({ type: 'resume', token: member.resumeToken, graceMs: RESUME_GRACE_MS })
+      return
+    }
     if (room.state !== 'lobby' || bytes[0] !== FRAME.HELLO) return
     let ship: ShipId
     try { ship = decodeHello(bytes) } catch { channel.close(); return }
     if (!member.shipChosen) member.ship = ship
+    if (!member.hello) member.joinedAt = ++room.nextJoinOrder
     member.hello = bytes
     clearTimeout(helloTimeout)
     room.lastActivity = Date.now()
@@ -316,7 +387,7 @@ function connectSocket(socket: WebSocket, room: Room): void {
       if (error) channel.control({ type: 'error', message: error })
     }
   }))
-  socket.on('close', () => {
+  socket.on('close', (code) => {
     if (notified) return
     notified = true
     closed = true
@@ -326,18 +397,20 @@ function connectSocket(socket: WebSocket, room: Room): void {
       for (const handler of closers) handler()
       const index = room.members.indexOf(member)
       if (index >= 0) room.members.splice(index, 1)
-      if (room.members.length === 0) closeRoom(room)
+      if (reservation && !member.hello) reservation.claiming = false
+      else if (code !== 1008 && code !== 1009) reserveSeat(room, member)
+      if (room.members.length === 0 && room.resumes.size === 0) closeRoom(room)
       else if (room.state === 'lobby') broadcast(room)
     })
   })
   socket.on('error', () => guardRoom(room, 'socket error', () => socket.close()))
   room.members.push(member)
   room.lastActivity = Date.now()
-  broadcast(room)
+  if (room.state === 'lobby') broadcast(room)
 }
 
-wss.on('connection', (socket: WebSocket, room: Room) => {
-  guardRoom(room, 'connection', () => connectSocket(socket, room))
+wss.on('connection', (socket: WebSocket, room: Room, reservation?: ResumeReservation) => {
+  guardRoom(room, 'connection', () => connectSocket(socket, room, reservation))
   // A failure before the new socket joins room.members still has to close it.
   if (!rooms.has(room.code)) {
     try { socket.close(1000) } catch {

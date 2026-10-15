@@ -84,6 +84,7 @@ function boot() {
   let lobby: Lobby | null = null
   let joinAttempt = 0
   let serverCanLaunch = false
+  let serverResume: { endpoint: string; code: string; token: string } | null = null
 
   /** The one line of network status on screen, in either mode. */
   const netPanel = document.createElement('div')
@@ -270,6 +271,7 @@ function boot() {
     )
     document.getElementById('retryjoin')?.addEventListener('click', () => startJoining(code))
     document.getElementById('solojoin')?.addEventListener('click', () => {
+      serverResume = null
       mode = { kind: 'solo' }
       netPanel.style.display = 'none'
       openHangar()
@@ -278,6 +280,8 @@ function boot() {
 
   function startJoining(code: string, asServerHost = false) {
     const attempt = ++joinAttempt
+    const resumeToken = endpoint && serverResume?.endpoint === endpoint && serverResume.code === code
+      ? serverResume.token : undefined
     serverCanLaunch = false
     joining?.stop()
     joining = null
@@ -327,6 +331,9 @@ function boot() {
         if (lobbyState) wing.update(lobbyState, canLaunch, lead)
         updateAction()
       },
+      onServerResumeToken: (token: string) => {
+        if (current() && endpoint) serverResume = { endpoint, code, token }
+      },
       onWelcome: (seat: number) => {
         if (!current()) return
         wing.hide()
@@ -354,11 +361,14 @@ function boot() {
           if ((joining?.client.seat ?? -1) >= 0) netPanel.style.display = 'none'
           else netStatus(`JOINING <b>${code}</b><div>connected — waiting for room status</div>`)
         } else {
-          offerRetry(code, 'CONNECTION LOST', link.reason, link.route ? `route was ${link.route}` : '')
+          const note = endpoint && serverResume?.code === code
+            ? 'Your seat is held briefly. Select RETRY to reclaim it.'
+            : link.route ? `route was ${link.route}` : ''
+          offerRetry(code, 'CONNECTION LOST', link.reason, note)
         }
       },
     }
-    const connect = endpoint ? joinServer(game, endpoint, code, ship, handlers)
+    const connect = endpoint ? joinServer(game, endpoint, code, ship, handlers, resumeToken)
       : joinMatch(game, code, ship, handlers)
     connect
       .then((j) => {

@@ -72,7 +72,7 @@ try {
 } finally {
   for (const socket of sockets) socket.close()
 }
-const deadline = Date.now() + 3000
+const deadline = Date.now() + 15_000
 while (Date.now() < deadline) {
   const health = await fetch(`${endpoint}/health`).then(res => res.json())
   if (health.rooms === 0 && health.players === 0) break
@@ -167,6 +167,11 @@ assert.equal(gapWelcome[11], 0, 'seat 2 keeps Wasp instead of giving it to AI')
 p1.socket.close()
 p3.socket.close()
 await waitFor(async () => (await fetch(`${endpoint}/health`).then(res => res.json())).players === 0)
+const gapCleanupDeadline = Date.now() + 15_000
+while ((await fetch(`${endpoint}/health`).then(res => res.json())).rooms !== 0) {
+  if (Date.now() > gapCleanupDeadline) throw new Error('empty match outlived resume grace')
+  await new Promise(resolve => setTimeout(resolve, 50))
+}
 console.log('lobby gap kept seat and hull assignments')
 
 const sharedIp = '198.51.100.20'
@@ -265,4 +270,38 @@ for (const [index, kicked] of [false, true].entries()) {
   last.socket.close()
   late.socket.close()
   console.log(`${kicked ? 'policy kick' : 'normal departure'} kept launch with the earliest remaining member`)
+}
+const helloOrderRoom = await createRoom(2, '198.51.100.80')
+assert.equal(helloOrderRoom.status, 201)
+const helloOrderUrl = new URL('/ws', endpoint)
+helloOrderUrl.protocol = helloOrderUrl.protocol === 'https:' ? 'wss:' : 'ws:'
+helloOrderUrl.searchParams.set('room', helloOrderRoom.code)
+const earlySocket = new WebSocket(helloOrderUrl, { headers: { 'X-Real-IP': '198.51.100.80' } })
+const early = { socket: earlySocket, frames: [], controls: [] }
+earlySocket.on('message', (data, binary) => {
+  if (binary) early.frames.push(Buffer.from(data))
+  else early.controls.push(JSON.parse(String(data)))
+})
+await new Promise((resolve, reject) => {
+  earlySocket.once('open', resolve)
+  earlySocket.once('error', reject)
+})
+const ready = await joinRoom(helloOrderRoom.code, '198.51.100.81')
+const role = peer => peer.controls.filter(control => control.type === 'room').at(-1)
+await waitFor(() => role(ready)?.creator === true)
+earlySocket.send(Buffer.from([1, 3, 1]))
+await waitFor(() => early.frames.some(frame => frame[0] === 7) && role(early)?.creator === false)
+assert.equal(role(ready).launcherSeat, 1, 'the first valid HELLO remains the launcher')
+earlySocket.send(JSON.stringify({ type: 'start' }))
+await new Promise(resolve => setTimeout(resolve, 100))
+assert.ok(!early.frames.some(frame => frame[0] === 2), 'late HELLO cannot steal launch authority')
+ready.socket.send(JSON.stringify({ type: 'start' }))
+await waitFor(() => ready.frames.some(frame => frame[0] === 2) && early.frames.some(frame => frame[0] === 2))
+ready.socket.close()
+earlySocket.close()
+console.log('first valid HELLO kept launch authority against an earlier idle socket')
+const finalCleanupDeadline = Date.now() + 15_000
+while ((await fetch(`${endpoint}/health`).then(res => res.json())).rooms !== 0) {
+  if (Date.now() > finalCleanupDeadline) throw new Error('handoff matches outlived resume grace')
+  await new Promise(resolve => setTimeout(resolve, 50))
 }
