@@ -15,8 +15,12 @@ function connect() {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(url)
     const frames = []
-    socket.on('message', (data, binary) => { if (binary) frames.push(Buffer.from(data)) })
-    socket.once('open', () => { sockets.push(socket); socket.send(Buffer.from([1, 3, 0])); resolve({ socket, frames }) })
+    const controls = []
+    socket.on('message', (data, binary) => {
+      if (binary) frames.push(Buffer.from(data))
+      else controls.push(JSON.parse(String(data)))
+    })
+    socket.once('open', () => { sockets.push(socket); socket.send(Buffer.from([1, 3, 0])); resolve({ socket, frames, controls }) })
     socket.once('error', reject)
   })
 }
@@ -31,6 +35,10 @@ try {
     }
   }
   await until(() => first.frames.some(frame => frame[0] === 7))
+  first.socket.send(JSON.stringify({ type: 'start' }))
+  await until(() => first.controls.some(control => control.type === 'error'))
+  assert.equal((await fetch(`${endpoint}/health`).then(res => res.json())).rooms, 1,
+    'early launch refusal kept the lobby open')
   const second = await connect()
   await until(() => second.frames.some(frame => frame[0] === 7))
   first.socket.send(JSON.stringify({ type: 'ship', ship: 'drone' }))
