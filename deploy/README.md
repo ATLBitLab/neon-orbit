@@ -28,7 +28,7 @@ From this repository branch on a development machine:
 ```sh
 npm ci
 npm run build:server
-tar -czf /tmp/neon-orbit-server.tgz dist-server package.json package-lock.json deploy/neon-orbit.service deploy/Caddyfile
+tar -czf /tmp/neon-orbit-server.tgz dist-server scripts/stats-summary.mjs package.json package-lock.json deploy/neon-orbit.service deploy/Caddyfile
 scp /tmp/neon-orbit-server.tgz root@104.131.185.100:/tmp/
 ```
 
@@ -56,6 +56,32 @@ only to loopback, and needs only the firewall's public 80/443 ports. A restart
 ends active rooms. Check `journalctl -u neon-orbit -f` if health fails.
 The [Caddy reverse proxy reference](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
 documents the upstream client-IP header used for per-IP connection limits.
+
+## Anonymous match stats
+
+Every dedicated-server match appends anonymous JSONL to
+`/var/lib/neon-orbit/match-stats.jsonl` (override with `STATS_PATH`; set it
+empty to turn recording off). Each match writes one `match` line (random match
+id, the hour it started, duration, outcome, hulls) and one `player` line per
+human seat: hull, kills, deaths, shots/hits, time to first kill, seconds per
+life, approximate hull damage taken, death positions rounded to 100 units, and
+how the seat left (`end`, `quit`, `disconnect`). AI seats get no player line.
+The only cross-match link is `session`, a random id the browser keeps in
+sessionStorage and sends in its own frame before HELLO (never in the URL, so
+no proxy log can pair it with an IP), so a repeat pick is visible while the
+tab stays open. The file
+never contains IPs, user agents, room codes, resume tokens, pubkeys or names;
+`npm run check:stats` asserts that against a real listener. The file is capped
+at `STATS_MAX_BYTES` (50 MB) with one rotation to `match-stats.jsonl.1`, and a
+write failure is logged once and never reaches a match. Browser-hosted (P2P)
+matches are not recorded. The wing panel tells players about the recording.
+
+Summarise on the droplet:
+
+```sh
+node /opt/neon-orbit/scripts/stats-summary.mjs            # table per hull
+node /opt/neon-orbit/scripts/stats-summary.mjs --json     # raw numbers
+```
 
 ## Pot payment lobby (disabled until payout/refunds ship)
 

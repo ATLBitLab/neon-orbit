@@ -1369,6 +1369,8 @@ body {
 .wing-pot-copy { margin-top: 8px; }
 .wing-seats strong { font-weight: 400; }
 .wing-status { margin: 12px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.wing-note { margin: -4px 0 12px; font-size: 11px; line-height: 1.4; opacity: 0.6; }
+.wing-note[hidden] { display: none; }
 .wing-actions { display: flex; gap: 8px; }
 .wing .btn { padding: 10px 12px; min-height: 44px; font-size: 11px; letter-spacing: 0.06em; }
 .wing button[hidden] { display: none; }

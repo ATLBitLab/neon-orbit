@@ -102,6 +102,8 @@ export function createDedicatedMatch(options: DedicatedOptions) {
       host.tick()
     },
     snapshot: () => headless.game.capture(),
+    /** One seat's read-only view, for the anonymous stats recorder. */
+    view: (seat: number) => headless.game.snapshot(seat),
     get result() { return headless.game.result },
     get stats() { return host.stats },
     get peers() { return host.peers },
