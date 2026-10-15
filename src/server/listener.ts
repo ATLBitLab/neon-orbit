@@ -74,8 +74,13 @@ function reply(res: import('node:http').ServerResponse, status: number, body: ob
   res.end(JSON.stringify(body))
 }
 
+function launcher(room: Room): Member | undefined {
+  return room.members.filter(member => member.hello).sort((a, b) => a.seat - b.seat)[0]
+}
+
 function broadcast(room: Room): void {
   room.revision++
+  const lead = launcher(room)
   const seats = Array.from({ length: room.seats }, (_, i) => {
     const member = room.members.find(m => m.seat === i)
     return { ship: member?.ship ?? 'hornet', pilot: member ? 'human' : 'ai' } as const
@@ -83,7 +88,8 @@ function broadcast(room: Room): void {
   for (const member of room.members) {
     member.channel.send(encodeLobby({ revision: room.revision, seat: member.seat, seats }))
     member.channel.control({ type: 'room', code: room.code, seats: room.seats,
-      players: room.members.length, state: room.state, creator: member.seat === 0 })
+      players: room.members.length, state: room.state, creator: member === lead,
+      launcherSeat: lead?.seat ?? -1 })
   }
 }
 
@@ -227,7 +233,6 @@ function connectSocket(socket: WebSocket, room: Room): void {
   const closers: (() => void)[] = []
   let closed = false
   let notified = false
-  let policyControlClose = false
   let count = 0
   let second = Math.floor(Date.now() / 1000)
   const channel: Member['channel'] = {
@@ -287,17 +292,14 @@ function connectSocket(socket: WebSocket, room: Room): void {
     }
     let parsed: unknown
     try { parsed = JSON.parse(String(data)) } catch {
-      policyControlClose = true
       socket.close(1008, 'invalid control'); return
     }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      policyControlClose = true
       socket.close(1008, 'invalid control'); return
     }
     const message = parsed as Record<string, unknown>
     if ((message.type !== 'ship' && message.type !== 'start') ||
         (message.type === 'ship' && !SHIP_ORDER.includes(message.ship as ShipId))) {
-      policyControlClose = true
       socket.close(1008, 'invalid control'); return
     }
     if (message.type === 'ship' && room.state === 'lobby' && member.hello) {
@@ -306,7 +308,7 @@ function connectSocket(socket: WebSocket, room: Room): void {
       broadcast(room)
       return
     }
-    if (message.type === 'start' && seat === 0) {
+    if (message.type === 'start' && member === launcher(room)) {
       const error = startRoom(room)
       if (error) channel.control({ type: 'error', message: error })
     }
@@ -321,7 +323,7 @@ function connectSocket(socket: WebSocket, room: Room): void {
       for (const handler of closers) handler()
       const index = room.members.indexOf(member)
       if (index >= 0) room.members.splice(index, 1)
-      if (room.members.length === 0 || (seat === 0 && room.state === 'lobby' && !policyControlClose)) closeRoom(room)
+      if (room.members.length === 0) closeRoom(room)
       else if (room.state === 'lobby') broadcast(room)
     })
   })

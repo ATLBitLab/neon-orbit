@@ -58,7 +58,7 @@ export function joinServer(
       if (!handlers.active()) { socket.close(); reject(new Error('join cancelled')); return }
       client = createClient({ game, channel, ship,
         onLobby: handlers.onLobby, onWelcome: handlers.onWelcome, onRefused: handlers.onRefused })
-      handlers.status('connected — waiting for launch')
+      handlers.status('connected — waiting for room status')
       handlers.onLink({ state: 'up', reason: '', route: 'server' })
       resolve({ client, tick: local => client.tick(local), stop: () => { stopped = true; socket.close() },
         start: () => socket.send(JSON.stringify({ type: 'start' })),
@@ -67,13 +67,20 @@ export function joinServer(
     socket.onmessage = event => {
       if (typeof event.data === 'string') {
         try {
-          const message = JSON.parse(event.data) as { type: string; message?: string; players?: number }
+          const message = JSON.parse(event.data) as {
+            type: string; message?: string; creator?: boolean; launcherSeat?: number
+          }
           if (message.type === 'error') {
             const reason = message.message ?? 'server error'
             handlers.status(reason)
             handlers.onServerError?.(reason)
           }
-          if (message.type === 'room' && (!client || client.seat < 0)) handlers.status(`${message.players} player(s) in room`)
+          if (message.type === 'room' && (!client || client.seat < 0)) {
+            if (typeof message.creator === 'boolean' && typeof message.launcherSeat === 'number' &&
+                Number.isInteger(message.launcherSeat)) {
+              handlers.onServerRole?.(message.creator, message.launcherSeat)
+            }
+          }
         } catch { handlers.status('invalid server message') }
         return
       }
