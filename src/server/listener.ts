@@ -1,8 +1,9 @@
 import { createServer, type IncomingMessage } from 'node:http'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { Channel } from '../net/channel'
 import { decodeHello, encodeLobby, FRAME } from '../net/session'
+import { decodeResumeToken } from '../net/resume'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { createDedicatedMatch } from './match'
 import { DEDICATED_SNAPSHOT_EVERY } from './snapshot-rate'
@@ -61,6 +62,19 @@ interface Room {
 
 const rooms = new Map<string, Room>()
 const clientIps = new WeakMap<WebSocket, string>()
+const pendingResumes = new Map<WebSocket, string>()
+
+function sameToken(left: string, right: string): boolean {
+  const a = Buffer.from(left)
+  const b = Buffer.from(right)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+function availableReservation(room: Room, token: string): ResumeReservation | undefined {
+  return [...room.resumes.values()].find(entry => sameToken(entry.token, token) &&
+    entry.expiresAt > Date.now() && !entry.claiming &&
+    !room.members.some(member => member.seat === entry.seat))
+}
 
 function members(): Member[] {
   return [...rooms.values()].flatMap(room => room.members)
@@ -120,6 +134,10 @@ function closeRoom(room: Room): void {
   if (room.expiry) clearTimeout(room.expiry)
   for (const reservation of room.resumes.values()) clearTimeout(reservation.timer)
   room.resumes.clear()
+  for (const [socket] of pendingResumes) {
+    // Pending sockets have no member yet, but must not outlive their room.
+    if (socketRoom.get(socket) === room) socket.close(1000)
+  }
   // Cleanup itself must not turn one failed room into a process-wide failure.
   try { room.match?.close() } catch (error) {
     console.error(`[neon-orbit] room ${room.code} cleanup failed`, error)
@@ -236,6 +254,7 @@ const server = createServer((req, res) => {
 })
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PACKET, perMessageDeflate: false })
+const socketRoom = new WeakMap<WebSocket, Room>()
 function clientIp(request: IncomingMessage): string {
   const direct = request.socket.remoteAddress ?? 'unknown'
   // Only the loopback Caddy hop may supply the actual public client IP.
@@ -250,16 +269,19 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
     const ip = clientIp(request)
     const sameIp = members().filter(member => member.ip === ip)
     const resumeToken = url.searchParams.get('resume')
+    // Query-token admission remains for one release while the already-deployed
+    // client rolls forward. New clients prove ownership in their first WS frame.
     const reservation = room?.state === 'running' && resumeToken
-      ? [...room.resumes.values()].find(entry => entry.token === resumeToken &&
-          entry.expiresAt > Date.now() && !entry.claiming &&
-          !room.members.some(member => member.seat === entry.seat)) : undefined
+      ? availableReservation(room, resumeToken) : undefined
+    const frameResume = room?.state === 'running' && resumeToken === null && room.resumes.size > 0
     if (url.pathname !== '/ws' || !room ||
-        (room.state !== 'lobby' && !reservation) ||
+        (room.state !== 'lobby' && !reservation && !frameResume) ||
         (room.state === 'lobby' && resumeToken !== null) ||
         room.members.length >= room.seats || totalPlayers() >= MAX_PLAYERS ||
-        sameIp.length >= MAX_CONNECTIONS_PER_IP ||
-        sameIp.filter(member => !member.hello).length >= MAX_PENDING_PER_IP) {
+        sameIp.length + [...pendingResumes.values()].filter(value => value === ip).length >= MAX_CONNECTIONS_PER_IP ||
+        sameIp.filter(member => !member.hello).length +
+          [...pendingResumes.values()].filter(value => value === ip).length >= MAX_PENDING_PER_IP ||
+        pendingResumes.size >= MAX_PLAYERS) {
       socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n')
       socket.destroy()
       return
@@ -270,7 +292,8 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
     }
     wss.handleUpgrade(request, socket, head, ws => {
       clientIps.set(ws, ip)
-      wss.emit('connection', ws, room, reservation)
+      socketRoom.set(ws, room)
+      wss.emit('connection', ws, room, reservation, frameResume)
     })
   } catch {
     if (claimed) claimed.claiming = false
@@ -307,7 +330,7 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
   }
   const member: Member = { channel, socket, seat, ship: reservation?.ship ?? 'hornet', hello: null,
     ip: clientIps.get(socket) ?? 'unknown', shipChosen: false,
-    resumeToken: reservation?.token ?? randomBytes(32).toString('base64url'), joinedAt: null }
+    resumeToken: randomBytes(32).toString('base64url'), joinedAt: null }
   const helloTimeout = setTimeout(() => guardRoom(room, 'hello timeout', () => {
     if (!member.hello) socket.close(1008, 'hello timeout')
   }), 5000)
@@ -409,8 +432,32 @@ function connectSocket(socket: WebSocket, room: Room, reservation?: ResumeReserv
   if (room.state === 'lobby') broadcast(room)
 }
 
-wss.on('connection', (socket: WebSocket, room: Room, reservation?: ResumeReservation) => {
-  guardRoom(room, 'connection', () => connectSocket(socket, room, reservation))
+function awaitResume(socket: WebSocket, room: Room): void {
+  const ip = clientIps.get(socket) ?? 'unknown'
+  pendingResumes.set(socket, ip)
+  const timeout = setTimeout(() => socket.close(1008, 'resume timeout'), 5000)
+  const cleanup = () => { clearTimeout(timeout); pendingResumes.delete(socket) }
+  socket.once('close', cleanup)
+  socket.on('error', () => socket.terminate())
+  socket.once('message', (data, binary) => {
+    if (!binary) { socket.close(1008, 'invalid resume'); return }
+    let token: string
+    try { token = decodeResumeToken(Buffer.from(data as ArrayBuffer)) } catch {
+      socket.close(1008, 'invalid resume'); return
+    }
+    const reservation = rooms.has(room.code) && room.state === 'running'
+      ? availableReservation(room, token) : undefined
+    if (!reservation) { socket.close(1008, 'invalid resume'); return }
+    reservation.claiming = true
+    cleanup()
+    guardRoom(room, 'resume connection', () => connectSocket(socket, room, reservation))
+  })
+}
+
+wss.on('connection', (socket: WebSocket, room: Room, reservation?: ResumeReservation,
+  frameResume?: boolean) => {
+  if (frameResume) guardRoom(room, 'resume admission', () => awaitResume(socket, room))
+  else guardRoom(room, 'connection', () => connectSocket(socket, room, reservation))
   // A failure before the new socket joins room.members still has to close it.
   if (!rooms.has(room.code)) {
     try { socket.close(1000) } catch {

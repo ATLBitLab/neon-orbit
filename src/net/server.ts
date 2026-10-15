@@ -2,6 +2,7 @@ import type { Game } from '../game/game'
 import type { ShipId } from '../ships/specs'
 import type { Channel } from './channel'
 import { createClient, type Client } from './session'
+import { encodeResumeToken } from './resume'
 import type { JoinHandlers, Joining } from './browser'
 
 /** The server URL is explicit so a preview client can point at a test droplet. */
@@ -39,7 +40,6 @@ export function joinServer(
   const url = new URL('/ws', endpoint)
   url.protocol = url.protocol === 'https:' || url.protocol === 'wss:' ? 'wss:' : 'ws:'
   url.searchParams.set('room', code)
-  if (resumeToken) url.searchParams.set('resume', resumeToken)
   const socket = new WebSocket(url)
   socket.binaryType = 'arraybuffer'
   return new Promise((resolve, reject) => {
@@ -58,6 +58,7 @@ export function joinServer(
     socket.onopen = () => {
       opened = true
       if (!handlers.active()) { socket.close(); reject(new Error('join cancelled')); return }
+      if (resumeToken) socket.send(Uint8Array.from(encodeResumeToken(resumeToken)))
       client = createClient({ game, channel, ship,
         onLobby: handlers.onLobby, onWelcome: handlers.onWelcome, onRefused: handlers.onRefused })
       handlers.status('connected — waiting for room status')

@@ -6,7 +6,10 @@ Node on loopback port 8080. The process admits twelve connected players across
 rooms, with two to four seats per match. Rooms live only in process memory.
 During a running match, a dropped player's seat is held for 12 seconds. The
 server gives each seat a 256-bit resume token after WELCOME; RETRY sends it
-back to reclaim that seat. A room code alone cannot join a running match.
+in the first WebSocket frame to reclaim that seat. The server rotates the token
+after each successful resume. For one release, the previous client can still
+present its token in `?resume=` during the upgrade. A room code alone cannot
+join a running match.
 The AI flies the seat while it is vacant, and a seat whose token expires stays
 AI. If all players drop, the room closes when the last grace window expires.
 Restarting the process ends all rooms and invalidates all tokens.
