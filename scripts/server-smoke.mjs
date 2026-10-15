@@ -244,14 +244,25 @@ for (const [index, kicked] of [false, true].entries()) {
   await waitFor(() => roomControl(next)?.creator === true && roomControl(last)?.creator === false)
   assert.equal(roomControl(next).launcherSeat, 1, 'room control names the promoted launcher')
   assert.equal(next.socket.readyState, WebSocket.OPEN, 'next seat stayed in the lobby')
+  const late = await joinRoom(room.code, ip)
+  assert.equal(late.frames.find(frame => frame[0] === 7)?.[6], 0,
+    'late arrival reused the vacated low seat')
+  await waitFor(() => roomControl(next)?.launcherSeat === 1 && roomControl(late)?.launcherSeat === 1)
+  assert.equal(roomControl(next).creator, true, 'late low-seat arrival did not demote the host')
+  assert.equal(roomControl(late).creator, false, 'late low-seat arrival is not the host')
+  late.socket.send(JSON.stringify({ type: 'start' }))
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.ok(!late.frames.some(frame => frame[0] === 2), 'late low-seat arrival could not launch')
   last.socket.send(JSON.stringify({ type: 'start' }))
   await new Promise(resolve => setTimeout(resolve, 100))
   assert.ok(!last.frames.some(frame => frame[0] === 2), 'higher seat could not launch')
   next.socket.send(JSON.stringify({ type: 'start' }))
-  await waitFor(() => next.frames.some(frame => frame[0] === 2) && last.frames.some(frame => frame[0] === 2))
+  await waitFor(() => next.frames.some(frame => frame[0] === 2) && last.frames.some(frame => frame[0] === 2) &&
+    late.frames.some(frame => frame[0] === 2))
   assert.equal(next.frames.find(frame => frame[0] === 2)[2], 1,
     'promoted launcher kept its reserved seat')
   next.socket.close()
   last.socket.close()
-  console.log(`${kicked ? 'policy kick' : 'normal departure'} handed launch to the lowest remaining seat`)
+  late.socket.close()
+  console.log(`${kicked ? 'policy kick' : 'normal departure'} kept launch with the earliest remaining member`)
 }
