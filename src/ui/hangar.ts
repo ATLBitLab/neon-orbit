@@ -65,6 +65,7 @@ export interface Hangar {
   root: HTMLElement
   open(initial: ShipId): void
   close(): void
+  hostOptions(visible: boolean): void
   update(dt: number): void
   action(label: string | null, locked?: boolean): void
   readonly selected: ShipId
@@ -77,6 +78,7 @@ export interface HangarDeps {
   camera: THREE.PerspectiveCamera
   audio: Audio
   onLaunch: (id: ShipId) => void
+  onHost?: (seats: number) => void
   onSelect?: (id: ShipId) => void
 }
 
@@ -176,7 +178,24 @@ export function createHangar(deps: HangarDeps): Hangar {
   `
   const launch = el('button', 'btn-launch', 'Launch') as HTMLButtonElement
   launch.type = 'button'
-  footer.append(legend, launch)
+  const actions = el('div', 'hangar-actions')
+  const host = el('div', 'host-game')
+  host.hidden = true
+  const seatsLabel = el('label', undefined, 'Players')
+  const seats = el('select') as HTMLSelectElement
+  seats.setAttribute('aria-label', 'Players in the room')
+  for (const count of [2, 3, 4]) {
+    const option = el('option') as HTMLOptionElement
+    option.value = String(count)
+    option.textContent = String(count)
+    seats.append(option)
+  }
+  seatsLabel.append(seats)
+  const hostButton = el('button', 'btn host-button', 'Host game') as HTMLButtonElement
+  hostButton.type = 'button'
+  host.append(seatsLabel, hostButton)
+  actions.append(host, launch)
+  footer.append(legend, actions)
 
   root.append(header, stage, cards, footer)
   parent.append(root)
@@ -225,6 +244,12 @@ export function createHangar(deps: HangarDeps): Hangar {
   }
 
   launch.addEventListener('click', doLaunch)
+  hostButton.addEventListener('click', () => {
+    if (!open || locked) return
+    audio.resume()
+    audio.uiSelect()
+    deps.onHost?.(Number(seats.value))
+  })
 
   function onKey(e: KeyboardEvent) {
     if (!open || locked) return
@@ -246,6 +271,9 @@ export function createHangar(deps: HangarDeps): Hangar {
 
   return {
     root,
+    hostOptions(visible) {
+      host.hidden = !visible || !deps.onHost
+    },
     action(label, lock = false) {
       actionLabel = label
       locked = lock
