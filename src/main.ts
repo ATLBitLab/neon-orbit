@@ -83,6 +83,7 @@ function boot() {
   let joining: Joining | null = null
   let lobby: Lobby | null = null
   let joinAttempt = 0
+  let serverCanLaunch = false
 
   /** The one line of network status on screen, in either mode. */
   const netPanel = document.createElement('div')
@@ -188,6 +189,7 @@ function boot() {
 
   function openHangar() {
     joinAttempt++
+    serverCanLaunch = false
     joining?.stop()
     joining = null
     hosting?.stop()
@@ -211,9 +213,11 @@ function boot() {
   }
 
   function startRun(id: ShipId) {
-    if (mode.kind === 'join') { startJoining(mode.code); return }
-    if (mode.kind === 'host' && endpoint) {
-      if (!joining?.start) { netStatus('Waiting for server room…'); return }
+    if (mode.kind === 'join' && !(endpoint && serverCanLaunch)) {
+      startJoining(mode.code); return
+    }
+    if (mode.kind !== 'solo' && endpoint) {
+      if (!joining?.start || !serverCanLaunch) { netStatus('Waiting for server room…'); return }
       joining.start()
       hangar.action('LAUNCHING…', true)
       return
@@ -252,6 +256,7 @@ function boot() {
    */
   function offerRetry(code: string, heading: string, reason: string, note = '') {
     joinAttempt++
+    serverCanLaunch = false
     joining?.stop()
     joining = null
     wing.status(reason)
@@ -273,11 +278,19 @@ function boot() {
 
   function startJoining(code: string, asServerHost = false) {
     const attempt = ++joinAttempt
+    serverCanLaunch = false
     joining?.stop()
     joining = null
     const current = () => attempt === joinAttempt
     const ship = hangar.selected
     let serverReady = false
+    let lobbyState: LobbyState | null = null
+    let launcherSeat: number | undefined
+    const updateAction = () => {
+      if (endpoint) hangar.action(serverCanLaunch ? serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER' : 'WAITING FOR HOST',
+        !serverCanLaunch || !serverReady)
+      else hangar.action('WAITING FOR HOST', true)
+    }
     rememberShip(ship)
     game.abandon()
     screens.moveTo('hangar')
@@ -290,22 +303,29 @@ function boot() {
     debrief.hide()
     pilot.reset()
     audio.setMusic('hangar')
-    const waiting = 'connected — waiting for the host to launch'
     netPanel.style.display = 'none'
     wing.show(code, asServerHost, endpoint ? serverJoinLink(code, endpoint) : undefined)
-    wing.status('Looking for the host…')
+    wing.status(endpoint ? 'Connecting to server…' : 'Looking for the host…')
     const handlers = {
       active: current,
       status: (stage: string) => { if (current()) wing.status(stage) },
       onLobby: (state: LobbyState) => {
         if (!current()) return
-        wing.update(state)
+        lobbyState = state
+        wing.update(state, endpoint ? serverCanLaunch : undefined, launcherSeat)
         serverReady = state.seats.filter(seat => seat.pilot === 'human').length >= 2
-        hangar.action(asServerHost ? serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER' : 'WAITING FOR HOST',
-          !asServerHost || !serverReady)
+        updateAction()
+        if (endpoint) netPanel.style.display = 'none'
       },
       onServerError: () => {
-        if (current() && asServerHost) hangar.action(serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER', !serverReady)
+        if (current()) updateAction()
+      },
+      onServerRole: (canLaunch: boolean, lead: number) => {
+        if (!current()) return
+        serverCanLaunch = canLaunch
+        launcherSeat = lead
+        if (lobbyState) wing.update(lobbyState, canLaunch, lead)
+        updateAction()
       },
       onWelcome: (seat: number) => {
         if (!current()) return
@@ -332,7 +352,7 @@ function boot() {
           )
         } else if (link.state === 'up') {
           if ((joining?.client.seat ?? -1) >= 0) netPanel.style.display = 'none'
-          else netStatus(`JOINING <b>${code}</b><div>${waiting}</div>`)
+          else netStatus(`JOINING <b>${code}</b><div>connected — waiting for room status</div>`)
         } else {
           offerRetry(code, 'CONNECTION LOST', link.reason, link.route ? `route was ${link.route}` : '')
         }

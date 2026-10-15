@@ -132,14 +132,18 @@ async function joinRoom(code, ip, ship = 1) {
   url.searchParams.set('room', code)
   const socket = new WebSocket(url, { headers: { 'X-Real-IP': ip } })
   const frames = []
-  socket.on('message', (data, binary) => { if (binary) frames.push(Buffer.from(data)) })
+  const controls = []
+  socket.on('message', (data, binary) => {
+    if (binary) frames.push(Buffer.from(data))
+    else controls.push(JSON.parse(String(data)))
+  })
   await new Promise((resolve, reject) => {
     socket.once('open', resolve)
     socket.once('error', reject)
   })
   socket.send(Buffer.from([1, 3, ship]))
   await waitFor(() => frames.some(frame => frame[0] === 7))
-  return { socket, frames }
+  return { socket, frames, controls }
 }
 
 const gapIp = '198.51.100.10'
@@ -219,3 +223,31 @@ assert.equal(survivor.socket.readyState, WebSocket.OPEN,
 survivor.socket.close()
 replacement.socket.close()
 console.log('invalid controls closed only their senders; malformed upgrade returned 400')
+
+for (const [index, kicked] of [false, true].entries()) {
+  const ip = `198.51.100.${60 + index}`
+  const room = await createRoom(3, ip)
+  assert.equal(room.status, 201)
+  const [first, next, last] = [await joinRoom(room.code, ip), await joinRoom(room.code, ip),
+    await joinRoom(room.code, ip)]
+  const roomControl = peer => peer.controls.filter(control => control.type === 'room').at(-1)
+  await waitFor(() => roomControl(first)?.creator === true && roomControl(next)?.creator === false)
+  const closed = new Promise(resolve => first.socket.once('close', resolve))
+  if (kicked) first.socket.send('null')
+  else first.socket.close()
+  const closeCode = await closed
+  if (kicked) assert.equal(closeCode, 1008, 'policy kick closed only the creator')
+  await waitFor(() => roomControl(next)?.creator === true && roomControl(last)?.creator === false)
+  assert.equal(roomControl(next).launcherSeat, 1, 'room control names the promoted launcher')
+  assert.equal(next.socket.readyState, WebSocket.OPEN, 'next seat stayed in the lobby')
+  last.socket.send(JSON.stringify({ type: 'start' }))
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.ok(!last.frames.some(frame => frame[0] === 2), 'higher seat could not launch')
+  next.socket.send(JSON.stringify({ type: 'start' }))
+  await waitFor(() => next.frames.some(frame => frame[0] === 2) && last.frames.some(frame => frame[0] === 2))
+  assert.equal(next.frames.find(frame => frame[0] === 2)[2], 1,
+    'promoted launcher kept its reserved seat')
+  next.socket.close()
+  last.socket.close()
+  console.log(`${kicked ? 'policy kick' : 'normal departure'} handed launch to the lowest remaining seat`)
+}

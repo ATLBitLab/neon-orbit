@@ -40,7 +40,8 @@ export function createWing(parent: HTMLElement, onLeave: () => void) {
       seats.replaceChildren()
       status.textContent = host ? 'Launch when ready. Open seats fly on AI.' : 'Choose your hull, then join the wing.'
     },
-    update(state: LobbyState) {
+    update(state: LobbyState, canLaunch = state.seat === 0,
+      lead = state.seats.findIndex(seat => seat.pilot === 'human')) {
       seats.replaceChildren(...state.seats.map((seat, i) => {
         const row = document.createElement('li')
         row.className = i === state.seat ? 'you' : ''
@@ -49,11 +50,11 @@ export function createWing(parent: HTMLElement, onLeave: () => void) {
         const hull = document.createElement('strong')
         hull.textContent = SHIPS[seat.ship].name
         const pilot = document.createElement('span')
-        pilot.textContent = i === 0 ? 'HOST' : seat.pilot === 'human' ? 'JOINED' : seat.pilot.toUpperCase()
+        pilot.textContent = i === lead ? 'HOST' : seat.pilot === 'human' ? 'JOINED' : seat.pilot.toUpperCase()
         row.append(name, hull, pilot)
         return row
       }))
-      status.textContent = state.seat === 0
+      status.textContent = canLaunch
         ? 'Launch when ready. Open seats fly on AI.'
         : 'Seat reserved. Waiting for the host to launch.'
     },
