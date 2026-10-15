@@ -54,6 +54,10 @@ try {
   assert.equal(firstWelcome[9], 2, 'host selected Drone reached the match')
   assert.equal(firstWelcome[10], 0, 'guest selected Wasp reached the match')
   await until(() => first.frames.some(frame => frame[0] === 4) && second.frames.some(frame => frame[0] === 4))
+  await until(() => second.frames.filter(frame => frame[0] === 4).length >= 5)
+  const snapshotTicks = second.frames.filter(frame => frame[0] === 4).map(frame => frame.readUInt32LE(2))
+  assert.ok(snapshotTicks.every((tick, i) => i === 0 || tick - snapshotTicks[i - 1] === 2),
+    'server sends a full snapshot every second match tick')
   assert.equal(first.frames.filter(frame => frame[0] === 2).length, 1, 'host welcomed exactly once')
   assert.equal(second.frames.filter(frame => frame[0] === 2).length, 1, 'guest welcomed exactly once')
   const health = await fetch(`${endpoint}/health`).then(res => res.json())

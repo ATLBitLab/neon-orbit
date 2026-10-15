@@ -30,6 +30,8 @@ jobs:
       # typecheck + simulation checks + balance contract.
       - run: npm run check
 
+      - run: npm run check:bandwidth
+
       - run: npm run build
 
       - run: npm run check:server-isolation

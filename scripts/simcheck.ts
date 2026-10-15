@@ -4087,10 +4087,11 @@ function testTheStickIsAttachedToTheShip(): void {
   SHIPS.hornet.maxHull = 1e6
   SHIPS.wasp.maxHull = 1e6
 
-  function fly(predict: boolean) {
+  function fly(predict: boolean, snapshotEvery = 1) {
     const hostGame = newMatch()
     const clientGame = newMatch()
-    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0x9e11, respawn: true } })
+    const host = createHost({ game: hostGame, setup: { ships: ['hornet', 'wasp'], seed: 0x9e11, respawn: true },
+      snapshotEvery })
     host.start()
     const wire = createLoopback({ latency: LATENCY })
     const client = createClient({ game: clientGame, channel: wire.b, predict })
@@ -4163,7 +4164,9 @@ function testTheStickIsAttachedToTheShip(): void {
         alongSamples++
       }
     }
-    const result = { acked, ackMismatch, worstAck, reconciled, worstReconcile, along: alongSamples ? alongSum / alongSamples : 0, moved, unacked: client.unacknowledged }
+    const result = { acked, ackMismatch, worstAck, reconciled, worstReconcile,
+      along: alongSamples ? alongSum / alongSamples : 0, moved, unacked: client.unacknowledged,
+      shots: clientGame.capture().seats[1].ship.shotsFired }
     hostGame.dispose()
     clientGame.dispose()
     return result
@@ -4171,6 +4174,7 @@ function testTheStickIsAttachedToTheShip(): void {
 
   const on = fly(true)
   const off = fly(false)
+  const thinned = fly(true, 2)
   SHIPS.hornet.maxHull = hulls.hornet
   SHIPS.wasp.maxHull = hulls.wasp
   // Not every tick: two autopilots chasing each other throttle down inside 170
@@ -4189,6 +4193,16 @@ function testTheStickIsAttachedToTheShip(): void {
   check('without prediction the hull does not move on the stick', off.moved < TICKS, `${off.moved} of ${TICKS}`)
   check('and it trails where the host has it, by about the downlink', off.along < -3 * LATENCY,
     `${off.along.toFixed(2)} units along the track`)
+  check('at 30 Hz snapshots, the predicted hull still moves on every local stick tick',
+    thinned.moved > TICKS * 0.8, `${thinned.moved} of ${TICKS}`)
+  check('at 30 Hz snapshots, the host still acknowledges the flight continuously',
+    thinned.acked > TICKS * 0.35, `${thinned.acked} acknowledgements`)
+  check('at 30 Hz snapshots, the host truth agrees with the predicted flight',
+    thinned.ackMismatch === 0, `${thinned.ackMismatch} mismatches; worst ${thinned.worstAck.toFixed(3)}`)
+  check('at 30 Hz snapshots, the predicted hull remains close after reconciliation',
+    thinned.worstReconcile < 0.1, `worst ${thinned.worstReconcile.toFixed(3)}`)
+  check('at 30 Hz snapshots, the predicted gun still fires locally',
+    thinned.shots > 0, `${thinned.shots} shots`)
 
   /* predict and reconcile refuse what they cannot fly, quietly. */
   const solo = newMatch()

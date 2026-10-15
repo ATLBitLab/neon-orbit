@@ -5,6 +5,7 @@ import type { Channel } from '../net/channel'
 import { decodeHello, encodeLobby, FRAME } from '../net/session'
 import { SHIP_ORDER, type ShipId } from '../ships/specs'
 import { createDedicatedMatch } from './match'
+import { DEDICATED_SNAPSHOT_EVERY } from './snapshot-rate'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const MAX_ROOMS = 8
@@ -126,7 +127,8 @@ function startRoom(room: Room): string | null {
   }
   const ships = Array.from({ length: room.seats }, (_, i) =>
     room.members.find(m => m.seat === i)?.ship ?? 'hornet')
-  const match = createDedicatedMatch({ setup: { ships, seed: randomBytes(4).readUInt32LE(), respawn: true } })
+  const match = createDedicatedMatch({ setup: { ships, seed: randomBytes(4).readUInt32LE(), respawn: true },
+    snapshotEvery: DEDICATED_SNAPSHOT_EVERY })
   room.match = match
   room.state = 'running'
   broadcast(room)
