@@ -24,7 +24,8 @@ import { joinMatch, modeFromLocation, openLobby, startHosting, type Hosting, typ
 import { LINK_GRACE_MS } from './net/link'
 import { stepSession } from './net/frame'
 import type { LobbyState } from './net/session'
-import { createServerRoom, joinServer, serverJoinLink, serverUrl } from './net/server'
+import { createServerRoom, joinServer, potPayment, serverJoinLink, serverPotEnabled, serverUrl,
+  type PotPaymentStatus } from './net/server'
 import { createHangar } from './ui/hangar'
 import { createWing } from './ui/wing'
 import { createDebriefPanel, createPausePanel } from './ui/panels'
@@ -79,6 +80,11 @@ function boot() {
   // the frame loop step the simulation again.
   let mode = modeFromLocation(window.location.search)
   const endpoint = serverUrl(window.location.search)
+  const requestedPot = Number(new URLSearchParams(window.location.search).get('pot'))
+  const potBuyInSats = mode.kind === 'host' && endpoint && Number.isInteger(requestedPot) &&
+    requestedPot >= 1 && requestedPot <= 1000 ? requestedPot : undefined
+  let potAvailable = false
+  let potPoll: number | null = null
   let hosting: Hosting | null = null
   let joining: Joining | null = null
   let lobby: Lobby | null = null
@@ -108,11 +114,13 @@ function boot() {
     camera: stage.camera,
     audio,
     onLaunch: (id) => startRun(id),
-    onHost: endpoint ? (seats) => {
+    onHost: endpoint ? (seats, buyInSats) => {
       const url = new URL(window.location.href)
       url.searchParams.delete('join')
       url.searchParams.delete('p2p')
       url.searchParams.set('host', String(seats))
+      if (buyInSats === undefined) url.searchParams.delete('pot')
+      else url.searchParams.set('pot', String(buyInSats))
       window.location.assign(url.toString())
     } : undefined,
     onSelect: (id) => {
@@ -120,8 +128,29 @@ function boot() {
       joining?.selectShip?.(id)
     },
   })
+  if (endpoint) void serverPotEnabled(endpoint).then(enabled => {
+    potAvailable = enabled
+    hangar.potOptions(enabled && mode.kind === 'solo')
+  })
+
+  function storedPotClaim(code: string): { seat: number; token: string } | undefined {
+    if (!endpoint) return undefined
+    try {
+      const raw = localStorage.getItem(`neonorbit:pot:${endpoint}:${code}`)
+      if (!raw) return undefined
+      const claim = JSON.parse(raw) as { seat: number; token: string }
+      if (!Number.isInteger(claim.seat) || claim.seat < 0 || claim.seat > 3 ||
+          !/^[A-Za-z0-9_-]{43}$/.test(claim.token)) return undefined
+      return claim
+    } catch { return undefined }
+  }
+
+  function clearPotPoll() {
+    if (potPoll !== null) { window.clearInterval(potPoll); potPoll = null }
+  }
 
   const wing = createWing(hangar.root.querySelector('.stage')!, () => {
+    clearPotPoll()
     joinAttempt++
     joining?.stop()
     joining = null
@@ -175,8 +204,11 @@ function boot() {
     if (endpoint) {
       const attempt = ++joinAttempt
       wing.status('Creating server room…')
-      createServerRoom(endpoint, mode.seats).then(code => {
+      createServerRoom(endpoint, mode.seats, potBuyInSats).then(code => {
         if (attempt !== joinAttempt) return
+        // A paid host must be able to reload and reclaim the original room.
+        // The link contains only the room code; the private claim stays local.
+        if (potBuyInSats !== undefined) history.replaceState(null, '', serverJoinLink(code, endpoint))
         startJoining(code, true)
       }).catch(error => {
         if (attempt === joinAttempt) netStatus(`SERVER ROOM FAILED: ${error instanceof Error ? error.message : error}`)
@@ -196,6 +228,7 @@ function boot() {
   }
 
   function openHangar() {
+    clearPotPoll()
     joinAttempt++
     serverCanLaunch = false
     joining?.stop()
@@ -208,6 +241,7 @@ function boot() {
     netPanel.style.display = 'none'
     hangar.action(mode.kind === 'join' ? 'JOIN WING' : null)
     hangar.hostOptions(mode.kind === 'solo')
+    hangar.potOptions(mode.kind === 'solo' && potAvailable)
     wing.hide()
     screens.moveTo('hangar')
     pause.hide()
@@ -264,6 +298,7 @@ function boot() {
    * the match.
    */
   function offerRetry(code: string, heading: string, reason: string, note = '') {
+    clearPotPoll()
     joinAttempt++
     serverCanLaunch = false
     joining?.stop()
@@ -287,6 +322,7 @@ function boot() {
   }
 
   function startJoining(code: string, asServerHost = false) {
+    clearPotPoll()
     const attempt = ++joinAttempt
     const resumeToken = endpoint && serverResume?.endpoint === endpoint && serverResume.code === code
       ? serverResume.token : undefined
@@ -298,8 +334,31 @@ function boot() {
     let serverReady = false
     let lobbyState: LobbyState | null = null
     let launcherSeat: number | undefined
+    let potRoom: { buyInSats: number; paidSeats: number[] } | null = null
+    let potStatus: PotPaymentStatus | undefined
+    let potClaim = storedPotClaim(code)
+    const renderPot = () => {
+      if (potRoom) void wing.potStatus(potRoom.buyInSats, potRoom.paidSeats,
+        lobbyState?.seat ?? potClaim?.seat ?? -1, potStatus)
+    }
+    const refreshPot = async (create: boolean) => {
+      if (!endpoint || !potClaim || !current()) return
+      try {
+        const status = await potPayment(endpoint, code, potClaim.seat, potClaim.token, create)
+        if (!current()) return
+        potStatus = status
+        renderPot()
+        if (status.state === 'completed' || status.state === 'failed' || status.state === 'expired') clearPotPoll()
+      } catch (error) {
+        if (current()) wing.status(`Payment status unavailable: ${error instanceof Error ? error.message : error}`)
+      }
+    }
     const updateAction = () => {
-      if (endpoint) hangar.action(serverCanLaunch ? serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER' : 'WAITING FOR HOST',
+      if (endpoint && potRoom) {
+        const humanSeats = lobbyState?.seats.flatMap((seat, i) => seat.pilot === 'human' ? [i] : []) ?? []
+        hangar.action(humanSeats.length >= 2 && humanSeats.every(seat => potRoom!.paidSeats.includes(seat))
+          ? 'AWAITING POT LAUNCH' : 'WAITING FOR PAYMENT', true)
+      } else if (endpoint) hangar.action(serverCanLaunch ? serverReady ? 'LAUNCH' : 'WAITING FOR PLAYER' : 'WAITING FOR HOST',
         !serverCanLaunch || !serverReady)
       else hangar.action('WAITING FOR HOST', true)
     }
@@ -326,6 +385,7 @@ function boot() {
         lobbyState = state
         wing.update(state, endpoint ? serverCanLaunch : undefined, launcherSeat)
         serverReady = state.seats.filter(seat => seat.pilot === 'human').length >= 2
+        renderPot()
         updateAction()
         if (endpoint) netPanel.style.display = 'none'
       },
@@ -338,6 +398,34 @@ function boot() {
         launcherSeat = lead
         if (lobbyState) wing.update(lobbyState, canLaunch, lead)
         updateAction()
+      },
+      onPotRoom: (pot: { buyInSats: number; paidSeats: number[] }) => {
+        if (!current()) return
+        potRoom = pot
+        renderPot()
+        updateAction()
+        if (potClaim && potPoll === null && !['completed', 'failed', 'expired'].includes(potStatus?.state ?? '')) {
+          void refreshPot(false)
+          potPoll = window.setInterval(() => { void refreshPot(false) }, 3000)
+        }
+      },
+      onPotClaim: (claim: { seat: number; buyInSats: number; paymentId: string; token: string }) => {
+        if (!current() || !endpoint) return
+        const nextClaim = { seat: claim.seat, token: claim.token }
+        try {
+          const key = `neonorbit:pot:${endpoint}:${code}`
+          const value = JSON.stringify(nextClaim)
+          localStorage.setItem(key, value)
+          if (localStorage.getItem(key) !== value) throw new Error('claim was not saved')
+        } catch {
+          potClaim = undefined
+          potStatus = { paymentId: claim.paymentId, state: 'storage-unavailable', invoice: null }
+          renderPot()
+          return
+        }
+        potClaim = nextClaim
+        void refreshPot(true)
+        if (potPoll === null) potPoll = window.setInterval(() => { void refreshPot(false) }, 3000)
       },
       onServerResumeToken: (token: string) => {
         if (current() && endpoint) serverResume = { endpoint, code, token }
@@ -376,7 +464,7 @@ function boot() {
         }
       },
     }
-    const connect = endpoint ? joinServer(game, endpoint, code, ship, handlers, resumeToken)
+    const connect = endpoint ? joinServer(game, endpoint, code, ship, handlers, resumeToken, potClaim)
       : joinMatch(game, code, ship, handlers)
     connect
       .then((j) => {

@@ -469,6 +469,38 @@ body {
   display: none;
 }
 
+#select .host-game {
+  flex-wrap: wrap;
+}
+
+#select .pot-choice[hidden],
+#select .pot-amount[hidden],
+#select .pot-fee[hidden] {
+  display: none;
+}
+
+#select .pot-choice input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--cyan);
+}
+
+#select .pot-amount input {
+  width: 72px;
+  padding: 8px;
+  border: 1px solid var(--hair);
+  background: #0b0f1a;
+  color: #dff6ff;
+  font: 700 13px var(--font-display);
+}
+
+#select .pot-fee {
+  flex-basis: 100%;
+  margin: 0;
+  color: #b8e2e8;
+  font-size: 11px;
+}
+
 #select .host-game label {
   display: flex;
   align-items: center;
@@ -490,6 +522,7 @@ body {
 }
 
 #select .host-game select:focus-visible,
+#select .host-game input:focus-visible,
 #select .host-button:focus-visible {
   outline: 2px solid var(--cyan);
   outline-offset: 3px;
@@ -1320,6 +1353,20 @@ body {
 .wing-seats { margin: 16px 0; padding: 0; list-style: none; font-size: 13px; }
 .wing-seats li { display: grid; grid-template-columns: 80px 1fr auto; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--hair); }
 .wing-seats li.you { color: var(--cyan); }
+.wing-pot {
+  padding: 12px 0;
+  border-top: 1px solid var(--hair);
+  border-bottom: 1px solid var(--hair);
+}
+.wing-pot[hidden] { display: none; }
+.wing-pot h3 { margin: 0 0 8px; color: var(--cyan); font: 700 14px var(--font-display); }
+.wing-pot p { margin: 6px 0; font-size: 12px; line-height: 1.5; }
+.wing-pot-fee { color: #b8e2e8; }
+.wing-pot-qr { display: block; max-width: 100%; margin: 12px auto; background: #fff; }
+.wing-pot-qr[hidden], .wing-pot-invoice[hidden] { display: none; }
+.wing-pot-invoice { display: block; width: 100%; min-height: 58px; padding: 8px; resize: vertical;
+  color: #dff6ff; background: #07111b; border: 1px solid var(--hair); font: 11px/1.4 monospace; }
+.wing-pot-copy { margin-top: 8px; }
 .wing-seats strong { font-weight: 400; }
 .wing-status { margin: 12px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .wing-actions { display: flex; gap: 8px; }

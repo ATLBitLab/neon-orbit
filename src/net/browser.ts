@@ -125,6 +125,8 @@ export interface JoinHandlers {
   onServerRole?(canLaunch: boolean, launcherSeat: number): void
   /** Dedicated-server secret for reclaiming this seat after a brief disconnect. */
   onServerResumeToken?(token: string): void
+  onPotClaim?(claim: { seat: number; buyInSats: number; paymentId: string; token: string }): void
+  onPotRoom?(pot: { buyInSats: number; paidSeats: number[] }): void
 }
 
 /** Connect to a host by code. Resolves once the data channel is open; the welcome follows on it. */
