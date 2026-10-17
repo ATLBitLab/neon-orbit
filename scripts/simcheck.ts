@@ -8169,10 +8169,10 @@ function testShipCollisions(): void {
   game.step([controls({ throttle: 0 }), controls({ throttle: 0 })])
   const result = game.capture()
   check('pot-room ram kills credit both opponents and enter the kill feed',
-    result.seats[0].kills === 1 && result.seats[1].kills === 1 &&
+    result.seats[0]?.kills === 1 && result.seats[1]?.kills === 1 &&
     result.feed.length === 2 && result.feed.every(entry => entry.killer >= 0))
   check('ram damage and bounties reach match score without inflating shot accuracy',
-    result.seats.every(seat => seat.score > 0 && seat.hits === 0))
+    result.seats.length === 2 && result.seats.every(seat => seat.score > 0 && seat.hits === 0))
   game.dispose()
 
   const labels: string[] = []
