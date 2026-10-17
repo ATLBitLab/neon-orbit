@@ -2181,7 +2181,7 @@ export function createGame(deps: GameDeps): Game {
     const collisionShips = seats.map(seat => seat.ship)
     for (const pilot of pilots) collisionShips.push(pilot.ship)
     resolvingCollision = true
-    if (deps.shipCollisions !== false) shipCollisions.resolve(collisionShips, elapsed, !respawns, impact => {
+    if (deps.shipCollisions !== false) shipCollisions.resolve(collisionShips, elapsed, impact => {
       fx.spark(impact.point, impact.a.accent, impact.closingSpeed > 300 ? 22 : 10)
       for (const ship of [impact.a, impact.b]) {
         if (ship !== local()?.ship) continue

@@ -8101,30 +8101,30 @@ function testShipCollisions(): void {
   const collisions = createShipCollisions()
   const events: number[] = []
   reset()
-  collisions.resolve([a, b], 1, false, e => events.push(e.closingSpeed))
+  collisions.resolve([a, b], 1, e => events.push(e.closingSpeed))
   check('a head-on contact resolves once and separates both spheres', events.length === 1 && a.position.distanceTo(b.position) >= a.radius + b.radius - 1e-6)
   check('ships leave a head-on ram separating', b.velocity.x - a.velocity.x > 0)
   check('both hulls take capped damage and the heavier Drone takes less', a.hull < a.spec.maxHull && b.hull < b.spec.maxHull && a.spec.maxHull - a.hull <= MAX_RAM_DAMAGE && a.spec.maxHull - a.hull > b.spec.maxHull - b.hull)
   const after = a.hull
   reset()
   a.hull = after
-  collisions.resolve([a, b], 1 + RAM_COOLDOWN / 2, false, () => {})
+  collisions.resolve([a, b], 1 + RAM_COOLDOWN / 2, () => {})
   check('the pair cooldown refuses another damage tick while still separating', a.hull === after && a.position.distanceTo(b.position) >= a.radius + b.radius - 1e-6)
   reset()
-  collisions.resolve([a, b], 1 + RAM_COOLDOWN + 0.01, false, () => {})
+  collisions.resolve([a, b], 1 + RAM_COOLDOWN + 0.01, () => {})
   check('the pair can crash again after cooldown', a.hull < a.spec.maxHull)
   reset(20)
   collisions.reset()
-  collisions.resolve([a, b], 2, false, () => {})
+  collisions.resolve([a, b], 2, () => {})
   check('a low-speed touch bumps without damage', a.hull === a.spec.maxHull && b.hull === b.spec.maxHull)
   reset()
   collisions.reset()
   b.warpTimer = 1
-  collisions.resolve([a, b], 3, false, () => {})
+  collisions.resolve([a, b], 3, () => {})
   check('warp-in protection prevents a crash', a.hull === a.spec.maxHull && b.hull === b.spec.maxHull)
   b.warpTimer = 0
   a.shieldTimer = 1
-  collisions.resolve([a, b], 3, false, () => {})
+  collisions.resolve([a, b], 3, () => {})
   check('shield absorbs ram damage while the other hull is still hit', a.hull === a.spec.maxHull && b.hull < b.spec.maxHull)
   a.shieldTimer = 0
   reset()
@@ -8132,23 +8132,17 @@ function testShipCollisions(): void {
   const ally = make('hornet', humanFaction(1))
   ally.position.set(a.radius + ally.radius - 1, 0, -4000)
   ally.velocity.copy(b.velocity)
-  collisions.resolve([a, ally], 4, true, () => {})
-  check('co-op teammates bounce without hull damage', a.hull === a.spec.maxHull && ally.hull === ally.spec.maxHull && a.position.distanceTo(ally.position) >= a.radius + ally.radius - 1e-6)
+  collisions.resolve([a, ally], 4, () => {})
+  check('pot opponents with different human factions hurt each other', a.hull < a.spec.maxHull && ally.hull < ally.spec.maxHull)
   const wingman = make('wasp', FACTION_AI)
   wingman.position.set(0, 0, -4000)
   wingman.velocity.set(500, 0, 0)
   b.position.set(wingman.radius + b.radius - 1, 0, -4000)
   b.velocity.set(-500, 0, 0)
   collisions.reset()
-  collisions.resolve([wingman, b], 4.5, false, () => {})
+  collisions.resolve([wingman, b], 4.5, () => {})
   check('AI squadron mates also bump without damage', wingman.hull === wingman.spec.maxHull && b.hull === b.spec.maxHull && wingman.position.distanceTo(b.position) >= wingman.radius + b.radius - 1e-6)
   wingman.dispose()
-  reset()
-  ally.position.set(a.radius + ally.radius - 1, 0, -4000)
-  ally.velocity.copy(b.velocity)
-  collisions.reset()
-  collisions.resolve([a, ally], 5, false, () => {})
-  check('opposing PvP seats take ram damage', a.hull < a.spec.maxHull && ally.hull < ally.spec.maxHull)
   reset()
   collisions.reset()
   a.hull = 20
@@ -8156,14 +8150,14 @@ function testShipCollisions(): void {
   const deaths: Faction[] = []
   a.onDeath = (_ship, from) => deaths.push(from)
   b.onDeath = (_ship, from) => deaths.push(from)
-  collisions.resolve([a, b], 6, false, () => {})
+  collisions.resolve([a, b], 6, () => {})
   check('a double ram kill attributes each death to the other ship', deaths.length === 2 && deaths[0] === FACTION_AI && deaths[1] === FACTION_PLAYER)
   a.dispose(); b.dispose(); ally.dispose()
 
   // Run through createGame, not just the pair solver: onDamaged/onDeath are the
   // score and feed path used by the dedicated server and a P2P host alike.
   const game = newMatch({ shipCollisions: true })
-  game.start({ ships: ['wasp', 'wasp'], seed: 0xc0111de, respawn: true })
+  game.start({ ships: ['wasp', 'wasp'], seed: 0xc0111de, respawn: false, potHumans: [0, 1] })
   const world = game.capture()
   for (const [i, state] of world.seats.entries()) {
     state.ship.position = { x: i * (SHIPS.wasp.radius * 2 - 1), y: 0, z: -4000 }
@@ -8174,7 +8168,7 @@ function testShipCollisions(): void {
   game.apply(world)
   game.step([controls({ throttle: 0 }), controls({ throttle: 0 })])
   const result = game.capture()
-  check('authoritative ram kills credit both seats and enter the kill feed',
+  check('pot-room ram kills credit both opponents and enter the kill feed',
     result.seats[0].kills === 1 && result.seats[1].kills === 1 &&
     result.feed.length === 2 && result.feed.every(entry => entry.killer >= 0))
   check('ram damage and bounties reach match score without inflating shot accuracy',

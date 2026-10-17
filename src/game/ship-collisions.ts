@@ -23,7 +23,7 @@ export function createShipCollisions() {
 
   return {
     reset() { last = new WeakMap() },
-    resolve(ships: readonly Ship[], now: number, friendlyHumans: boolean, onImpact: (impact: ShipImpact) => void): void {
+    resolve(ships: readonly Ship[], now: number, onImpact: (impact: ShipImpact) => void): void {
       for (let i = 0; i < ships.length; i++) {
         const a = ships[i]
         if (!a.targetable) continue
@@ -68,9 +68,9 @@ export function createShipCollisions() {
           if (!pair) { pair = new WeakMap(); last.set(a, pair) }
           pair.set(b, now)
 
-          // NPCs share one faction; human seats are teammates while fighting
-          // the squadron, but can still ram each other in PvP/respawn matches.
-          const friendly = a.faction === b.faction || (friendlyHumans && a.faction >= 0 && b.faction >= 0)
+          // Match the bolt rule: NPC squadron mates share a faction, while
+          // human seats remain opponents even in a no-respawn pot room.
+          const friendly = a.faction === b.faction
           const force = Math.max(0, closingSpeed - DAMAGE_THRESHOLD) * DAMAGE_PER_SPEED
           const damageA = friendly ? 0 : Math.min(MAX_RAM_DAMAGE, force * 2 * massB / (massA + massB))
           const damageB = friendly ? 0 : Math.min(MAX_RAM_DAMAGE, force * 2 * massA / (massA + massB))
