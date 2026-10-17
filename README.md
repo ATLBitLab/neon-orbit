@@ -110,6 +110,12 @@ a third of your firepower. The numbers all live at the top of `src/game/bfg.ts`.
 
 ## Hazards
 
+Ships are solid to one another. A fast crash bounces both hulls apart and damages
+both; the heavier Drone shoves harder and takes less damage. A single impact is
+capped at 55 hull, so even a Wasp at full health survives one hit. Friendly ships
+bump without hull damage, and a Shield absorbs crash damage. Ramming a rival to
+zero hull counts as a kill for the other pilot.
+
 **Stations** are solid on their core only — rings, trusses and solar panels are fly-through, so
 threading a habitat ring at full throttle stays available. Hitting a core scrapes your hull and
 bounces you off.

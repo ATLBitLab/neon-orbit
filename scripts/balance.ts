@@ -24,6 +24,7 @@
  */
 
 import * as THREE from 'three'
+import { MAX_RAM_DAMAGE } from '../src/game/ship-collisions'
 import type { Audio } from '../src/core/audio'
 import { createBolts, FACTION_AI, FACTION_PLAYER, MAX_BOLTS } from '../src/game/bolts'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
@@ -722,6 +723,12 @@ for (const [name, duration] of [
  * the game, the Drone's seven seconds parked at full solar exposure.
  */
 const longestBurn = Math.max(...SHIP_ORDER.map((id) => searDeath.get(id)!).filter(Number.isFinite))
+check(
+  'one ram cannot erase a full Wasp hull',
+  MAX_RAM_DAMAGE > SHIPS.wasp.maxHull * 0.5 && MAX_RAM_DAMAGE < SHIPS.wasp.maxHull,
+  `${MAX_RAM_DAMAGE} maximum impact against ${SHIPS.wasp.maxHull} hull`,
+)
+
 check(
   'a Shield cannot outlast the worst the arena can do',
   SHIELD_DURATION < longestBurn * 2,
