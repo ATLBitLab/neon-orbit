@@ -48,6 +48,7 @@ import {
 import { EnemyPilot } from './ai'
 import { BLAST_RADIUS, createBfg, SPOOL_THROTTLE_CAP, type Bfg } from './bfg'
 import { createBolts, FACTION_AI, FACTION_ENVIRONMENT, FACTION_PLAYER, type Bolts, type Faction } from './bolts'
+import { createShipCollisions } from './ship-collisions'
 import { FEED_RING, NOBODY, THE_ARENA, type KillEvent, type LockRef, type SeatState, type ShipState, type SquadronState, type WorldSnapshot } from '../net/snapshot'
 import { createChaseCamera, type ChaseCamera } from './chase'
 import { createFx, type Fx } from './fx'
@@ -484,6 +485,8 @@ export interface GameDeps {
   hud: Omit<Hud, 'root'>
   bestScoreFor(ship: ShipId): number
   onEnd: RunEnd
+  /** Test fixtures can isolate older combat rules; live games always use collisions. */
+  shipCollisions?: boolean
 }
 
 export function createGame(deps: GameDeps): Game {
@@ -507,6 +510,7 @@ export function createGame(deps: GameDeps): Game {
    * hulls counts as one accuracy hit rather than three.
    */
   let resolvingBlast = false
+  let resolvingCollision = false
 
   const chase: ChaseCamera = createChaseCamera(camera)
 
@@ -582,6 +586,7 @@ export function createGame(deps: GameDeps): Game {
    * Weak, so a retired squadron hull takes its entry with it.
    */
   const lastHitter = new WeakMap<Ship, Participant>()
+  const shipCollisions = createShipCollisions()
   /** The latest kills, oldest first, at most `FEED_RING`. Sent with every snapshot. */
   let feed: KillEvent[] = []
   let feedSeq = 0
@@ -872,7 +877,7 @@ export function createGame(deps: GameDeps): Game {
         // A BFG blast that catches three hulls is one shot, not three. Points
         // still land per hull; the accuracy numerator is bumped once in
         // `resolveBfg` after the sphere has finished.
-        if (resolvingBlast) creditDamage(direct, amount)
+        if (resolvingBlast || resolvingCollision) creditDamage(direct, amount)
         else creditHit(direct, amount)
         return
       }
@@ -1234,6 +1239,7 @@ export function createGame(deps: GameDeps): Game {
   /* ------------------------------------------------------------------------ */
 
   function clearArena(): void {
+    shipCollisions.reset()
     for (const pilot of pilots) {
       scene.remove(pilot.ship.visual.group)
       pilot.ship.dispose()
@@ -1882,6 +1888,12 @@ export function createGame(deps: GameDeps): Game {
     if (s.seats.length !== seats.length) {
       throw new RangeError(`snapshot has ${s.seats.length} seat(s), this match has ${seats.length}`)
     }
+    // A mirror receives the authoritative bounce in the ordinary position and
+    // velocity fields. Keep the previous velocities only to present the impact
+    // locally; they never feed back into the simulation or the wire.
+    const beforeVelocity = new Map<Ship, THREE.Vector3>()
+    for (const seat of seats) beforeVelocity.set(seat.ship, seat.ship.velocity.clone())
+    for (const pilot of pilots) beforeVelocity.set(pilot.ship, pilot.ship.velocity.clone())
     mirrored = true
     mirroredQueued = s.queued
     tick = s.tick
@@ -1986,6 +1998,35 @@ export function createGame(deps: GameDeps): Game {
         }
       }
     }
+    // A reversal close to another hull is the already-authoritative bounce.
+    // Reconstruct its one-frame feedback from snapshot state rather than adding
+    // a per-impact wire field (and bandwidth) for a cosmetic event.
+    const visibleShips = seats.map(seat => seat.ship)
+    for (const pilot of pilots) visibleShips.push(pilot.ship)
+    for (let i = 0; i < visibleShips.length; i++) {
+      const a = visibleShips[i]
+      const oldA = beforeVelocity.get(a)
+      if (!oldA) continue
+      for (let j = i + 1; j < visibleShips.length; j++) {
+        const b = visibleShips[j]
+        const oldB = beforeVelocity.get(b)
+        if (!oldB) continue
+        const distance = a.position.distanceTo(b.position)
+        if (distance > a.radius + b.radius + 25 || distance < 1e-6) continue
+        _toEnemy.copy(b.position).sub(a.position).divideScalar(distance)
+        const before = oldB.clone().sub(oldA).dot(_toEnemy)
+        const after = b.velocity.clone().sub(a.velocity).dot(_toEnemy)
+        if (before >= -60 || after <= 0 || after - before < 100) continue
+        _blast.copy(a.position).addScaledVector(_toEnemy, a.radius)
+        fx.spark(_blast, a.accent, before < -300 ? 22 : 10)
+        const watcher = local()?.ship
+        if (watcher === a || watcher === b) {
+          watcher.onCollide?.(watcher, -before)
+          if (before < -300) hud.callout('COLLISION', '#ffb020', 1)
+        }
+      }
+    }
+
     // Locks resolve after every hull exists.
     for (let i = 0; i < seats.length; i++) seats[i].lockedTarget = resolveLock(s.seats[i].lock)
 
@@ -2134,6 +2175,21 @@ export function createGame(deps: GameDeps): Game {
       const controls = pilot.think(quarry, squadron, avoidNow, STEP)
       pilot.ship.step(controls, STEP, ctx)
     }
+
+    /* Resolve each hull pair after both sides have moved. The host owns the
+       bounce and damage; the existing snapshot already carries both results. */
+    const collisionShips = seats.map(seat => seat.ship)
+    for (const pilot of pilots) collisionShips.push(pilot.ship)
+    resolvingCollision = true
+    if (deps.shipCollisions !== false) shipCollisions.resolve(collisionShips, elapsed, impact => {
+      fx.spark(impact.point, impact.a.accent, impact.closingSpeed > 300 ? 22 : 10)
+      for (const ship of [impact.a, impact.b]) {
+        if (ship !== local()?.ship) continue
+        ship.onCollide?.(ship, impact.closingSpeed)
+        if (impact.closingSpeed > 300) hud.callout('COLLISION', '#ffb020', 1)
+      }
+    })
+    resolvingCollision = false
 
     /* Projectiles */
     for (const hit of bolts.update(STEP, boltTargets, environment.hazards)) {
@@ -2511,7 +2567,7 @@ export function createGame(deps: GameDeps): Game {
           const direct = seatOf(seats, from)
           if (direct && direct !== seat) {
             lastHitter.set(self, direct)
-            if (resolvingBlast) creditDamage(direct, amount)
+            if (resolvingBlast || resolvingCollision) creditDamage(direct, amount)
             else creditHit(direct, amount)
           }
           // Feedback is the drawn seat's, and only the drawn seat's. Another
@@ -2592,6 +2648,8 @@ export function createGame(deps: GameDeps): Game {
       })
       chargeTimer = 0
       resolvingBlast = false
+      resolvingCollision = false
+      shipCollisions.reset()
 
       hud.setShip(localSpec)
       hud.show()

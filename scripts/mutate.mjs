@@ -505,8 +505,8 @@ const MUTATIONS = [
   {
     name: 'the last hitter is never remembered',
     file: 'src/game/game.ts',
-    from: '      if (direct) {\n        lastHitter.set(self, direct)\n        // A BFG blast that catches three hulls is one shot, not three. Points\n        // still land per hull; the accuracy numerator is bumped once in\n        // `resolveBfg` after the sphere has finished.\n        if (resolvingBlast) creditDamage(direct, amount)\n        else creditHit(direct, amount)\n        return\n      }',
-    to: '      if (direct) {\n        if (resolvingBlast) creditDamage(direct, amount)\n        else creditHit(direct, amount)\n        return\n      }',
+    from: '      if (direct) {\n        lastHitter.set(self, direct)\n        // A BFG blast that catches three hulls is one shot, not three. Points\n        // still land per hull; the accuracy numerator is bumped once in\n        // `resolveBfg` after the sphere has finished.\n        if (resolvingBlast || resolvingCollision) creditDamage(direct, amount)\n        else creditHit(direct, amount)\n        return\n      }',
+    to: '      if (direct) {\n        if (resolvingBlast || resolvingCollision) creditDamage(direct, amount)\n        else creditHit(direct, amount)\n        return\n      }',
   },
   {
     name: "the arena's damage is nobody's, even in a match of one",
@@ -517,7 +517,7 @@ const MUTATIONS = [
   {
     name: 'a hit on a participant pays nothing',
     file: 'src/game/game.ts',
-    from: '            lastHitter.set(self, direct)\n            if (resolvingBlast) creditDamage(direct, amount)\n            else creditHit(direct, amount)',
+    from: '            lastHitter.set(self, direct)\n            if (resolvingBlast || resolvingCollision) creditDamage(direct, amount)\n            else creditHit(direct, amount)',
     to: '            lastHitter.set(self, direct)',
   },
   {
@@ -1067,7 +1067,7 @@ function runSuite() {
  * If you added or removed checks on purpose, bump this in the same commit. If you did not,
  * something stopped running.
  */
-const EXPECTED_ASSERTIONS = 778
+const EXPECTED_ASSERTIONS = 792
 const PASS_SUMMARY = 'All checks passed.'
 const SUMMARY = /check\(s\) failed\.$|All checks passed\.$/
 

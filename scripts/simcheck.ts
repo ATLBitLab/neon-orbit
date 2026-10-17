@@ -57,6 +57,7 @@ import { createSeats, isParticipant, seatOf } from '../src/game/roster'
 import { createDevHook, installDevHook, type DevHook } from '../src/core/dev-hook'
 import { createScreens, type PauseHost, type Screen } from '../src/ui/screens'
 import { Ship, type Controls, type ShipContext } from '../src/game/ship'
+import { createShipCollisions, MAX_RAM_DAMAGE, RAM_COOLDOWN } from '../src/game/ship-collisions'
 import { NPC_DRONE_GUN, SHIPS, SHIP_ORDER, type ShipId } from '../src/ships/specs'
 import {
   ARENA_HARD_LIMIT,
@@ -2533,6 +2534,9 @@ function flyAll(game: Game, crew: SeatPilot[], intents: Controls[]): void {
 
 function newMatch(deps: Partial<GameDeps> = {}): Game {
   return createGame({
+    // Legacy scripted fights assert gun, score and prediction rules independent
+    // of the new contact system. Collision integration has its own live fixture.
+    shipCollisions: false,
     scene: new THREE.Scene(),
     camera: new THREE.PerspectiveCamera(74, 16 / 9, 1, 150000),
     environment: stubEnvironment(),
@@ -7205,10 +7209,12 @@ function testARunMatchesItsRecordedBaseline(): void {
    * that shifts a trajectory has to say so.
    */
   const BASELINE: Record<string, string> = {
+    // Crashes now change the Wasp and Hornet's seeded trajectories and hulls;
+    // keep that intentional gameplay shift pinned rather than hiding it.
     hornet:
-      '0/0/0/120/177.65902947694352/0 | 10/0/5/120/346.74667078924824/2 | 70/0/13/120/120.17605570806118/3 | 80/0/28/120/10.756811887398108/3',
+      '0/0/0/120/177.65902947694352/0 | 10/0/5/120/346.74667078924824/2 | 97/0/15/75.69939699419024/290.00678707647415/3 | 117/0/29/55.69939699419024/81.24910791813119/3',
     wasp:
-      '0/0/0/70/235.30300057403224/0 | 55/0/19/70/445.3298881633059/2 | 100/0/59/70/292.3947361912082/3 | 115/0/84/70/442.1328492907095/3',
+      '0/0/0/70/235.30300057403224/0 | 55/0/19/70/445.3298881633059/2 | 169/0/48/15/200.26474472551809/3 | 189/0/85/15/10.296742848784824/3',
     drone:
       '0/0/0/200/125.05555269793625/0 | 0/0/2/180/208.07734173024517/2 | 18/0/12/175/232.03821959823935/3 | 18/0/18/175/194.53175177624726/3',
   }
@@ -8074,6 +8080,123 @@ function testPotWinnerIsOnePaidHuman(): void {
   check('a reclaimed pilot is eligible to win again', awardPotWinner(reclaimed, [0, 1]) === 0)
 }
 
+function testShipCollisions(): void {
+  section('Ship crashes bounce, hurt and credit the other pilot')
+  const make = (id: ShipId, faction: Faction) => {
+    const ship = new Ship(SHIPS[id], faction)
+    ship.warpTimer = 0
+    return ship
+  }
+  const a = make('wasp', FACTION_PLAYER)
+  const b = make('drone', FACTION_AI)
+  const reset = (speed = 500) => {
+    a.alive = b.alive = true
+    a.hull = a.spec.maxHull
+    b.hull = b.spec.maxHull
+    a.position.set(0, 0, -4000)
+    b.position.set(a.radius + b.radius - 1, 0, -4000)
+    a.velocity.set(speed, 0, 0)
+    b.velocity.set(-speed, 0, 0)
+  }
+  const collisions = createShipCollisions()
+  const events: number[] = []
+  reset()
+  collisions.resolve([a, b], 1, e => events.push(e.closingSpeed))
+  check('a head-on contact resolves once and separates both spheres', events.length === 1 && a.position.distanceTo(b.position) >= a.radius + b.radius - 1e-6)
+  check('ships leave a head-on ram separating', b.velocity.x - a.velocity.x > 0)
+  check('both hulls take capped damage and the heavier Drone takes less', a.hull < a.spec.maxHull && b.hull < b.spec.maxHull && a.spec.maxHull - a.hull <= MAX_RAM_DAMAGE && a.spec.maxHull - a.hull > b.spec.maxHull - b.hull)
+  const after = a.hull
+  reset()
+  a.hull = after
+  collisions.resolve([a, b], 1 + RAM_COOLDOWN / 2, () => {})
+  check('the pair cooldown refuses another damage tick while still separating', a.hull === after && a.position.distanceTo(b.position) >= a.radius + b.radius - 1e-6)
+  reset()
+  collisions.resolve([a, b], 1 + RAM_COOLDOWN + 0.01, () => {})
+  check('the pair can crash again after cooldown', a.hull < a.spec.maxHull)
+  reset(20)
+  collisions.reset()
+  collisions.resolve([a, b], 2, () => {})
+  check('a low-speed touch bumps without damage', a.hull === a.spec.maxHull && b.hull === b.spec.maxHull)
+  reset()
+  collisions.reset()
+  b.warpTimer = 1
+  collisions.resolve([a, b], 3, () => {})
+  check('warp-in protection prevents a crash', a.hull === a.spec.maxHull && b.hull === b.spec.maxHull)
+  b.warpTimer = 0
+  a.shieldTimer = 1
+  collisions.resolve([a, b], 3, () => {})
+  check('shield absorbs ram damage while the other hull is still hit', a.hull === a.spec.maxHull && b.hull < b.spec.maxHull)
+  a.shieldTimer = 0
+  reset()
+  collisions.reset()
+  const ally = make('hornet', humanFaction(1))
+  ally.position.set(a.radius + ally.radius - 1, 0, -4000)
+  ally.velocity.copy(b.velocity)
+  collisions.resolve([a, ally], 4, () => {})
+  check('pot opponents with different human factions hurt each other', a.hull < a.spec.maxHull && ally.hull < ally.spec.maxHull)
+  const wingman = make('wasp', FACTION_AI)
+  wingman.position.set(0, 0, -4000)
+  wingman.velocity.set(500, 0, 0)
+  b.position.set(wingman.radius + b.radius - 1, 0, -4000)
+  b.velocity.set(-500, 0, 0)
+  collisions.reset()
+  collisions.resolve([wingman, b], 4.5, () => {})
+  check('AI squadron mates also bump without damage', wingman.hull === wingman.spec.maxHull && b.hull === b.spec.maxHull && wingman.position.distanceTo(b.position) >= wingman.radius + b.radius - 1e-6)
+  wingman.dispose()
+  reset()
+  collisions.reset()
+  a.hull = 20
+  b.hull = 20
+  const deaths: Faction[] = []
+  a.onDeath = (_ship, from) => deaths.push(from)
+  b.onDeath = (_ship, from) => deaths.push(from)
+  collisions.resolve([a, b], 6, () => {})
+  check('a double ram kill attributes each death to the other ship', deaths.length === 2 && deaths[0] === FACTION_AI && deaths[1] === FACTION_PLAYER)
+  a.dispose(); b.dispose(); ally.dispose()
+
+  // Run through createGame, not just the pair solver: onDamaged/onDeath are the
+  // score and feed path used by the dedicated server and a P2P host alike.
+  const game = newMatch({ shipCollisions: true })
+  game.start({ ships: ['wasp', 'wasp'], seed: 0xc0111de, respawn: false, potHumans: [0, 1] })
+  const world = game.capture()
+  for (const [i, state] of world.seats.entries()) {
+    state.ship.position = { x: i * (SHIPS.wasp.radius * 2 - 1), y: 0, z: -4000 }
+    state.ship.velocity = { x: i === 0 ? 500 : -500, y: 0, z: 0 }
+    state.ship.hull = 20
+    state.ship.warpTimer = 0
+  }
+  game.apply(world)
+  game.step([controls({ throttle: 0 }), controls({ throttle: 0 })])
+  const result = game.capture()
+  check('pot-room ram kills credit both opponents and enter the kill feed',
+    result.seats[0]?.kills === 1 && result.seats[1]?.kills === 1 &&
+    result.feed.length === 2 && result.feed.every(entry => entry.killer >= 0))
+  check('ram damage and bounties reach match score without inflating shot accuracy',
+    result.seats.length === 2 && result.seats.every(seat => seat.score > 0 && seat.hits === 0))
+  game.dispose()
+
+  const labels: string[] = []
+  const hud = stubHud()
+  hud.callout = label => { labels.push(label) }
+  const mirror = newMatch({ hud })
+  mirror.start({ ships: ['wasp', 'hornet'], seed: 0xc0111de, respawn: true })
+  const first = mirror.capture()
+  for (const [i, state] of first.seats.entries()) {
+    state.ship.position = { x: i * 20, y: 0, z: -4000 }
+    state.ship.velocity = { x: i === 0 ? 500 : -500, y: 0, z: 0 }
+    state.ship.warpTimer = 0
+  }
+  mirror.apply(first)
+  const bounced = structuredClone(first)
+  bounced.seats[0].ship.velocity.x = -500
+  bounced.seats[1].ship.velocity.x = 500
+  bounced.seats[1].ship.position.x = SHIPS.wasp.radius + SHIPS.hornet.radius
+  mirror.apply(bounced)
+  check('a dedicated mirror reconstructs the big collision callout from ordinary snapshots', labels.includes('COLLISION'))
+  mirror.dispose()
+}
+
+testShipCollisions()
 testPotWinnerIsOnePaidHuman()
 testSolarSear()
 testBoltPoolDoesNotLeak()
